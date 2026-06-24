@@ -111,6 +111,8 @@ local function MakePreviewFrame(parent)
     pf.textHost:SetAllPoints(pf)
     pf.textHost:SetFrameLevel(pf.cd:GetFrameLevel() + 5)
     pf.timer = pf.textHost:CreateFontString(nil, "OVERLAY")
+    pf.timer:SetFont((EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("extras")) or STANDARD_TEXT_FONT, 12,
+        (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE")
     pf.timer:SetText("")
 
     pf:Hide()
