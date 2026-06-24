@@ -134,7 +134,13 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
         { type="toggle", text="Enable Advanced Debuffs",
           tooltip="Track your active debuffs as a freely-movable grid of custom icons. Use Unlock Mode (/eui) to drag it into place.",
           getValue=function() return Enabled() end,
-          setValue=function(v) Set("enabled", v); Refresh(); EllesmereUI:RefreshPage() end },
+          setValue=function(v)
+              Set("enabled", v)
+              if not v and _G._EUI_AdvancedDebuffs_HidePreview then
+                  _G._EUI_AdvancedDebuffs_HidePreview()
+              end
+              Refresh(); EllesmereUI:RefreshPage()
+          end },
         { type="toggle", text="Hide Blizzard Debuffs",
           tooltip="Hide the default Blizzard debuff icons while this feature is enabled, so your debuffs aren't shown twice.",
           disabled=Disabled,
@@ -294,29 +300,21 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
           disabled=Disabled,
           getValue=function() return Cfg("filterBloodlust") ~= false end,
           setValue=function(v) Set("filterBloodlust", v); Refresh() end },
-        { type="spacer" })
+        { type="toggle", text="Preview",
+          tooltip="Show sample debuffs so you can position and style the grid without waiting for real ones to appear.",
+          disabled=Disabled,
+          getValue=function()
+              return _G._EUI_AdvancedDebuffs_IsPreviewActive
+                  and _G._EUI_AdvancedDebuffs_IsPreviewActive() or false
+          end,
+          setValue=function(v)
+              if v then
+                  if _G._EUI_AdvancedDebuffs_ShowPreview then _G._EUI_AdvancedDebuffs_ShowPreview() end
+              else
+                  if _G._EUI_AdvancedDebuffs_HidePreview then _G._EUI_AdvancedDebuffs_HidePreview() end
+              end
+          end })
     y = y - h
-
-    -- Preview button
-    do
-        local previewIsActive = _G._EUI_AdvancedDebuffs_IsPreviewActive
-            and _G._EUI_AdvancedDebuffs_IsPreviewActive()
-        local previewLabel = previewIsActive and "Stop Preview" or "Preview"
-
-        row, h = W:DualRow(parent, y,
-            { type="button", text=previewLabel,
-              disabled=Disabled,
-              onClick=function()
-                  if _G._EUI_AdvancedDebuffs_IsPreviewActive and _G._EUI_AdvancedDebuffs_IsPreviewActive() then
-                      if _G._EUI_AdvancedDebuffs_HidePreview then _G._EUI_AdvancedDebuffs_HidePreview() end
-                  else
-                      if _G._EUI_AdvancedDebuffs_ShowPreview then _G._EUI_AdvancedDebuffs_ShowPreview() end
-                  end
-                  EllesmereUI:RefreshPage()
-              end },
-            { type="spacer" })
-        y = y - h
-    end
 
     _, h = W:Spacer(parent, y, 20); y = y - h
 
