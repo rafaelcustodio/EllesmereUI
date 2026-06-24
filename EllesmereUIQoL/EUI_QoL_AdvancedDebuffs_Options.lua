@@ -116,62 +116,6 @@ local function MakeBorderColorSwatches()
 end
 
 -------------------------------------------------------------------------------
---  Blocklist editor (cog popup with one toggle per blocked spell + add input)
--------------------------------------------------------------------------------
-local function BuildBlocklistRows()
-    local p = P()
-    local rows = {}
-    if p and p.blocklist then
-        local ids = {}
-        for sid in pairs(p.blocklist) do ids[#ids + 1] = sid end
-        table.sort(ids, function(a, b)
-            local ea, eb = p.blocklist[a], p.blocklist[b]
-            local da = (type(ea) == "table" and ea.default) and 0 or 1
-            local dbk = (type(eb) == "table" and eb.default) and 0 or 1
-            if da ~= dbk then return da < dbk end
-            return a < b
-        end)
-        for _, sid in ipairs(ids) do
-            local e = p.blocklist[sid]
-            local label = (type(e) == "table" and e.label) or nil
-            if not label and C_Spell and C_Spell.GetSpellName then label = C_Spell.GetSpellName(sid) end
-            label = (label or ("Spell " .. sid)) .. " (" .. sid .. ")"
-            rows[#rows + 1] = {
-                type = "toggle",
-                label = label,
-                tooltip = "When on, this debuff is hidden from the tracker.",
-                get = function()
-                    local pp = P(); local ee = pp and pp.blocklist and pp.blocklist[sid]
-                    return ee and (ee == true or ee.enabled) and true or false
-                end,
-                set = function(v)
-                    local pp = P(); if not pp or not pp.blocklist then return end
-                    local ee = pp.blocklist[sid]
-                    if type(ee) ~= "table" then pp.blocklist[sid] = { enabled = v } else ee.enabled = v end
-                    Refresh()
-                end,
-            }
-        end
-    end
-    rows[#rows + 1] = {
-        type = "input",
-        label = "Add Spell ID",
-        get = function() return "" end,
-        set = function(text)
-            local sid = tonumber(text and text:match("%d+"))
-            if not sid then return end
-            local pp = P(); if not pp then return end
-            pp.blocklist = pp.blocklist or {}
-            local nm = (C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(sid)) or ("Spell " .. sid)
-            pp.blocklist[sid] = { label = nm, enabled = true, default = false }
-            Refresh()
-            EllesmereUI:RefreshPage()
-        end,
-    }
-    return rows
-end
-
--------------------------------------------------------------------------------
 --  Page builder
 -------------------------------------------------------------------------------
 local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
@@ -323,8 +267,8 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
         { type="spacer" })
     y = y - h
 
-    -- ── FILTERS & BLOCKLIST ───────────────────────────────────────────
-    _, h = W:SectionHeader(parent, "FILTERS & BLOCKLIST", y); y = y - h
+    -- ── FILTERS ───────────────────────────────────────────────────────
+    _, h = W:SectionHeader(parent, "FILTERS", y); y = y - h
 
     for i = 1, #FILTER_DEFS, 2 do
         local a = FILTER_DEFS[i]
@@ -344,21 +288,22 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
         y = y - h
     end
 
-    -- Blocklist editor + Preview buttons
-    do
-        local _, blocklistShow = EllesmereUI.BuildCogPopup({
-            title = "Debuff Blocklist",
-            rows  = BuildBlocklistRows(),
-        })
+    row, h = W:DualRow(parent, y,
+        { type="toggle", text="Filter Bloodlust Debuffs",
+          tooltip="Hide Bloodlust / Heroism and the related Exhaustion / Sated / Fatigued debuffs, which are rarely useful to track.",
+          disabled=Disabled,
+          getValue=function() return Cfg("filterBloodlust") ~= false end,
+          setValue=function(v) Set("filterBloodlust", v); Refresh() end },
+        { type="spacer" })
+    y = y - h
 
+    -- Preview button
+    do
         local previewIsActive = _G._EUI_AdvancedDebuffs_IsPreviewActive
             and _G._EUI_AdvancedDebuffs_IsPreviewActive()
         local previewLabel = previewIsActive and "Stop Preview" or "Preview"
 
         row, h = W:DualRow(parent, y,
-            { type="button", text="Edit Blocklist...",
-              disabled=Disabled,
-              onClick=function(self) if not Disabled() then blocklistShow(self) end end },
             { type="button", text=previewLabel,
               disabled=Disabled,
               onClick=function()
@@ -368,7 +313,8 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
                       if _G._EUI_AdvancedDebuffs_ShowPreview then _G._EUI_AdvancedDebuffs_ShowPreview() end
                   end
                   EllesmereUI:RefreshPage()
-              end })
+              end },
+            { type="spacer" })
         y = y - h
     end
 

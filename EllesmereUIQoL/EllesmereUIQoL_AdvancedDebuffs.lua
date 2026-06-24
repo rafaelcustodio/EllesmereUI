@@ -2,8 +2,8 @@
 --  EllesmereUIQoL_AdvancedDebuffs.lua
 --  Player debuff tracker. Reads the player's HARMFUL auras via C_UnitAuras and
 --  lays them out as a freely-movable grid of custom icons (size / spacing /
---  rows / grow direction), with dispel-type colored borders, a spell-ID
---  blocklist, Blizzard filter toggles, stack text and a preview mode.
+--  rows / grow direction), with dispel-type colored borders, a Bloodlust
+--  filter, Blizzard filter toggles, stack text and a preview mode.
 --
 --  SECRET-VALUE SAFE: modern WoW returns "secret values" for boss / restricted
 --  aura fields (spellId, duration, applications, dispelName) when read by
@@ -49,18 +49,18 @@ local DISPEL_COLORS = {
     [""]    = { r = 0.75,  g = 0.15,  b = 0.15 },
 }
 
--- Default blocklist (spellID -> hidden). Ported from the reference addon:
--- Bloodlust / Heroism variants + Time Trial, which appear as harmful auras but
--- are never useful to track here.
-local DEFAULT_BLOCKLIST = {
-    [390435] = "Bloodlust",
-    [57723]  = "Exhaustion (Heroism)",
-    [95809]  = "Insanity (Hunter)",
-    [80354]  = "Temporal Displacement",
-    [308312] = "Time Trial",
-    [57724]  = "Sated",
-    [160455] = "Fatigued",
-    [264689] = "Fatigued (Hunter)",
+-- Bloodlust / Heroism family (plus the related exhaustion/fatigue debuffs).
+-- Hidden when the "Filter Bloodlust Debuffs" toggle is on. Ported from the
+-- reference addon's default blocklist.
+local BLOODLUST_IDS = {
+    [390435] = true,  -- Bloodlust
+    [57723]  = true,  -- Exhaustion (Heroism)
+    [95809]  = true,  -- Insanity (Hunter)
+    [80354]  = true,  -- Temporal Displacement
+    [308312] = true,  -- Time Trial
+    [57724]  = true,  -- Sated
+    [160455] = true,  -- Fatigued
+    [264689] = true,  -- Fatigued (Hunter)
 }
 
 -- Blizzard aura filter categories. When toggled on, auras matching the category
@@ -111,7 +111,7 @@ local defaults = {
             reverse        = true,
             -- filtering
             filters        = { PLAYER = true },  -- hide self-cast debuffs by default
-            blocklist      = nil,     -- { [spellID] = { label=, enabled=, default= } }
+            filterBloodlust = true,   -- hide the Bloodlust / Heroism debuff family
             -- position
             pos            = nil,     -- { centerX, centerY } stored after first move
         },
@@ -139,16 +139,6 @@ local C_UA = C_UnitAuras
 local function _isSecret(v)
     return issecretvalue and issecretvalue(v) or false
 end
-
-local function EnsureBlocklist(p)
-    p.blocklist = p.blocklist or {}
-    for sid, label in pairs(DEFAULT_BLOCKLIST) do
-        if p.blocklist[sid] == nil then
-            p.blocklist[sid] = { label = label, enabled = true, default = true }
-        end
-    end
-end
-addon.EnsureBlocklist = EnsureBlocklist
 
 -------------------------------------------------------------------------------
 --  Button creation + styling
@@ -414,12 +404,11 @@ end
 local function ShouldShow(aura, p, filterStrings)
     if not aura then return false end
 
-    -- Blocklist by spellID -- only when the spellID is a plain (non-secret)
-    -- value; secret-tagged auras (boss / restricted) simply can't be blocked.
-    local sid = aura.spellId
-    if sid ~= nil and not _isSecret(sid) and p.blocklist then
-        local e = p.blocklist[sid]
-        if e and (e == true or (type(e) == "table" and e.enabled)) then
+    -- Bloodlust/Heroism filter -- only when the spellID is a plain (non-secret)
+    -- value; secret-tagged auras (boss / restricted) can't be matched.
+    if p.filterBloodlust then
+        local sid = aura.spellId
+        if sid ~= nil and not _isSecret(sid) and BLOODLUST_IDS[sid] then
             return false
         end
     end
@@ -585,8 +574,6 @@ local function Apply()
     if not frame then CreateContainer() end
     local p = P(); if not p then return end
 
-    EnsureBlocklist(p)
-
     local w, h = GetGridSize(p)
     frame:SetSize(w, h)
     for i = 1, #pool do StyleButton(pool[i], p) end
@@ -617,7 +604,6 @@ local function ResetDefaults()
             p[k] = v
         end
     end
-    EnsureBlocklist(p)
     Apply()
 end
 _G._EUI_AdvancedDebuffs_Reset = ResetDefaults
@@ -702,8 +688,6 @@ boot:SetScript("OnEvent", function(self)
     end
     addon.db = EllesmereUI.Lite.NewDB("EllesmereUIQoLDB", defaults, true)
     _G._EUI_AdvancedDebuffs_DB = function() return addon.db end
-    local p = P()
-    if p then EnsureBlocklist(p) end
     CreateContainer()
     _registerEvents()
     Apply()
