@@ -245,21 +245,43 @@ local function HidePreviewFrames()
     end
 end
 
+-- Full live render of the placeholder icons. Re-runs on every settings change
+-- so size / spacing / grow / slots / border update on screen immediately.
+local function RenderPreview(p)
+    local PP = EllesmereUI and EllesmereUI.PP
+    local sz = p.iconSize or 40
+    local n  = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
+
+    LayoutSlots(p)      -- sizes rootFrame + slotFrames and positions them
+    ApplyPosition()
+    rootFrame:Show()
+
+    for i = 1, MAX_SLOTS do
+        local f  = slotFrames[i]
+        local pf = previewFrames[i]
+        pf:ClearAllPoints()
+        pf:SetSize(sz, sz)
+        pf:SetPoint("CENTER", f, "CENTER", 0, 0)
+        pf:SetFrameStrata("DIALOG")
+        -- Re-snap the border to the new frame size and reflect Show Border.
+        if PP then
+            if p.showBorder ~= false then
+                if PP.SetBorderSize then PP.SetBorderSize(pf, 1) end
+                PP.ShowBorder(pf)
+            else
+                PP.HideBorder(pf)
+            end
+        end
+        if i <= n then pf:Show() else pf:Hide() end
+    end
+end
+
 local function ShowPreview()
     EnsureFrames()
     local p = P(); if not p then return end
     previewActive = true
-    LayoutSlots(p)
-    ApplyPosition()
-    rootFrame:Show()
-    local n = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
-    for i = 1, MAX_SLOTS do
-        local pf = previewFrames[i]
-        pf:ClearAllPoints()
-        pf:SetPoint("CENTER", slotFrames[i], "CENTER", 0, 0)
-        pf:SetFrameStrata("DIALOG")
-        if i <= n then pf:Show() else pf:Hide() end
-    end
+    RemoveAllAnchors()  -- don't run real anchors while previewing
+    RenderPreview(p)
 end
 _G._EUI_PrivateAuras_ShowPreview = ShowPreview
 
@@ -278,8 +300,12 @@ _G._EUI_PrivateAuras_IsPreviewActive = function() return previewActive end
 local function Apply()
     if not addon.db then return end
     EnsureFrames()
-    ApplyAnchors()
-    if previewActive then ShowPreview() end
+    if previewActive then
+        RemoveAllAnchors()        -- preview overrides the real anchors
+        RenderPreview(P())
+    else
+        ApplyAnchors()
+    end
 end
 _G._EUI_PrivateAuras_Apply = Apply
 
