@@ -132,28 +132,43 @@ local function BuildPrivateAurasPage(pageName, parent, yOffset)
           getValue=function() return Cfg("showCountdown") ~= false end,
           setValue=function(v) Set("showCountdown", v); Refresh() end },
         { type="toggle", text="Show Countdown Numbers",
-          tooltip="Show the numeric countdown on each icon. Independent of the swipe -- you can have numbers without the sweep, or vice versa.",
+          tooltip="Show the numeric countdown on each icon. Independent of the swipe -- you can have numbers without the sweep, or vice versa. Use the cog to nudge their position.",
           disabled=Disabled,
           getValue=function() return Cfg("showNumbers") ~= false end,
           setValue=function(v) Set("showNumbers", v); Refresh() end })
     y = y - h
 
-    row, h = W:DualRow(parent, y,
-        { type="slider", text="Timer Offset X",
-          tooltip="Horizontal offset of the countdown numbers relative to the icon center (the swipe stays on the icon).",
-          disabled=function() return Disabled() or Cfg("showNumbers") == false end,
-          disabledTooltip="Enable Show Countdown Numbers to adjust this.",
-          min=-150, max=150, step=1, isPercent=false,
-          getValue=function() return Cfg("durationOffsetX") or 0 end,
-          setValue=function(v) Set("durationOffsetX", v); Refresh() end },
-        { type="slider", text="Timer Offset Y",
-          tooltip="Vertical offset of the countdown numbers relative to the icon center (the swipe stays on the icon).",
-          disabled=function() return Disabled() or Cfg("showNumbers") == false end,
-          disabledTooltip="Enable Show Countdown Numbers to adjust this.",
-          min=-150, max=150, step=1, isPercent=false,
-          getValue=function() return Cfg("durationOffsetY") or 0 end,
-          setValue=function(v) Set("durationOffsetY", v); Refresh() end })
-    y = y - h
+    -- Inline directions cog on Show Countdown Numbers: timer X/Y position
+    -- (addon-standard, like the Action Bars text offsets).
+    do
+        local PP = EllesmereUI.PP
+        local rgn = row._rightRegion
+        local function isDisabled() return Disabled() or Cfg("showNumbers") == false end
+        local _, cogShow = EllesmereUI.BuildCogPopup({
+            title = "Timer Position",
+            rows = {
+                { type="slider", label="X Offset", min=-150, max=150, step=1,
+                  get=function() return Cfg("durationOffsetX") or 0 end,
+                  set=function(v) Set("durationOffsetX", v); Refresh() end },
+                { type="slider", label="Y Offset", min=-150, max=150, step=1,
+                  get=function() return Cfg("durationOffsetY") or 0 end,
+                  set=function(v) Set("durationOffsetY", v); Refresh() end },
+            },
+        })
+        local cogBtn = CreateFrame("Button", nil, rgn)
+        cogBtn:SetSize(26, 26)
+        PP.Point(cogBtn, "RIGHT", rgn._control or rgn, "LEFT", -6, 0)
+        cogBtn:SetFrameLevel(rgn:GetFrameLevel() + 5)
+        local cogTex = cogBtn:CreateTexture(nil, "OVERLAY")
+        cogTex:SetAllPoints()
+        cogTex:SetTexture(EllesmereUI.DIRECTIONS_ICON)
+        local function UpdateAlpha() cogBtn:SetAlpha(isDisabled() and 0.15 or 0.4) end
+        EllesmereUI.RegisterWidgetRefresh(UpdateAlpha)
+        UpdateAlpha()
+        cogBtn:SetScript("OnClick", function(self) if not isDisabled() then cogShow(self) end end)
+        cogBtn:SetScript("OnEnter", function(self) if not isDisabled() then self:SetAlpha(0.75) end end)
+        cogBtn:SetScript("OnLeave", function() UpdateAlpha() end)
+    end
 
     _, h = W:Spacer(parent, y, 20); y = y - h
 

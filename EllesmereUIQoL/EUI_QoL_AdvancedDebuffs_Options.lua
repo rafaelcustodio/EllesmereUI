@@ -282,6 +282,35 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
           setValue=function(v) Set("swipe", v); Refresh() end })
     y = y - h
 
+    -- Inline directions cog on Count Size: stack-count X/Y position (addon-standard).
+    do
+        local rgn = row._leftRegion
+        local _, cogShow = EllesmereUI.BuildCogPopup({
+            title = "Count Position",
+            rows = {
+                { type="slider", label="X Offset", min=-30, max=30, step=1,
+                  get=function() return Cfg("countOffsetX") or 0 end,
+                  set=function(v) Set("countOffsetX", v); Refresh() end },
+                { type="slider", label="Y Offset", min=-30, max=30, step=1,
+                  get=function() return Cfg("countOffsetY") or 0 end,
+                  set=function(v) Set("countOffsetY", v); Refresh() end },
+            },
+        })
+        local cogBtn = CreateFrame("Button", nil, rgn)
+        cogBtn:SetSize(26, 26)
+        PP.Point(cogBtn, "RIGHT", rgn._control or rgn, "LEFT", -6, 0)
+        cogBtn:SetFrameLevel(rgn:GetFrameLevel() + 5)
+        local cogTex = cogBtn:CreateTexture(nil, "OVERLAY")
+        cogTex:SetAllPoints()
+        cogTex:SetTexture(EllesmereUI.DIRECTIONS_ICON)
+        local function UpdateAlpha() cogBtn:SetAlpha(Disabled() and 0.15 or 0.4) end
+        EllesmereUI.RegisterWidgetRefresh(UpdateAlpha)
+        UpdateAlpha()
+        cogBtn:SetScript("OnClick", function(self) if not Disabled() then cogShow(self) end end)
+        cogBtn:SetScript("OnEnter", function(self) if not Disabled() then self:SetAlpha(0.75) end end)
+        cogBtn:SetScript("OnLeave", function() UpdateAlpha() end)
+    end
+
     row, h = W:DualRow(parent, y,
         { type="toggle", text="Reverse Swipe",
           tooltip="Reverse the cooldown sweep direction (the swipe shrinks instead of growing).",
