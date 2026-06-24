@@ -141,11 +141,29 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
               end
               Refresh(); EllesmereUI:RefreshPage()
           end },
+        { type="toggle", text="Preview",
+          tooltip="Show sample debuffs so you can position and style the grid without waiting for real ones to appear.",
+          disabled=Disabled,
+          getValue=function()
+              return _G._EUI_AdvancedDebuffs_IsPreviewActive
+                  and _G._EUI_AdvancedDebuffs_IsPreviewActive() or false
+          end,
+          setValue=function(v)
+              if v then
+                  if _G._EUI_AdvancedDebuffs_ShowPreview then _G._EUI_AdvancedDebuffs_ShowPreview() end
+              else
+                  if _G._EUI_AdvancedDebuffs_HidePreview then _G._EUI_AdvancedDebuffs_HidePreview() end
+              end
+          end })
+    y = y - h
+
+    row, h = W:DualRow(parent, y,
         { type="toggle", text="Hide Blizzard Debuffs",
           tooltip="Hide the default Blizzard debuff icons while this feature is enabled, so your debuffs aren't shown twice.",
           disabled=Disabled,
           getValue=function() return Cfg("hideBlizzard") and true or false end,
-          setValue=function(v) Set("hideBlizzard", v); Refresh() end })
+          setValue=function(v) Set("hideBlizzard", v); Refresh() end },
+        { type="spacer" })
     y = y - h
 
     row, h = W:DualRow(parent, y,
@@ -300,20 +318,7 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
           disabled=Disabled,
           getValue=function() return Cfg("filterBloodlust") ~= false end,
           setValue=function(v) Set("filterBloodlust", v); Refresh() end },
-        { type="toggle", text="Preview",
-          tooltip="Show sample debuffs so you can position and style the grid without waiting for real ones to appear.",
-          disabled=Disabled,
-          getValue=function()
-              return _G._EUI_AdvancedDebuffs_IsPreviewActive
-                  and _G._EUI_AdvancedDebuffs_IsPreviewActive() or false
-          end,
-          setValue=function(v)
-              if v then
-                  if _G._EUI_AdvancedDebuffs_ShowPreview then _G._EUI_AdvancedDebuffs_ShowPreview() end
-              else
-                  if _G._EUI_AdvancedDebuffs_HidePreview then _G._EUI_AdvancedDebuffs_HidePreview() end
-              end
-          end })
+        { type="spacer" })
     y = y - h
 
     _, h = W:Spacer(parent, y, 20); y = y - h
