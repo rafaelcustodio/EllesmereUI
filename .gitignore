@@ -13,3 +13,4 @@ CLAUDE_PATTERNS.md
 
 # Developer scripts
 *.ps1
+*.bat
