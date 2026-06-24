@@ -15,6 +15,11 @@
 
 local MAX_SLOTS = 5  -- player private-aura slots to expose (extra empty slots render nothing)
 
+-- Sample spells + per-slot durations used only by the preview, so it looks like
+-- real auras (real icons + animated, looping cooldowns) instead of static art.
+local PREVIEW_SPELLS = { 589, 980, 8680, 146739, 1943 }
+local PREVIEW_DURS   = { 16, 22, 12, 28, 19 }
+
 local defaults = {
     profile = {
         privateAuras = {
@@ -46,6 +51,7 @@ local previewFrames = {}        -- [1..MAX_SLOTS] fake icons for positioning
 local anchorIDs    = {}         -- [1..N] active private-aura anchor IDs
 local pendingApply = false
 local previewActive = false
+local _previewGen   = 0  -- bumped to invalidate stale preview-cooldown timers
 
 local C_UA = C_UnitAuras
 
@@ -87,14 +93,15 @@ local function MakePreviewFrame(parent)
     pf:EnableMouse(false)
     pf.tex = pf:CreateTexture(nil, "ARTWORK")
     pf.tex:SetAllPoints(pf)
-    pf.tex:SetTexture(134400)  -- generic question-mark icon
-    pf.tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    pf.tex:SetAlpha(0.6)
-    if PP then PP.CreateBorder(pf, 0.2, 0.8, 1, 0.9, 1, "OVERLAY", 2) end
-    pf.num = pf:CreateFontString(nil, "OVERLAY")
-    pf.num:SetFont((EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("extras")) or STANDARD_TEXT_FONT, 14,
-        (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE")
-    pf.num:SetPoint("CENTER")
+    pf.tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)  -- trim the icon's stock border
+    if PP then PP.CreateBorder(pf, 0, 0, 0, 1, 1, "OVERLAY", 2) end
+
+    -- Fake cooldown so the preview shows an animated swipe / numbers / offset.
+    pf.cd = CreateFrame("Cooldown", nil, pf, "CooldownFrameTemplate")
+    pf.cd:SetAllPoints(pf)
+    pf.cd:SetDrawEdge(false)
+    pf.cd:Hide()
+
     pf:Hide()
     return pf
 end
@@ -114,7 +121,8 @@ local function EnsureFrames()
         end
         if not previewFrames[i] then
             previewFrames[i] = MakePreviewFrame(slotFrames[i])
-            previewFrames[i].num:SetText(tostring(i))
+            local tex = (C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(PREVIEW_SPELLS[i])) or 134400
+            previewFrames[i].tex:SetTexture(tex)
         end
     end
 end
@@ -245,12 +253,33 @@ local function HidePreviewFrames()
     end
 end
 
--- Full live render of the placeholder icons. Re-runs on every settings change
--- so size / spacing / grow / slots / border update on screen immediately.
+-- Self-scheduling loop so each preview icon shows an animated, repeating
+-- cooldown. The generation token invalidates timers from a previous render.
+local function ArmSlotLoop(i, gen)
+    if gen ~= _previewGen or not previewActive then return end
+    local pf = previewFrames[i]
+    if not pf or not pf.cd:IsShown() then return end
+    local dur = PREVIEW_DURS[i] or 15
+    pf.cd:SetCooldown(GetTime(), dur)
+    C_Timer.After(dur, function() ArmSlotLoop(i, gen) end)
+end
+
+local function StartPreviewCooldowns(n)
+    _previewGen = _previewGen + 1
+    local gen = _previewGen
+    for i = 1, n do
+        ArmSlotLoop(i, gen)
+    end
+end
+
+-- Full live render of the preview icons. Re-runs on every settings change so
+-- size / spacing / grow / slots / border / cooldown options update immediately,
+-- using real spell art and animated cooldowns (matching Advanced Debuffs).
 local function RenderPreview(p)
     local PP = EllesmereUI and EllesmereUI.PP
     local sz = p.iconSize or 40
     local n  = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
+    local dox, doy = p.durationOffsetX or 0, p.durationOffsetY or 0
 
     LayoutSlots(p)      -- sizes rootFrame + slotFrames and positions them
     ApplyPosition()
@@ -263,17 +292,38 @@ local function RenderPreview(p)
         pf:SetSize(sz, sz)
         pf:SetPoint("CENTER", f, "CENTER", 0, 0)
         pf:SetFrameStrata("DIALOG")
-        -- Re-snap the border to the new frame size and reflect Show Border.
+
+        -- Border: thickness scales with Border Scale (mirrors the real anchor's
+        -- borderScale = iconSize/16 * scale), and reflects Show Border.
         if PP then
             if p.showBorder ~= false then
-                if PP.SetBorderSize then PP.SetBorderSize(pf, 1) end
+                if PP.SetBorderSize then
+                    local bpx = math.max(1, math.min(8, math.floor((sz / 16) * (p.borderScale or 1.0) + 0.5)))
+                    PP.SetBorderSize(pf, bpx)
+                end
                 PP.ShowBorder(pf)
             else
                 PP.HideBorder(pf)
             end
         end
+
+        -- Cooldown swipe / numbers / timer offset.
+        local cd = pf.cd
+        if p.showCountdown ~= false then
+            cd:ClearAllPoints()
+            cd:SetSize(sz, sz)
+            cd:SetPoint("CENTER", pf, "CENTER", dox, doy)
+            cd:SetHideCountdownNumbers(p.showNumbers == false)
+            cd:SetDrawSwipe(true)
+            cd:Show()
+        else
+            cd:Hide()
+        end
+
         if i <= n then pf:Show() else pf:Hide() end
     end
+
+    StartPreviewCooldowns(n)
 end
 
 local function ShowPreview()
@@ -287,6 +337,7 @@ _G._EUI_PrivateAuras_ShowPreview = ShowPreview
 
 local function HidePreview()
     previewActive = false
+    _previewGen = _previewGen + 1  -- stop the looping preview cooldowns
     HidePreviewFrames()
     ApplyAnchors()
 end
