@@ -4,16 +4,16 @@
 --  mechanics) whose data addons CANNOT read. The only way to show them is to
 --  hand Blizzard an anchor frame via C_UnitAuras.AddPrivateAuraAnchor -- Blizzard
 --  then renders the (otherwise invisible) icon into our frame. We only control
---  position, size, border scale and the cooldown frame/numbers.
+--  position, size, border scale and the cooldown frame/numbers; the icon art,
+--  shape, zoom and border color are owned by Blizzard and cannot be changed.
 --
---  Mirrors the EXBoss PrivateAuraMonitor approach but follows EllesmereUI's DB /
---  unlock-mode / options conventions (modeled on EllesmereUIQoL_BattleRes.lua).
---
---  Anchors can only be added/removed OUT of combat, so every (re)apply is gated
---  by InCombatLockdown and deferred to PLAYER_REGEN_ENABLED when needed.
+--  Layout mirrors Advanced Debuffs (configurable grid: size / spacing / icons
+--  per row / rows / grow H+V). Anchors can only be added/removed OUT of combat,
+--  so every (re)apply is gated by InCombatLockdown and deferred to
+--  PLAYER_REGEN_ENABLED when needed.
 -------------------------------------------------------------------------------
 
-local MAX_SLOTS = 5  -- player private-aura slots to expose (extra empty slots render nothing)
+local HARD_CAP = 24  -- safety cap on grid cells / private-aura anchors
 
 -- Sample spells + per-slot durations used only by the preview, so it looks like
 -- real auras (real icons + animated, looping cooldowns) instead of static art.
@@ -24,10 +24,14 @@ local defaults = {
     profile = {
         privateAuras = {
             enabled         = false,
-            slots           = 3,
+            -- layout (grid) -- same options as Advanced Debuffs
             iconSize        = 40,
             iconSpacing     = 6,
-            growDir         = "RIGHT",  -- RIGHT | LEFT | UP | DOWN
+            iconsPerRow     = 3,
+            maxRows         = 1,
+            growHorizontal  = "RIGHT",  -- LEFT | RIGHT
+            growVertical    = "DOWN",   -- DOWN | UP
+            -- border / cooldown (only what the anchor API exposes)
             showBorder      = true,
             borderScale     = 1.0,
             showCountdown   = true,     -- cooldown swipe frame
@@ -46,46 +50,56 @@ local function P()
 end
 
 local rootFrame                 -- movable container (the unlock-mode anchor)
-local slotFrames   = {}         -- [1..MAX_SLOTS] real frames the icons render into
-local previewFrames = {}        -- [1..MAX_SLOTS] fake icons for positioning
-local anchorIDs    = {}         -- [1..N] active private-aura anchor IDs
-local pendingApply = false
+local slotFrames    = {}        -- real frames the icons render into (grows on demand)
+local previewFrames = {}        -- fake icons for positioning (grows on demand)
+local anchorIDs     = {}        -- active private-aura anchor IDs
+local pendingApply  = false
 local previewActive = false
-local _previewGen   = 0  -- bumped to invalidate stale preview-cooldown timers
+local _previewGen   = 0         -- bumped to invalidate stale preview-cooldown timers
+local _previewTextTicker
 
 local C_UA = C_UnitAuras
 
 -------------------------------------------------------------------------------
---  Layout helpers (group is centered on rootFrame, like the EXBoss monitor)
+--  Layout (configurable grid, anchored at the corner opposite the growth
+--  direction -- identical to Advanced Debuffs)
 -------------------------------------------------------------------------------
+local function SlotCount(p)
+    local perRow = math.max(1, p.iconsPerRow or 3)
+    local rows   = math.max(1, p.maxRows or 1)
+    return math.min(perRow * rows, HARD_CAP)
+end
+
 local function GetGridSize(p)
     p = p or {}
-    local sz   = p.iconSize or 40
-    local step = sz + (p.iconSpacing or 6)
-    local n    = math.max(1, p.slots or 3)
-    local dir  = p.growDir or "RIGHT"
-    if dir == "RIGHT" or dir == "LEFT" then
-        return step * n - (p.iconSpacing or 6), sz
-    end
-    return sz, step * n - (p.iconSpacing or 6)
+    local size    = p.iconSize    or 40
+    local spacing = p.iconSpacing or 6
+    local perRow  = math.max(1, p.iconsPerRow or 3)
+    local rows    = math.max(1, p.maxRows or 1)
+    local w = perRow * size + (perRow - 1) * spacing
+    local h = rows * size + (rows - 1) * spacing
+    return w, h
 end
 
-local function GetSlotOffset(p, idx)
-    local sz   = p.iconSize or 40
-    local step = sz + (p.iconSpacing or 6)
-    local dir  = p.growDir or "RIGHT"
-    local totalW, totalH = GetGridSize(p)
-    local dx = (totalW - sz) * 0.5
-    local dy = (totalH - sz) * 0.5
-    local i = idx - 1
-    if dir == "RIGHT" then return -dx + i * step, 0 end
-    if dir == "LEFT"  then return  dx - i * step, 0 end
-    if dir == "UP"    then return 0, -dy + i * step end
-    return 0, dy - i * step  -- DOWN
+local function GridAnchor(p)
+    local growH = (p.growHorizontal == "RIGHT") and 1 or -1
+    local growV = (p.growVertical   == "UP")    and 1 or -1
+    local anchor = (growV == 1 and "BOTTOM" or "TOP") .. (growH == 1 and "LEFT" or "RIGHT")
+    return anchor, growH, growV
+end
+
+local function GridOffset(p, idx, growH, growV)
+    local size    = p.iconSize    or 40
+    local spacing = p.iconSpacing or 6
+    local perRow  = math.max(1, p.iconsPerRow or 3)
+    local step = size + spacing
+    local col = (idx - 1) % perRow
+    local row = math.floor((idx - 1) / perRow)
+    return col * step * growH, row * step * growV
 end
 
 -------------------------------------------------------------------------------
---  Frame creation
+--  Frame creation (slot + preview frames are created on demand)
 -------------------------------------------------------------------------------
 local function MakePreviewFrame(parent)
     local PP = EllesmereUI and EllesmereUI.PP
@@ -96,7 +110,6 @@ local function MakePreviewFrame(parent)
     pf.tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)  -- trim the icon's stock border
     if PP then PP.CreateBorder(pf, 0, 0, 0, 1, 1, "OVERLAY", 2) end
 
-    -- Fake cooldown so the preview shows an animated swipe / numbers / offset.
     -- Cooldown draws the SWIPE only; we render the timer ourselves so the swipe
     -- and the numbers are independent (and the numbers can be offset freely).
     pf.cd = CreateFrame("Cooldown", nil, pf, "CooldownFrameTemplate")
@@ -105,37 +118,45 @@ local function MakePreviewFrame(parent)
     pf.cd:SetHideCountdownNumbers(true)
     pf.cd:Hide()
 
-    -- Timer text on its own host frame, layered above the swipe and independent
-    -- of the cooldown frame's visibility.
     pf.textHost = CreateFrame("Frame", nil, pf)
     pf.textHost:SetAllPoints(pf)
     pf.textHost:SetFrameLevel(pf.cd:GetFrameLevel() + 5)
     pf.timer = pf.textHost:CreateFontString(nil, "OVERLAY")
+    pf.timer:SetFont((EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("extras")) or STANDARD_TEXT_FONT, 12,
+        (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE")
     pf.timer:SetText("")
 
     pf:Hide()
     return pf
 end
 
-local function EnsureFrames()
+local function EnsureRoot()
     if not rootFrame then
         rootFrame = CreateFrame("Frame", "EllesmereUIPrivateAuras", UIParent)
         rootFrame:SetFrameStrata("MEDIUM")
         rootFrame:SetSize(GetGridSize(P()))
         rootFrame:EnableMouse(false)
     end
-    for i = 1, MAX_SLOTS do
-        if not slotFrames[i] then
-            local f = CreateFrame("Frame", nil, rootFrame)
-            f:EnableMouse(false)
-            slotFrames[i] = f
-        end
-        if not previewFrames[i] then
-            previewFrames[i] = MakePreviewFrame(slotFrames[i])
-            local tex = (C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(PREVIEW_SPELLS[i])) or 134400
-            previewFrames[i].tex:SetTexture(tex)
-        end
+end
+
+local function EnsureSlot(i)
+    EnsureRoot()
+    if not slotFrames[i] then
+        local f = CreateFrame("Frame", nil, rootFrame)
+        f:EnableMouse(false)
+        slotFrames[i] = f
     end
+    if not previewFrames[i] then
+        previewFrames[i] = MakePreviewFrame(slotFrames[i])
+        local sp = PREVIEW_SPELLS[((i - 1) % #PREVIEW_SPELLS) + 1]
+        local tex = (C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(sp)) or 134400
+        previewFrames[i].tex:SetTexture(tex)
+    end
+end
+
+-- Kept for callers/back-compat: just makes sure the root exists.
+local function EnsureFrames()
+    EnsureRoot()
 end
 
 -------------------------------------------------------------------------------
@@ -164,6 +185,30 @@ local function SavePosition()
 end
 
 -------------------------------------------------------------------------------
+--  Slot layout (safe in combat) -- positions slot + preview frames in the grid
+-------------------------------------------------------------------------------
+local function LayoutSlots(p)
+    local sz = p.iconSize or 40
+    local n  = SlotCount(p)
+    rootFrame:SetSize(GetGridSize(p))
+    local anchor, growH, growV = GridAnchor(p)
+
+    for i = 1, n do
+        EnsureSlot(i)
+        local ox, oy = GridOffset(p, i, growH, growV)
+        local f = slotFrames[i]
+        f:SetSize(sz, sz)
+        f:ClearAllPoints()
+        f:SetPoint(anchor, rootFrame, anchor, ox, oy)
+        f:Show()
+        previewFrames[i]:SetSize(sz, sz)
+    end
+    for i = n + 1, #slotFrames do
+        if slotFrames[i] then slotFrames[i]:Hide() end
+    end
+end
+
+-------------------------------------------------------------------------------
 --  Anchor management (out-of-combat only)
 -------------------------------------------------------------------------------
 local function RemoveAllAnchors()
@@ -175,29 +220,8 @@ local function RemoveAllAnchors()
     wipe(anchorIDs)
 end
 
--- Lay out slot/preview frames for the current settings (safe in combat).
-local function LayoutSlots(p)
-    local sz = p.iconSize or 40
-    local n  = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
-    rootFrame:SetSize(GetGridSize(p))
-    for i = 1, MAX_SLOTS do
-        local f = slotFrames[i]
-        f:SetSize(sz, sz)
-        f:ClearAllPoints()
-        if i <= n then
-            local ox, oy = GetSlotOffset(p, i)
-            f:SetPoint("CENTER", rootFrame, "CENTER", ox, oy)
-            f:Show()
-        else
-            f:Hide()
-        end
-        local pf = previewFrames[i]
-        pf:SetSize(sz, sz)
-    end
-end
-
 local function ApplyAnchors()
-    if not rootFrame then return end
+    EnsureRoot()
     local p = P(); if not p then return end
 
     -- Adding/removing private-aura anchors is restricted in combat.
@@ -220,7 +244,7 @@ local function ApplyAnchors()
     local sz       = p.iconSize or 40
     local bScale   = p.showBorder and (p.borderScale or 1.0) or -100
     local borderPx = (sz / 16) * bScale
-    local n        = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
+    local n        = SlotCount(p)
     local dox, doy = p.durationOffsetX or 0, p.durationOffsetY or 0
     local hasOffset = (dox ~= 0 or doy ~= 0)  -- positions the numbers, not the swipe
 
@@ -259,7 +283,7 @@ end
 --  Preview (fake icons -- real ones only appear when a private aura is active)
 -------------------------------------------------------------------------------
 local function HidePreviewFrames()
-    for i = 1, MAX_SLOTS do
+    for i = 1, #previewFrames do
         if previewFrames[i] then previewFrames[i]:Hide() end
     end
 end
@@ -277,7 +301,7 @@ local function ArmSlotLoop(i, gen)
     if gen ~= _previewGen or not previewActive then return end
     local pf = previewFrames[i]
     if not pf or not pf:IsShown() then return end
-    local dur = PREVIEW_DURS[i] or 15
+    local dur = PREVIEW_DURS[((i - 1) % #PREVIEW_DURS) + 1] or 15
     pf._expiration = GetTime() + dur
     pf.cd:SetCooldown(GetTime(), dur)  -- drives the swipe; harmless when hidden
     C_Timer.After(dur, function() ArmSlotLoop(i, gen) end)
@@ -291,12 +315,10 @@ local function StartPreviewCooldowns(n)
     end
 end
 
--- Ticker that updates the separate timer text (independent of the swipe).
-local _previewTextTicker
 local function _updatePreviewText()
     if not previewActive then return end
     local p = P(); if not p then return end
-    local n = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
+    local n = SlotCount(p)
     for i = 1, n do
         local pf = previewFrames[i]
         if pf and pf.timer:IsShown() and pf._expiration then
@@ -306,20 +328,18 @@ local function _updatePreviewText()
     end
 end
 
--- Full live render of the preview icons. Re-runs on every settings change so
--- size / spacing / grow / slots / border / cooldown options update immediately,
--- using real spell art and animated cooldowns (matching Advanced Debuffs).
+-- Full live render of the preview icons (real spell art + animated cooldowns).
 local function RenderPreview(p)
     local PP = EllesmereUI and EllesmereUI.PP
     local sz = p.iconSize or 40
-    local n  = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
+    local n  = SlotCount(p)
     local dox, doy = p.durationOffsetX or 0, p.durationOffsetY or 0
 
-    LayoutSlots(p)      -- sizes rootFrame + slotFrames and positions them
+    LayoutSlots(p)
     ApplyPosition()
     rootFrame:Show()
 
-    for i = 1, MAX_SLOTS do
+    for i = 1, n do
         local f  = slotFrames[i]
         local pf = previewFrames[i]
         pf:ClearAllPoints()
@@ -327,7 +347,7 @@ local function RenderPreview(p)
         pf:SetPoint("CENTER", f, "CENTER", 0, 0)
         pf:SetFrameStrata("DIALOG")
 
-        -- Border: thickness scales with Border Scale (mirrors the real anchor's
+        -- Border thickness scales with Border Scale (mirrors the real anchor's
         -- borderScale = iconSize/16 * scale), and reflects Show Border.
         if PP then
             if p.showBorder ~= false then
@@ -341,19 +361,16 @@ local function RenderPreview(p)
             end
         end
 
-        -- Swipe: covers the whole icon, independent of the numbers.
+        -- Swipe covers the icon; timer is our own text, offset independently.
         local cd = pf.cd
         if p.showCountdown ~= false then
-            cd:ClearAllPoints()
-            cd:SetAllPoints(pf)
+            cd:ClearAllPoints(); cd:SetAllPoints(pf)
             cd:SetDrawSwipe(true)
             cd:Show()
         else
             cd:Hide()
         end
 
-        -- Timer numbers: our own text, positioned freely via the Timer Offset,
-        -- shown independently of the swipe.
         local tm = pf.timer
         tm:SetFont((EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("extras")) or STANDARD_TEXT_FONT,
             math.max(8, math.floor(sz * 0.4 + 0.5)),
@@ -362,14 +379,19 @@ local function RenderPreview(p)
         tm:SetPoint("CENTER", pf, "CENTER", dox, doy)
         if p.showNumbers ~= false then tm:Show() else tm:SetText(""); tm:Hide() end
 
-        if i <= n then pf:Show() else pf:Hide() end
+        pf:Show()
+    end
+
+    -- Hide any preview frames beyond the current count.
+    for i = n + 1, #previewFrames do
+        if previewFrames[i] then previewFrames[i]:Hide() end
     end
 
     StartPreviewCooldowns(n)
 end
 
 local function ShowPreview()
-    EnsureFrames()
+    EnsureRoot()
     local p = P(); if not p then return end
     previewActive = true
     RemoveAllAnchors()  -- don't run real anchors while previewing
@@ -396,7 +418,7 @@ _G._EUI_PrivateAuras_IsPreviewActive = function() return previewActive end
 -------------------------------------------------------------------------------
 local function Apply()
     if not addon.db then return end
-    EnsureFrames()
+    EnsureRoot()
     if previewActive then
         RemoveAllAnchors()        -- preview overrides the real anchors
         RenderPreview(P())
@@ -409,6 +431,8 @@ _G._EUI_PrivateAuras_Apply = Apply
 local function ResetDefaults()
     local p = P(); if not p then return end
     previewActive = false
+    _previewGen = _previewGen + 1
+    if _previewTextTicker then _previewTextTicker:Cancel(); _previewTextTicker = nil end
     HidePreviewFrames()
     wipe(p)
     for k, v in pairs(defaults.profile.privateAuras) do
@@ -457,7 +481,7 @@ local function RegisterUnlock()
                 return not p or not p.enabled
             end,
             getFrame = function()
-                if not rootFrame then EnsureFrames() end
+                EnsureRoot()
                 return rootFrame
             end,
             getSize = function()
@@ -501,7 +525,7 @@ boot:SetScript("OnEvent", function(self)
     end
     addon.db = EllesmereUI.Lite.NewDB("EllesmereUIQoLDB", defaults, true)
     _G._EUI_PrivateAuras_DB = function() return addon.db end
-    EnsureFrames()
+    EnsureRoot()
     _registerEvents()
     Apply()
     RegisterUnlock()

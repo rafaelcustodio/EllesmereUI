@@ -107,6 +107,8 @@ local defaults = {
             -- text / cooldown
             showDuration   = true,    -- show Blizzard's built-in cooldown countdown
             countSize      = 14,
+            countOffsetX   = 0,
+            countOffsetY   = 0,
             swipe          = true,
             reverse        = true,
             -- filtering
@@ -195,7 +197,7 @@ local function StyleButton(b, p)
     local flag = (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE"
     b.Count:SetFont(fontPath, p.countSize or 11, flag)
     b.Count:ClearAllPoints()
-    b.Count:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
+    b.Count:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2 + (p.countOffsetX or 0), 2 + (p.countOffsetY or 0))
 
     b._shape = shape
 

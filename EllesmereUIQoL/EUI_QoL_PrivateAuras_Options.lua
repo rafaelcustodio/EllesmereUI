@@ -33,8 +33,10 @@ end
 local function Enabled() return Cfg("enabled") and true or false end
 local function Disabled() return not Enabled() end
 
-local GROW_VALUES = { RIGHT = "Right", LEFT = "Left", UP = "Up", DOWN = "Down" }
-local GROW_ORDER  = { "RIGHT", "LEFT", "UP", "DOWN" }
+local GROWH_VALUES = { LEFT = "Left", RIGHT = "Right" }
+local GROWH_ORDER  = { "LEFT", "RIGHT" }
+local GROWV_VALUES = { DOWN = "Down", UP = "Up" }
+local GROWV_ORDER  = { "DOWN", "UP" }
 
 -------------------------------------------------------------------------------
 --  Page builder
@@ -78,33 +80,48 @@ local function BuildPrivateAurasPage(pageName, parent, yOffset)
     y = y - h
 
     row, h = W:DualRow(parent, y,
-        { type="slider", text="Slots",
-          tooltip="How many private-aura slots to display. The game shows mechanics in fixed slots; extra slots stay empty until used.",
-          disabled=Disabled,
-          min=1, max=5, step=1, isPercent=false,
-          getValue=function() return Cfg("slots") or 3 end,
-          setValue=function(v) Set("slots", v); Refresh() end },
         { type="slider", text="Icon Size",
           tooltip="Width and height of each private-aura icon, in pixels.",
           disabled=Disabled,
           min=20, max=128, step=1, isPercent=false,
           getValue=function() return Cfg("iconSize") or 40 end,
-          setValue=function(v) Set("iconSize", v); Refresh() end })
-    y = y - h
-
-    row, h = W:DualRow(parent, y,
+          setValue=function(v) Set("iconSize", v); Refresh() end },
         { type="slider", text="Icon Spacing",
           tooltip="Gap between adjacent icons, in pixels.",
           disabled=Disabled,
           min=0, max=60, step=1, isPercent=false,
           getValue=function() return Cfg("iconSpacing") or 6 end,
-          setValue=function(v) Set("iconSpacing", v); Refresh() end },
-        { type="dropdown", text="Grow Direction",
-          tooltip="Direction the slots line up from the anchor: Right, Left, Up or Down.",
+          setValue=function(v) Set("iconSpacing", v); Refresh() end })
+    y = y - h
+
+    row, h = W:DualRow(parent, y,
+        { type="slider", text="Icons Per Row",
+          tooltip="How many private-aura slots to place in a row before wrapping. The game fills slots in order; unused slots stay empty.",
           disabled=Disabled,
-          values=GROW_VALUES, order=GROW_ORDER,
-          getValue=function() return Cfg("growDir") or "RIGHT" end,
-          setValue=function(v) Set("growDir", v); Refresh() end })
+          min=1, max=8, step=1, isPercent=false,
+          getValue=function() return Cfg("iconsPerRow") or 3 end,
+          setValue=function(v) Set("iconsPerRow", v); Refresh() end },
+        { type="slider", text="Max Rows",
+          tooltip="Maximum number of rows of private-aura slots.",
+          disabled=Disabled,
+          min=1, max=4, step=1, isPercent=false,
+          getValue=function() return Cfg("maxRows") or 1 end,
+          setValue=function(v) Set("maxRows", v); Refresh() end })
+    y = y - h
+
+    row, h = W:DualRow(parent, y,
+        { type="dropdown", text="Grow Horizontal",
+          tooltip="Direction the row grows from its anchor point: to the Left or to the Right.",
+          disabled=Disabled,
+          values=GROWH_VALUES, order=GROWH_ORDER,
+          getValue=function() return Cfg("growHorizontal") or "RIGHT" end,
+          setValue=function(v) Set("growHorizontal", v); Refresh() end },
+        { type="dropdown", text="Grow Vertical",
+          tooltip="Direction extra rows are added: Down or Up.",
+          disabled=Disabled,
+          values=GROWV_VALUES, order=GROWV_ORDER,
+          getValue=function() return Cfg("growVertical") or "DOWN" end,
+          setValue=function(v) Set("growVertical", v); Refresh() end })
     y = y - h
 
     -- ── APPEARANCE & COOLDOWN ─────────────────────────────────────────
@@ -132,28 +149,43 @@ local function BuildPrivateAurasPage(pageName, parent, yOffset)
           getValue=function() return Cfg("showCountdown") ~= false end,
           setValue=function(v) Set("showCountdown", v); Refresh() end },
         { type="toggle", text="Show Countdown Numbers",
-          tooltip="Show the numeric countdown on each icon. Independent of the swipe -- you can have numbers without the sweep, or vice versa.",
+          tooltip="Show the numeric countdown on each icon. Independent of the swipe -- you can have numbers without the sweep, or vice versa. Use the cog to nudge their position.",
           disabled=Disabled,
           getValue=function() return Cfg("showNumbers") ~= false end,
           setValue=function(v) Set("showNumbers", v); Refresh() end })
     y = y - h
 
-    row, h = W:DualRow(parent, y,
-        { type="slider", text="Timer Offset X",
-          tooltip="Horizontal offset of the countdown numbers relative to the icon center (the swipe stays on the icon).",
-          disabled=function() return Disabled() or Cfg("showNumbers") == false end,
-          disabledTooltip="Enable Show Countdown Numbers to adjust this.",
-          min=-150, max=150, step=1, isPercent=false,
-          getValue=function() return Cfg("durationOffsetX") or 0 end,
-          setValue=function(v) Set("durationOffsetX", v); Refresh() end },
-        { type="slider", text="Timer Offset Y",
-          tooltip="Vertical offset of the countdown numbers relative to the icon center (the swipe stays on the icon).",
-          disabled=function() return Disabled() or Cfg("showNumbers") == false end,
-          disabledTooltip="Enable Show Countdown Numbers to adjust this.",
-          min=-150, max=150, step=1, isPercent=false,
-          getValue=function() return Cfg("durationOffsetY") or 0 end,
-          setValue=function(v) Set("durationOffsetY", v); Refresh() end })
-    y = y - h
+    -- Inline directions cog on Show Countdown Numbers: timer X/Y position
+    -- (addon-standard, like the Action Bars text offsets).
+    do
+        local PP = EllesmereUI.PP
+        local rgn = row._rightRegion
+        local function isDisabled() return Disabled() or Cfg("showNumbers") == false end
+        local _, cogShow = EllesmereUI.BuildCogPopup({
+            title = "Timer Position",
+            rows = {
+                { type="slider", label="X Offset", min=-150, max=150, step=1,
+                  get=function() return Cfg("durationOffsetX") or 0 end,
+                  set=function(v) Set("durationOffsetX", v); Refresh() end },
+                { type="slider", label="Y Offset", min=-150, max=150, step=1,
+                  get=function() return Cfg("durationOffsetY") or 0 end,
+                  set=function(v) Set("durationOffsetY", v); Refresh() end },
+            },
+        })
+        local cogBtn = CreateFrame("Button", nil, rgn)
+        cogBtn:SetSize(26, 26)
+        PP.Point(cogBtn, "RIGHT", rgn._control or rgn, "LEFT", -6, 0)
+        cogBtn:SetFrameLevel(rgn:GetFrameLevel() + 5)
+        local cogTex = cogBtn:CreateTexture(nil, "OVERLAY")
+        cogTex:SetAllPoints()
+        cogTex:SetTexture(EllesmereUI.DIRECTIONS_ICON)
+        local function UpdateAlpha() cogBtn:SetAlpha(isDisabled() and 0.15 or 0.4) end
+        EllesmereUI.RegisterWidgetRefresh(UpdateAlpha)
+        UpdateAlpha()
+        cogBtn:SetScript("OnClick", function(self) if not isDisabled() then cogShow(self) end end)
+        cogBtn:SetScript("OnEnter", function(self) if not isDisabled() then self:SetAlpha(0.75) end end)
+        cogBtn:SetScript("OnLeave", function() UpdateAlpha() end)
+    end
 
     _, h = W:Spacer(parent, y, 20); y = y - h
 
