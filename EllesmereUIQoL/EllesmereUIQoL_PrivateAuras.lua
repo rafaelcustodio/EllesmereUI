@@ -97,10 +97,21 @@ local function MakePreviewFrame(parent)
     if PP then PP.CreateBorder(pf, 0, 0, 0, 1, 1, "OVERLAY", 2) end
 
     -- Fake cooldown so the preview shows an animated swipe / numbers / offset.
+    -- Cooldown draws the SWIPE only; we render the timer ourselves so the swipe
+    -- and the numbers are independent (and the numbers can be offset freely).
     pf.cd = CreateFrame("Cooldown", nil, pf, "CooldownFrameTemplate")
     pf.cd:SetAllPoints(pf)
     pf.cd:SetDrawEdge(false)
+    pf.cd:SetHideCountdownNumbers(true)
     pf.cd:Hide()
+
+    -- Timer text on its own host frame, layered above the swipe and independent
+    -- of the cooldown frame's visibility.
+    pf.textHost = CreateFrame("Frame", nil, pf)
+    pf.textHost:SetAllPoints(pf)
+    pf.textHost:SetFrameLevel(pf.cd:GetFrameLevel() + 5)
+    pf.timer = pf.textHost:CreateFontString(nil, "OVERLAY")
+    pf.timer:SetText("")
 
     pf:Hide()
     return pf
@@ -211,7 +222,7 @@ local function ApplyAnchors()
     local borderPx = (sz / 16) * bScale
     local n        = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
     local dox, doy = p.durationOffsetX or 0, p.durationOffsetY or 0
-    local hasOffset = p.showCountdown and (dox ~= 0 or doy ~= 0)
+    local hasOffset = (dox ~= 0 or doy ~= 0)  -- positions the numbers, not the swipe
 
     for i = 1, n do
         local f = slotFrames[i]
@@ -253,14 +264,22 @@ local function HidePreviewFrames()
     end
 end
 
+local function FormatTime(s)
+    if not s or s <= 0 then return "" end
+    if s >= 60 then return string.format("%d:%02d", math.floor(s / 60), math.floor(s % 60)) end
+    if s >= 10 then return string.format("%d", math.floor(s)) end
+    return string.format("%.1f", s)
+end
+
 -- Self-scheduling loop so each preview icon shows an animated, repeating
 -- cooldown. The generation token invalidates timers from a previous render.
 local function ArmSlotLoop(i, gen)
     if gen ~= _previewGen or not previewActive then return end
     local pf = previewFrames[i]
-    if not pf or not pf.cd:IsShown() then return end
+    if not pf or not pf:IsShown() then return end
     local dur = PREVIEW_DURS[i] or 15
-    pf.cd:SetCooldown(GetTime(), dur)
+    pf._expiration = GetTime() + dur
+    pf.cd:SetCooldown(GetTime(), dur)  -- drives the swipe; harmless when hidden
     C_Timer.After(dur, function() ArmSlotLoop(i, gen) end)
 end
 
@@ -269,6 +288,21 @@ local function StartPreviewCooldowns(n)
     local gen = _previewGen
     for i = 1, n do
         ArmSlotLoop(i, gen)
+    end
+end
+
+-- Ticker that updates the separate timer text (independent of the swipe).
+local _previewTextTicker
+local function _updatePreviewText()
+    if not previewActive then return end
+    local p = P(); if not p then return end
+    local n = math.max(1, math.min(MAX_SLOTS, p.slots or 3))
+    for i = 1, n do
+        local pf = previewFrames[i]
+        if pf and pf.timer:IsShown() and pf._expiration then
+            local rem = pf._expiration - GetTime()
+            pf.timer:SetText(rem > 0 and FormatTime(rem) or "")
+        end
     end
 end
 
@@ -307,18 +341,26 @@ local function RenderPreview(p)
             end
         end
 
-        -- Cooldown swipe / numbers / timer offset.
+        -- Swipe: covers the whole icon, independent of the numbers.
         local cd = pf.cd
         if p.showCountdown ~= false then
             cd:ClearAllPoints()
-            cd:SetSize(sz, sz)
-            cd:SetPoint("CENTER", pf, "CENTER", dox, doy)
-            cd:SetHideCountdownNumbers(p.showNumbers == false)
+            cd:SetAllPoints(pf)
             cd:SetDrawSwipe(true)
             cd:Show()
         else
             cd:Hide()
         end
+
+        -- Timer numbers: our own text, positioned freely via the Timer Offset,
+        -- shown independently of the swipe.
+        local tm = pf.timer
+        tm:SetFont((EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("extras")) or STANDARD_TEXT_FONT,
+            math.max(8, math.floor(sz * 0.4 + 0.5)),
+            (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE")
+        tm:ClearAllPoints()
+        tm:SetPoint("CENTER", pf, "CENTER", dox, doy)
+        if p.showNumbers ~= false then tm:Show() else tm:SetText(""); tm:Hide() end
 
         if i <= n then pf:Show() else pf:Hide() end
     end
@@ -332,12 +374,16 @@ local function ShowPreview()
     previewActive = true
     RemoveAllAnchors()  -- don't run real anchors while previewing
     RenderPreview(p)
+    if not _previewTextTicker then
+        _previewTextTicker = C_Timer.NewTicker(0.1, _updatePreviewText)
+    end
 end
 _G._EUI_PrivateAuras_ShowPreview = ShowPreview
 
 local function HidePreview()
     previewActive = false
     _previewGen = _previewGen + 1  -- stop the looping preview cooldowns
+    if _previewTextTicker then _previewTextTicker:Cancel(); _previewTextTicker = nil end
     HidePreviewFrames()
     ApplyAnchors()
 end
