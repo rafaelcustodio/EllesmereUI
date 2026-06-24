@@ -33,8 +33,10 @@ end
 local function Enabled() return Cfg("enabled") and true or false end
 local function Disabled() return not Enabled() end
 
-local GROW_VALUES = { RIGHT = "Right", LEFT = "Left", UP = "Up", DOWN = "Down" }
-local GROW_ORDER  = { "RIGHT", "LEFT", "UP", "DOWN" }
+local GROWH_VALUES = { LEFT = "Left", RIGHT = "Right" }
+local GROWH_ORDER  = { "LEFT", "RIGHT" }
+local GROWV_VALUES = { DOWN = "Down", UP = "Up" }
+local GROWV_ORDER  = { "DOWN", "UP" }
 
 -------------------------------------------------------------------------------
 --  Page builder
@@ -78,33 +80,48 @@ local function BuildPrivateAurasPage(pageName, parent, yOffset)
     y = y - h
 
     row, h = W:DualRow(parent, y,
-        { type="slider", text="Slots",
-          tooltip="How many private-aura slots to display. The game shows mechanics in fixed slots; extra slots stay empty until used.",
-          disabled=Disabled,
-          min=1, max=5, step=1, isPercent=false,
-          getValue=function() return Cfg("slots") or 3 end,
-          setValue=function(v) Set("slots", v); Refresh() end },
         { type="slider", text="Icon Size",
           tooltip="Width and height of each private-aura icon, in pixels.",
           disabled=Disabled,
           min=20, max=128, step=1, isPercent=false,
           getValue=function() return Cfg("iconSize") or 40 end,
-          setValue=function(v) Set("iconSize", v); Refresh() end })
-    y = y - h
-
-    row, h = W:DualRow(parent, y,
+          setValue=function(v) Set("iconSize", v); Refresh() end },
         { type="slider", text="Icon Spacing",
           tooltip="Gap between adjacent icons, in pixels.",
           disabled=Disabled,
           min=0, max=60, step=1, isPercent=false,
           getValue=function() return Cfg("iconSpacing") or 6 end,
-          setValue=function(v) Set("iconSpacing", v); Refresh() end },
-        { type="dropdown", text="Grow Direction",
-          tooltip="Direction the slots line up from the anchor: Right, Left, Up or Down.",
+          setValue=function(v) Set("iconSpacing", v); Refresh() end })
+    y = y - h
+
+    row, h = W:DualRow(parent, y,
+        { type="slider", text="Icons Per Row",
+          tooltip="How many private-aura slots to place in a row before wrapping. The game fills slots in order; unused slots stay empty.",
           disabled=Disabled,
-          values=GROW_VALUES, order=GROW_ORDER,
-          getValue=function() return Cfg("growDir") or "RIGHT" end,
-          setValue=function(v) Set("growDir", v); Refresh() end })
+          min=1, max=8, step=1, isPercent=false,
+          getValue=function() return Cfg("iconsPerRow") or 3 end,
+          setValue=function(v) Set("iconsPerRow", v); Refresh() end },
+        { type="slider", text="Max Rows",
+          tooltip="Maximum number of rows of private-aura slots.",
+          disabled=Disabled,
+          min=1, max=4, step=1, isPercent=false,
+          getValue=function() return Cfg("maxRows") or 1 end,
+          setValue=function(v) Set("maxRows", v); Refresh() end })
+    y = y - h
+
+    row, h = W:DualRow(parent, y,
+        { type="dropdown", text="Grow Horizontal",
+          tooltip="Direction the row grows from its anchor point: to the Left or to the Right.",
+          disabled=Disabled,
+          values=GROWH_VALUES, order=GROWH_ORDER,
+          getValue=function() return Cfg("growHorizontal") or "RIGHT" end,
+          setValue=function(v) Set("growHorizontal", v); Refresh() end },
+        { type="dropdown", text="Grow Vertical",
+          tooltip="Direction extra rows are added: Down or Up.",
+          disabled=Disabled,
+          values=GROWV_VALUES, order=GROWV_ORDER,
+          getValue=function() return Cfg("growVertical") or "DOWN" end,
+          setValue=function(v) Set("growVertical", v); Refresh() end })
     y = y - h
 
     -- ── APPEARANCE & COOLDOWN ─────────────────────────────────────────
