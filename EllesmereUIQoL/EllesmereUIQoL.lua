@@ -1770,8 +1770,13 @@ do
         crosshairFrame._hBar = MakeArm("OVERLAY")
         crosshairFrame._vBar = MakeArm("OVERLAY")
 
-        -- Throttled recolor when the target is out of melee range. No-ops unless
-        -- the feature is enabled and the class has a mapped melee spell.
+        -- Optional on-screen warning text shown while the target is out of melee
+        -- range (configured in _applyCrosshair; hidden until the OnUpdate shows it).
+        crosshairFrame._meleeText = crosshairFrame:CreateFontString(nil, "OVERLAY")
+        crosshairFrame._meleeText:Hide()
+
+        -- Throttled recolor/text-toggle when the target is out of melee range.
+        -- No-ops unless a melee feature is enabled and the class has a mapped spell.
         local meleeAccum = 0
         crosshairFrame:SetScript("OnUpdate", function(self, elapsed)
             meleeAccum = meleeAccum + elapsed
@@ -1779,20 +1784,34 @@ do
             meleeAccum = 0
             local nc = self._normalColor
             if not nc then return end
-            if not (CrosshairGet("crosshairMeleeColorEnabled") and _meleeSpell) then
+            local colorOn = CrosshairGet("crosshairMeleeColorEnabled")
+            local textOn  = CrosshairGet("crosshairMeleeTextEnabled")
+            if not (_meleeSpell and (colorOn or textOn)) then
                 if self._meleeActive then
                     self._meleeActive = false
                     self._hBar:SetColorTexture(nc.r, nc.g, nc.b, nc.a)
                     self._vBar:SetColorTexture(nc.r, nc.g, nc.b, nc.a)
+                    if self._meleeText then self._meleeText:Hide() end
                 end
                 return
             end
             local outOfRange = TargetOutOfMelee()
             if outOfRange ~= self._meleeActive then
                 self._meleeActive = outOfRange
-                local c = outOfRange and (CrosshairGet("crosshairMeleeColor") or { r = 1, g = 0, b = 0, a = 1 }) or nc
-                self._hBar:SetColorTexture(c.r or 1, c.g or 0, c.b or 0, c.a or 1)
-                self._vBar:SetColorTexture(c.r or 1, c.g or 0, c.b or 0, c.a or 1)
+                -- Recolor the arms only when the colour feature is on; otherwise
+                -- keep them at the normal colour.
+                if colorOn then
+                    local c = outOfRange and (CrosshairGet("crosshairMeleeColor") or { r = 1, g = 0, b = 0, a = 1 }) or nc
+                    self._hBar:SetColorTexture(c.r or 1, c.g or 0, c.b or 0, c.a or 1)
+                    self._vBar:SetColorTexture(c.r or 1, c.g or 0, c.b or 0, c.a or 1)
+                else
+                    self._hBar:SetColorTexture(nc.r, nc.g, nc.b, nc.a)
+                    self._vBar:SetColorTexture(nc.r, nc.g, nc.b, nc.a)
+                end
+                -- Toggle the warning text independently of the colour feature.
+                if self._meleeText then
+                    if textOn and outOfRange then self._meleeText:Show() else self._meleeText:Hide() end
+                end
             end
         end)
     end
@@ -1853,9 +1872,27 @@ do
         vBar:SetColorTexture(cr, cg, cb, ca)
 
         -- Base colour for the out-of-melee-range recolor, reset the melee state
-        -- so the OnUpdate re-applies the range colour next tick if still needed.
+        -- so the OnUpdate re-applies the range colour/text next tick if still needed.
         crosshairFrame._normalColor = { r = cr, g = cg, b = cb, a = ca }
         crosshairFrame._meleeActive = false
+
+        -- Out-of-melee warning text: shares the melee-range colour, positioned
+        -- relative to the crosshair centre. Hidden here; OnUpdate re-shows it.
+        local mt = crosshairFrame._meleeText
+        if mt then
+            local tSize = G("crosshairMeleeTextSize") or 16
+            mt:SetFont(STANDARD_TEXT_FONT, tSize, "OUTLINE")
+            local txt = G("crosshairMeleeText")
+            if txt == nil or txt == "" then txt = "OUT OF MELEE" end
+            mt:SetText(txt)
+            local mc = G("crosshairMeleeColor") or { r = 1, g = 0, b = 0, a = 1 }
+            mt:SetTextColor(mc.r or 1, mc.g or 0, mc.b or 0, mc.a or 1)
+            local tyo = G("crosshairMeleeTextYOffset")
+            if tyo == nil then tyo = 40 end
+            mt:ClearAllPoints()
+            mt:SetPoint("CENTER", crosshairFrame, "CENTER", 0, tyo)
+            mt:Hide()
+        end
 
         -- Pixel border: a slightly larger bar of border colour behind each arm.
         if bSize and bSize > 0 then

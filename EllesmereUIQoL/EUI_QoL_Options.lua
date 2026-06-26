@@ -1355,6 +1355,15 @@ initFrame:SetScript("OnEvent", function(self)
                     { type="slider", label="Y Offset", min=-200, max=200, step=1,
                       get=function() return cget("crosshairYOffset") or 0 end,
                       set=function(v) dbset("crosshairYOffset", v) end },
+                    { type="input", label="Melee Text", inputWidth=120,
+                      get=function() return cget("crosshairMeleeText") or "OUT OF MELEE" end,
+                      set=function(v) cset("crosshairMeleeText", v); applyCH() end },
+                    { type="slider", label="Melee Text Size", min=8, max=48, step=1,
+                      get=function() return cget("crosshairMeleeTextSize") or 16 end,
+                      set=function(v) dbset("crosshairMeleeTextSize", v) end },
+                    { type="slider", label="Melee Text Y", min=-200, max=200, step=1,
+                      get=function() return cget("crosshairMeleeTextYOffset") or 40 end,
+                      set=function(v) dbset("crosshairMeleeTextYOffset", v) end },
                 },
             })
 
@@ -1453,6 +1462,22 @@ initFrame:SetScript("OnEvent", function(self)
             mcSwatch:SetAlpha(mcInitOff and 0.3 or 1)
             if mcInitOff then mcBlock:Show() else mcBlock:Hide() end
         end
+
+        -- Text Out of Melee Range (toggle; message/size/position live in the cog)
+        local meleeTextRow
+        meleeTextRow, h = W:DualRow(parent, y,
+            { type="toggle", text="Text Out of Melee Range",
+              tooltip="Shows a warning text on screen when your current target is out of melee range. Edit the message, size and position in the crosshair cog. The text uses the same colour as the melee-range colour.",
+              disabled=function() return crosshairOff() end,
+              disabledTooltip="Enable the crosshair to use this option.",
+              getValue=function() return cget("crosshairMeleeTextEnabled") == true end,
+              setValue=function(v)
+                cset("crosshairMeleeTextEnabled", v)
+                if EllesmereUI._applyCrosshair then EllesmereUI._applyCrosshair() end
+                EllesmereUI:RefreshPage()
+              end },
+            { type="label", text="" }
+        );  y = y - h
 
         _, h = W:Spacer(parent, y, 20);  y = y - h
 
