@@ -1587,6 +1587,203 @@ do
 end
 
 -------------------------------------------------------------------------------
+--  Combat Potion Reminder
+--  Flashes an on-screen reminder while a combat potion in your bags is off
+--  cooldown, but only inside Mythic raids (difficulty 16/233) and Mythic+
+--  (active keystone runs). Potions are auto-detected from the bags so the
+--  feature works with any potion (retail or otherwise) without configuration.
+-------------------------------------------------------------------------------
+do
+    -- API resolution (these were relocated under C_Item / C_Container on retail).
+    local GetInfoInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+    local GetCD          = (C_Item and C_Item.GetItemCooldown) or (C_Container and C_Container.GetItemCooldown) or GetItemCooldown
+    local NumSlots       = C_Container and C_Container.GetContainerNumSlots
+    local SlotItemID     = C_Container and C_Container.GetContainerItemID
+
+    local DEFAULT_TEXT = "Combat Potion Ready!"
+
+    local trackedPotions = {}   -- [itemID] = true, refreshed on bag changes
+    local potionOverlay
+    local potionTicker
+    local previewActive = false
+
+    -- True only inside Mythic raid or an active Mythic+ keystone run.
+    local function InMythicContent()
+        if C_ChallengeMode and C_ChallengeMode.IsChallengeModeActive
+           and C_ChallengeMode.IsChallengeModeActive() then
+            return true
+        end
+        local _, instType, diffID = GetInstanceInfo()
+        if instType == "raid" and (diffID == 16 or diffID == 233) then
+            return true  -- 16 = fixed-20 Mythic, 233 = flexible Mythic
+        end
+        return false
+    end
+
+    -- Rebuild the tracked-potion set from every bag (potions are class 0 / subclass 1).
+    local function ScanPotions()
+        wipe(trackedPotions)
+        if not (NumSlots and SlotItemID and GetInfoInstant) then return end
+        for bag = 0, 5 do
+            local slots = NumSlots(bag)
+            if slots then
+                for slot = 1, slots do
+                    local itemID = SlotItemID(bag, slot)
+                    if itemID then
+                        local _, _, _, _, _, classID, subClassID = GetInfoInstant(itemID)
+                        if classID == 0 and subClassID == 1 then
+                            trackedPotions[itemID] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- True if at least one tracked potion is off cooldown (ignores the GCD).
+    local function AnyPotionReady()
+        if not next(trackedPotions) then return false end
+        local now = GetTime()
+        for itemID in pairs(trackedPotions) do
+            local start, duration = GetCD(itemID)
+            if start ~= nil then
+                local dur = duration or 0
+                if dur <= 2 or (start + dur - now) <= 0 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function CreatePotionOverlay()
+        if potionOverlay then return end
+
+        potionOverlay = CreateFrame("Frame", nil, UIParent)
+        potionOverlay:SetSize(400, 40)
+        potionOverlay:SetFrameStrata("HIGH")
+        potionOverlay:SetFrameLevel(50)
+        potionOverlay:EnableMouse(false)
+        potionOverlay:SetMouseClickEnabled(false)
+
+        local fs = potionOverlay:CreateFontString(nil, "OVERLAY")
+        fs:SetFont(EllesmereUI.EXPRESSWAY or "Fonts\\FRIZQT__.TTF", 18, EllesmereUI.GetFontOutlineFlag("extras"))
+        fs:SetPoint("CENTER")
+        fs:SetText(DEFAULT_TEXT)
+        potionOverlay._text = fs
+
+        local function ApplySettings()
+            potionOverlay:ClearAllPoints()
+            local pos = EllesmereUIDB and EllesmereUIDB.combatPotionPos
+            if pos and pos.point then
+                potionOverlay:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, pos.x or 0, pos.y or 200)
+            else
+                local yOff = EllesmereUIDB and EllesmereUIDB.combatPotionYOffset or 200
+                potionOverlay:SetPoint("CENTER", UIParent, "CENTER", 0, yOff)
+            end
+            potionOverlay:SetScale(1)
+
+            local fontPath = EllesmereUI.GetFontPath("extras")
+            local sz = (EllesmereUIDB and EllesmereUIDB.combatPotionTextSize) or 30
+            fs:SetFont(fontPath, sz, EllesmereUI.GetFontOutlineFlag("extras"))
+
+            local c = EllesmereUIDB and EllesmereUIDB.combatPotionColor
+            if c then
+                fs:SetTextColor(c.r, c.g, c.b, 1)
+            else
+                fs:SetTextColor(0.3, 1, 0.3, 1)
+            end
+        end
+        potionOverlay._applySettings = ApplySettings
+
+        -- Slow, gentle pulse so a persistent reminder still draws the eye
+        -- without the urgency of the durability flash.
+        local ag = fs:CreateAnimationGroup()
+        local fadeOut = ag:CreateAnimation("Alpha")
+        fadeOut:SetFromAlpha(1)
+        fadeOut:SetToAlpha(0.55)
+        fadeOut:SetDuration(0.8)
+        fadeOut:SetOrder(1)
+        local fadeIn = ag:CreateAnimation("Alpha")
+        fadeIn:SetFromAlpha(0.55)
+        fadeIn:SetToAlpha(1)
+        fadeIn:SetDuration(0.8)
+        fadeIn:SetOrder(2)
+        ag:SetLooping("REPEAT")
+
+        potionOverlay._show = function()
+            ApplySettings()
+            potionOverlay._text:SetText(DEFAULT_TEXT)
+            potionOverlay:Show()
+            ag:Play()
+        end
+
+        potionOverlay:SetScript("OnHide", function() ag:Stop() end)
+        potionOverlay:Hide()
+    end
+
+    local function HideOverlay()
+        if potionOverlay then potionOverlay:Hide() end
+    end
+
+    -- Single periodic evaluation; cheap and early-outs when disabled / not eligible.
+    local function Evaluate()
+        if previewActive then return end
+        if not (EllesmereUIDB and EllesmereUIDB.combatPotionReminder) then
+            HideOverlay()
+            return
+        end
+        if not InMythicContent() then
+            HideOverlay()
+            return
+        end
+        if AnyPotionReady() then
+            CreatePotionOverlay()
+            potionOverlay._show()
+        else
+            HideOverlay()
+        end
+    end
+
+    EllesmereUI._applyCombatPotion = function()
+        CreatePotionOverlay()
+        potionOverlay._applySettings()
+    end
+    EllesmereUI._combatPotionApplySettings = EllesmereUI._applyCombatPotion
+
+    EllesmereUI._combatPotionPreview = function()
+        previewActive = true
+        CreatePotionOverlay()
+        potionOverlay._show()
+    end
+    EllesmereUI._combatPotionHidePreview = function()
+        previewActive = false
+        HideOverlay()
+        Evaluate()
+    end
+
+    local potionFrame = CreateFrame("Frame")
+    potionFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    potionFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+    potionFrame:RegisterEvent("BAG_UPDATE_DELAYED")
+    potionFrame:RegisterEvent("BAG_UPDATE_COOLDOWN")
+    potionFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+    potionFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    potionFrame:RegisterEvent("CHALLENGE_MODE_START")
+    potionFrame:RegisterEvent("CHALLENGE_MODE_COMPLETED")
+    potionFrame:SetScript("OnEvent", function(_, event)
+        if event == "PLAYER_ENTERING_WORLD" or event == "BAG_UPDATE_DELAYED" then
+            ScanPotions()
+        end
+        Evaluate()
+    end)
+
+    -- Safety-net ticker: BAG_UPDATE_COOLDOWN fires when a cooldown starts but not
+    -- reliably when it ends, so poll once a second to catch the potion coming up.
+    potionTicker = C_Timer.NewTicker(1, Evaluate)
+end
+
+-------------------------------------------------------------------------------
 --  Pixel-Perfect UI Scale
 -------------------------------------------------------------------------------
 do

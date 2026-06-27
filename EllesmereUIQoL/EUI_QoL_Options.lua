@@ -1086,6 +1086,206 @@ initFrame:SetScript("OnEvent", function(self)
             UpdateRestCogState()
         end
 
+        -- Row: Combat Potion Reminder (left, with eye+cog+swatch) |
+        local potionRow
+        potionRow, h = W:DualRow(parent, y,
+            { type="toggle", text="Combat Potion Reminder",
+              tooltip="Pulses an on-screen reminder while a combat potion in your bags is ready to use. Only triggers inside Mythic raids and Mythic+. Potions are auto-detected from your bags.",
+              getValue=function()
+                return EllesmereUIDB and EllesmereUIDB.combatPotionReminder or false
+              end,
+              setValue=function(v)
+                if not EllesmereUIDB then EllesmereUIDB = {} end
+                EllesmereUIDB.combatPotionReminder = v
+                if not v and EllesmereUI._combatPotionHidePreview then
+                    EllesmereUI._combatPotionHidePreview()
+                end
+                EllesmereUI:RefreshPage()
+              end },
+            { type="label", text="" }
+        );  y = y - h
+
+        -- Inline: eyeball | cog | color swatch on the combat potion toggle
+        do
+            local leftRgn = potionRow._leftRegion
+            local function potOff()
+                return not (EllesmereUIDB and EllesmereUIDB.combatPotionReminder)
+            end
+
+            -- Color swatch (rightmost inline, closest to toggle)
+            local potSwGet = function()
+                local c = EllesmereUIDB and EllesmereUIDB.combatPotionColor
+                if c then return c.r, c.g, c.b end
+                return 0.3, 1, 0.3
+            end
+            local potSwSet = function(r, g, b)
+                if not EllesmereUIDB then EllesmereUIDB = {} end
+                EllesmereUIDB.combatPotionColor = { r = r, g = g, b = b }
+                if EllesmereUI._applyCombatPotion then EllesmereUI._applyCombatPotion() end
+            end
+            local potSwatch, potUpdateSwatch = EllesmereUI.BuildColorSwatch(leftRgn, leftRgn:GetFrameLevel() + 5, potSwGet, potSwSet, nil, 20)
+            PP.Point(potSwatch, "RIGHT", leftRgn._control, "LEFT", -12, 0)
+            leftRgn._lastInline = potSwatch
+
+            local potSwBlock = CreateFrame("Frame", nil, potSwatch)
+            potSwBlock:SetAllPoints()
+            potSwBlock:SetFrameLevel(potSwatch:GetFrameLevel() + 10)
+            potSwBlock:EnableMouse(true)
+            potSwBlock:SetScript("OnEnter", function()
+                EllesmereUI.ShowWidgetTooltip(potSwatch, EllesmereUI.DisabledTooltip("Combat Potion Reminder"))
+            end)
+            potSwBlock:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+
+            EllesmereUI.RegisterWidgetRefresh(function()
+                local off = potOff()
+                if off then
+                    potSwatch:SetAlpha(0.3)
+                    potSwBlock:Show()
+                else
+                    potSwatch:SetAlpha(1)
+                    potSwBlock:Hide()
+                end
+                potUpdateSwatch()
+            end)
+            local potInitOff = potOff()
+            potSwatch:SetAlpha(potInitOff and 0.3 or 1)
+            if potInitOff then potSwBlock:Show() else potSwBlock:Hide() end
+
+            -- Cog popup for combat potion settings (left of swatch)
+            local _, potCogShow = EllesmereUI.BuildCogPopup({
+                title = "Combat Potion Settings",
+                rows = {
+                    { type="slider", label="Text Size",
+                      min=10, max=50, step=1,
+                      get=function()
+                        return (EllesmereUIDB and EllesmereUIDB.combatPotionTextSize) or 30
+                      end,
+                      set=function(v)
+                        if not EllesmereUIDB then EllesmereUIDB = {} end
+                        EllesmereUIDB.combatPotionTextSize = v
+                        if EllesmereUI._combatPotionApplySettings then EllesmereUI._combatPotionApplySettings() end
+                      end },
+                    { type="slider", label="Y-Offset",
+                      min=-600, max=600, step=1,
+                      get=function()
+                        return EllesmereUIDB and EllesmereUIDB.combatPotionYOffset or 200
+                      end,
+                      set=function(v)
+                        if not EllesmereUIDB then EllesmereUIDB = {} end
+                        EllesmereUIDB.combatPotionYOffset = v
+                        EllesmereUIDB.combatPotionPos = nil  -- clear custom pos so slider always takes effect
+                        if EllesmereUI._combatPotionPreview then EllesmereUI._combatPotionPreview() end
+                      end },
+                },
+            })
+            local potCogBtn = CreateFrame("Button", nil, leftRgn)
+            potCogBtn:SetSize(26, 26)
+            potCogBtn:SetPoint("RIGHT", leftRgn._lastInline or leftRgn._control, "LEFT", -9, 0)
+            leftRgn._lastInline = potCogBtn
+            potCogBtn:SetFrameLevel(leftRgn:GetFrameLevel() + 5)
+            potCogBtn:SetAlpha(potOff() and 0.15 or 0.4)
+            local potCogTex = potCogBtn:CreateTexture(nil, "OVERLAY")
+            potCogTex:SetAllPoints()
+            potCogTex:SetTexture(EllesmereUI.COGS_ICON)
+            potCogBtn:SetScript("OnEnter", function(self) self:SetAlpha(0.7) end)
+            potCogBtn:SetScript("OnLeave", function(self) self:SetAlpha(potOff() and 0.15 or 0.4) end)
+            potCogBtn:SetScript("OnClick", function(self) potCogShow(self) end)
+
+            local potCogBlock = CreateFrame("Frame", nil, potCogBtn)
+            potCogBlock:SetAllPoints()
+            potCogBlock:SetFrameLevel(potCogBtn:GetFrameLevel() + 10)
+            potCogBlock:EnableMouse(true)
+            potCogBlock:SetScript("OnEnter", function()
+                EllesmereUI.ShowWidgetTooltip(potCogBtn, EllesmereUI.DisabledTooltip("Combat Potion Reminder"))
+            end)
+            potCogBlock:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+
+            EllesmereUI.RegisterWidgetRefresh(function()
+                local off = potOff()
+                if off then
+                    potCogBtn:SetAlpha(0.15)
+                    potCogBlock:Show()
+                else
+                    potCogBtn:SetAlpha(0.4)
+                    potCogBlock:Hide()
+                end
+            end)
+            local potCogInitOff = potOff()
+            potCogBtn:SetAlpha(potCogInitOff and 0.15 or 0.4)
+            if potCogInitOff then potCogBlock:Show() else potCogBlock:Hide() end
+
+            -- Eye icon to toggle combat potion preview (left of cog)
+            local EYE_VISIBLE   = EllesmereUI.MEDIA_PATH .. "icons\\eui-visible.png"
+            local EYE_INVISIBLE = EllesmereUI.MEDIA_PATH .. "icons\\eui-invisible.png"
+            local potPreviewShown = false
+            local potEyeBtn = CreateFrame("Button", nil, leftRgn)
+            potEyeBtn:SetSize(26, 26)
+            potEyeBtn:SetPoint("RIGHT", leftRgn._lastInline or leftRgn._control, "LEFT", -8, 0)
+            leftRgn._lastInline = potEyeBtn
+            potEyeBtn:SetFrameLevel(leftRgn:GetFrameLevel() + 5)
+            potEyeBtn:SetAlpha(potOff() and 0.15 or 0.4)
+            local potEyeTex = potEyeBtn:CreateTexture(nil, "OVERLAY")
+            potEyeTex:SetAllPoints()
+            local function RefreshPotEye()
+                if potPreviewShown then
+                    potEyeTex:SetTexture(EYE_INVISIBLE)
+                else
+                    potEyeTex:SetTexture(EYE_VISIBLE)
+                end
+            end
+            RefreshPotEye()
+            potEyeBtn:SetScript("OnEnter", function(self)
+                self:SetAlpha(0.7)
+                EllesmereUI.ShowWidgetTooltip(self, "Preview combat potion reminder")
+            end)
+            potEyeBtn:SetScript("OnLeave", function(self)
+                EllesmereUI.HideWidgetTooltip()
+                self:SetAlpha(0.4)
+            end)
+            potEyeBtn:SetScript("OnClick", function(self)
+                potPreviewShown = not potPreviewShown
+                RefreshPotEye()
+                if potPreviewShown then
+                    if EllesmereUI._applyCombatPotion then EllesmereUI._applyCombatPotion() end
+                    if EllesmereUI._combatPotionPreview then
+                        EllesmereUI._combatPotionPreview()
+                    end
+                else
+                    if EllesmereUI._combatPotionHidePreview then
+                        EllesmereUI._combatPotionHidePreview()
+                    end
+                end
+            end)
+
+            local potEyeBlock = CreateFrame("Frame", nil, potEyeBtn)
+            potEyeBlock:SetAllPoints()
+            potEyeBlock:SetFrameLevel(potEyeBtn:GetFrameLevel() + 10)
+            potEyeBlock:EnableMouse(true)
+            potEyeBlock:SetScript("OnEnter", function()
+                EllesmereUI.ShowWidgetTooltip(potEyeBtn, EllesmereUI.DisabledTooltip("Combat Potion Reminder"))
+            end)
+            potEyeBlock:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+
+            EllesmereUI.RegisterWidgetRefresh(function()
+                local off = potOff()
+                if off then
+                    potPreviewShown = false
+                    RefreshPotEye()
+                    potEyeBtn:SetAlpha(0.15)
+                    potEyeBlock:Show()
+                    if EllesmereUI._combatPotionHidePreview then
+                        EllesmereUI._combatPotionHidePreview()
+                    end
+                else
+                    potEyeBtn:SetAlpha(0.4)
+                    potEyeBlock:Hide()
+                end
+            end)
+            local potEyeInitOff = potOff()
+            potEyeBtn:SetAlpha(potEyeInitOff and 0.15 or 0.4)
+            if potEyeInitOff then potEyeBlock:Show() else potEyeBlock:Hide() end
+        end
+
         _, h = W:Spacer(parent, y, 20);  y = y - h
 
         ---------------------------------------------------------------------------
@@ -1603,7 +1803,7 @@ initFrame:SetScript("OnEvent", function(self)
         title       = "Quality of Life",
         description = "Quality of life features and custom cursor.",
         pages       = { PAGE_QOL, PAGE_CURSOR, PAGE_ADVDEBUFFS, PAGE_PRIVAURAS, PAGE_AUTOLOG, PAGE_UPGCALC, PAGE_SHIFTER },
-        searchTerms = { "brez", "bres", "battle res", "combat res", "cursor", "macro", "fps", "logging", "combat log", "warcraft logs", "upgrade", "ilvl", "item level", "crest", "upgrade calculator", "shifter", "move", "drag", "position", "demodal", "drift", "debuff", "debuffs", "advanced debuffs", "aura", "dispel", "blocklist", "private aura", "private auras", "boss", "mechanic", "anchor" },
+        searchTerms = { "brez", "bres", "battle res", "combat res", "cursor", "macro", "fps", "logging", "combat log", "warcraft logs", "upgrade", "ilvl", "item level", "crest", "upgrade calculator", "shifter", "move", "drag", "position", "demodal", "drift", "debuff", "debuffs", "advanced debuffs", "aura", "dispel", "blocklist", "private aura", "private auras", "boss", "mechanic", "anchor", "potion", "combat potion", "potion reminder", "consumable", "mythic" },
         buildPage   = function(pageName, parent, yOffset)
             if pageName == PAGE_QOL then
                 return BuildQoLPage(pageName, parent, yOffset)
@@ -1653,6 +1853,11 @@ initFrame:SetScript("OnEvent", function(self)
                 EllesmereUIDB.autoRepairGuild = false
                 EllesmereUIDB.shifterEnabled = false
                 EllesmereUIDB.shifterPositions = nil
+                EllesmereUIDB.combatPotionReminder = false
+                EllesmereUIDB.combatPotionColor = nil
+                EllesmereUIDB.combatPotionTextSize = nil
+                EllesmereUIDB.combatPotionYOffset = nil
+                EllesmereUIDB.combatPotionPos = nil
             end
             EllesmereUIDB.autoLogging = nil
             if _G._EUI_ResetUpgradeCalc then _G._EUI_ResetUpgradeCalc() end
@@ -1662,6 +1867,7 @@ initFrame:SetScript("OnEvent", function(self)
             if EllesmereUI._applyHideBlizzardPartyFrame then EllesmereUI._applyHideBlizzardPartyFrame() end
             if EllesmereUI._applyQuickSignup then EllesmereUI._applyQuickSignup() end
             if EllesmereUI._applyPersistSignupNote then EllesmereUI._applyPersistSignupNote() end
+            if EllesmereUI._combatPotionHidePreview then EllesmereUI._combatPotionHidePreview() end
             EllesmereUI:InvalidatePageCache()
         end,
     })
