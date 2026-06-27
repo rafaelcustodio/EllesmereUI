@@ -194,6 +194,38 @@ local function ShortLabel(name, classOverride)
 end
 
 -------------------------------------------------------------------------------
+--  Foreign raid-buff request: clicking a raid buff the player can't provide
+--  asks the group for it in chat. SendChatMessage is insecure and works in
+--  combat, so no secure attribute is needed (unlike the cast path). Exposed
+--  on _G (same pattern as _EABR_RequestRefresh) so the PostClick closure can
+--  reach it without an extra file-scope local. (do..end adds no such local.)
+-------------------------------------------------------------------------------
+do
+    local lastSent = {}
+    _G._EABR_RequestBuff = function(spellID)
+        if not spellID then return end
+        local channel
+        if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+            channel = "INSTANCE_CHAT"
+        elseif IsInRaid() then
+            channel = "RAID"
+        elseif IsInGroup() then
+            channel = "PARTY"
+        else
+            return  -- solo: nobody to ask
+        end
+        -- Throttle per spell so accidental double-clicks don't spam chat.
+        local now = GetTime()
+        if lastSent[spellID] and (now - lastSent[spellID]) < 5 then return end
+        lastSent[spellID] = now
+        -- Localized spell name so groupmates read it in their own client locale.
+        local name = (C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID))
+                     or (GetSpellInfo and GetSpellInfo(spellID)) or "?"
+        SendChatMessage(EllesmereUI.Lf("%s please", name), channel)
+    end
+end
+
+-------------------------------------------------------------------------------
 --  Instance / Difficulty helpers
 --  Cached per-frame: call CacheInstanceInfo() at the start of Refresh()
 -------------------------------------------------------------------------------
@@ -1435,6 +1467,7 @@ local defaults = {
         raidBuffs = {
             showNonInstanced = false,
             showOthersMissing = true,
+            showForeign = false,
             scale = 1.0,
             enabled = {
                 motw=true, bshout=true, fort=true, ai=true, bronze=true, sky=true, hmark=true,
@@ -1720,11 +1753,16 @@ local function GetOrCreateIcon(index)
     btn:SetFrameStrata(GetStrata())
     btn:Hide()
 
-    -- Middle-click dismiss: hide this reminder until the next loading screen
-    btn:HookScript("PostClick", function(self, button)
+    -- Middle-click dismiss: hide this reminder until the next loading screen.
+    -- Left-click on a "request" reminder (a raid buff the player can't provide)
+    -- asks the group in chat. Both buttons register Down+Up, so PostClick fires
+    -- twice per click; gate the request on the Up event (not down) to send once.
+    btn:HookScript("PostClick", function(self, button, down)
         if button == "MiddleButton" and self._dismissKey then
             _dismissedUntilLoad[self._dismissKey] = true
             if _G._EABR_RequestRefresh then _G._EABR_RequestRefresh() end
+        elseif button == "LeftButton" and not down and self._requestSpell then
+            _G._EABR_RequestBuff(self._requestSpell)
         end
     end)
 
@@ -1824,6 +1862,7 @@ do
         e.texture = nil; e.label = nil; e.unit = nil; e.desaturated = false
         e.tooltipItem = nil
         e.cat = nil; e.data = nil; e.scale = 1.0; e.dismissKey = nil
+        e.requestSpell = nil
         return e
     end
 
@@ -1849,6 +1888,8 @@ do
         end
         btn._text:SetText(m.label or "")
         btn._icon:SetDesaturated(m.desaturated or false)
+        -- Request reminders carry the spell to ask for; nil for castable ones.
+        btn._requestSpell = m.requestSpell
     end
 end
 
@@ -1942,9 +1983,32 @@ local rb = db.profile.raidBuffs
 if inInstance or rb.showNonInstanced then
     local _, iType = IsInInstance()
     local inPvP = (iType == "pvp" or iType == "arena")
+    local inGroup = IsInGroup() or IsInRaid()
+    -- Foreign buffs (ones the player can't provide) are only relevant in a
+    -- group AND when a class that can cast them is actually present, so the
+    -- request reminder never nags for an impossible buff. Build the set of
+    -- present classes once per pass instead of re-scanning per buff.
+    local presentClasses
+    if rb.showForeign and inGroup then
+        presentClasses = {}
+        presentClasses[playerClass] = true
+        if IsInRaid() then
+            for i = 1, GetNumGroupMembers() do
+                local _, c = UnitClass("raid"..i); if c then presentClasses[c] = true end
+            end
+        else
+            for i = 1, GetNumSubgroupMembers() do
+                local _, c = UnitClass("party"..i); if c then presentClasses[c] = true end
+            end
+        end
+    end
     for _, buff in ipairs(RAID_BUFFS) do
-        if rb.enabled[buff.key] and (buff.class == playerClass) and Known(buff.castSpell)
-           and not (buff.noPvP and inPvP) then
+        local isOwn = (buff.class == playerClass) and Known(buff.castSpell)
+        -- Foreign: a buff the player can't cast, shown only as a chat request
+        -- when enabled, in a group, and a provider class is present.
+        local isForeign = (not isOwn) and rb.showForeign and inGroup
+                          and presentClasses and presentClasses[buff.class] and true
+        if rb.enabled[buff.key] and (isOwn or isForeign) and not (buff.noPvP and inPvP) then
             -- In combat, skip buffs whose IDs are not all whitelisted
             local canCheck = true
             if inCombat then
@@ -1958,18 +2022,28 @@ if inInstance or rb.showNonInstanced then
             end
             if canCheck then
                 local isMissing = false
-                if buff.check == "huntersMark" then
+                if isForeign then
+                    -- Player or any in-range member missing it (group-wide).
+                    isMissing = AnyGroupMemberMissingBuff(buff.buffIDs)
+                elseif buff.check == "huntersMark" then
                     isMissing = inCombat and _huntersMarkNeeded
-                elseif rb.showOthersMissing and buff.check == "raid" and (IsInGroup() or IsInRaid()) then
+                elseif rb.showOthersMissing and buff.check == "raid" and inGroup then
                     isMissing = AnyGroupMemberMissingBuff(buff.buffIDs)
                 else
                     isMissing = not PlayerHasAuraByID(buff.buffIDs)
                 end
                 if isMissing then
                     local e = AcquireEntry()
-                    e.mode = "spell"; e.spellID = buff.castSpell
+                    if isForeign then
+                        -- Can't cast it; left-click asks the group in chat.
+                        e.mode = "texture"; e.texture = Tex(buff.castSpell)
+                        e.spellID = buff.castSpell      -- tooltip only
+                        e.requestSpell = buff.castSpell -- drives the chat request
+                    else
+                        e.mode = "spell"; e.spellID = buff.castSpell
+                        if buff.check == "huntersMark" then e.unit = "target" end
+                    end
                     e.label = ShortLabel(buff.name)
-                    if buff.check == "huntersMark" then e.unit = "target" end
                     e.cat = "raidbuff"; e.data = buff; e.scale = rb.scale or 1.0
                     e.dismissKey = buff.key and ("raidbuff:" .. buff.key) or nil
                     missing[#missing+1] = e
@@ -3400,6 +3474,12 @@ function EABR:OnEnable()
                 _isEvokerOwnOnRaid = true
                 break
             end
+        end
+        -- "Track Missing Group Buffs" needs broad UNIT_AURA so other members'
+        -- missing foreign buffs refresh in real time, even when the player's
+        -- own class provides no raid buff.
+        if db and db.profile.raidBuffs and db.profile.raidBuffs.showForeign then
+            _needGroupAura = true
         end
         if _needGroupAura then
             mainFrame:RegisterEvent("GROUP_JOINED")

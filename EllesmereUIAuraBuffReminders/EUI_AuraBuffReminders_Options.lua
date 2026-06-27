@@ -1015,6 +1015,18 @@ initFrame:SetScript("OnEvent", function(self)
               setValue=function(v) local r = RDB(); if r then r.showNonInstanced = v; RefreshAll() end end }
         );  y = y - h
 
+        -- Track buffs the player's own class can't provide (other classes'
+        -- raid buffs). Shown only when a class that can cast it is in the
+        -- group; left-click the reminder to ask for it in chat. Spacer in the
+        -- right column keeps the toggle aligned under the first column above.
+        _, h = W:DualRow(parent, y,
+            { type="toggle", text="Track Missing Group Buffs",
+              tooltip="Also remind you about raid buffs your class can't cast (e.g. Battle Shout for a Mage), but only when someone who can provide it is in your group or raid. Left-click the reminder to ask for the buff in group chat.",
+              getValue=function() local r = RDB(); return r and r.showForeign end,
+              setValue=function(v) local r = RDB(); if r then r.showForeign = v; if _G._EABR_UpdateGroupAuraRegistration then _G._EABR_UpdateGroupAuraRegistration() end; RefreshAll() end end },
+            { type="spacer" }
+        );  y = y - h
+
         -- 4-column checkbox grid for individual raid buffs
         do
             local RAID_BUFFS = _G._EABR_RAID_BUFFS or {}
