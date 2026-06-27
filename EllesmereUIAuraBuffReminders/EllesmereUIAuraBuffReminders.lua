@@ -172,6 +172,7 @@ end
 --  ShortLabel shorten buff/aura names for icon text display
 -------------------------------------------------------------------------------
 local LABEL_OVERRIDES = {
+    ["Battle Stance"]           = "Stance",
     ["Defensive Stance"]        = "Stance",
     ["Berserker Stance"]        = "Stance",
     ["Devotion Aura"]           = "Aura",
@@ -191,6 +192,38 @@ local function ShortLabel(name, classOverride)
     end
     if LABEL_OVERRIDES[name] then return LABEL_OVERRIDES[name] end
     return name:match("^(%S+)") or name
+end
+
+-------------------------------------------------------------------------------
+--  Foreign raid-buff request: clicking a raid buff the player can't provide
+--  asks the group for it in chat. SendChatMessage is insecure and works in
+--  combat, so no secure attribute is needed (unlike the cast path). Exposed
+--  on _G (same pattern as _EABR_RequestRefresh) so the PostClick closure can
+--  reach it without an extra file-scope local. (do..end adds no such local.)
+-------------------------------------------------------------------------------
+do
+    local lastSent = {}
+    _G._EABR_RequestBuff = function(spellID)
+        if not spellID then return end
+        local channel
+        if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+            channel = "INSTANCE_CHAT"
+        elseif IsInRaid() then
+            channel = "RAID"
+        elseif IsInGroup() then
+            channel = "PARTY"
+        else
+            return  -- solo: nobody to ask
+        end
+        -- Throttle per spell so accidental double-clicks don't spam chat.
+        local now = GetTime()
+        if lastSent[spellID] and (now - lastSent[spellID]) < 5 then return end
+        lastSent[spellID] = now
+        -- Localized spell name so groupmates read it in their own client locale.
+        local name = (C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID))
+                     or (GetSpellInfo and GetSpellInfo(spellID)) or "?"
+        SendChatMessage(EllesmereUI.Lf("%s please", name), channel)
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -453,6 +486,20 @@ local function PlayerHasAuraByID(spellIDs)
         end
     end
     return false
+end
+
+-- Warrior stances are shapeshift forms, not auras, so GetPlayerAuraBySpellID can't
+-- detect them. Scan the stance bar instead: return whether the stance (by its cast
+-- spell ID) is known (present in the bar) and whether it is currently active.
+local function GetStanceState(stanceSpellID)
+    local numForms = GetNumShapeshiftForms()
+    for i = 1, numForms do
+        local _, isActive, _, spellID = GetShapeshiftFormInfo(i)
+        if spellID == stanceSpellID then
+            return true, isActive
+        end
+    end
+    return false, false
 end
 
 -- Shared helpers for group aura scanning (hoisted to avoid per-call closure allocation)
@@ -774,11 +821,15 @@ local AURAS = {
     -- Symbiotic Relationship: player gets a buff when active (group only)
     { key="symbiotic",  class="DRUID",   name="Symbiotic Relationship", castSpell=474750, buffIDs={474754},
       check="player", combatOk=false, requireGroup=true },
-    -- Warrior stances: NOT on non-secret list, OOC only
-    { key="def_stance",  class="WARRIOR", name="Defensive Stance",  castSpell=386208, buffIDs={386208},
-      check="player", specs={73}, combatOk=false },
+    -- Warrior stances: shapeshift forms (detected via the stance bar, not auras), OOC only.
+    -- Arms -> Battle Stance; Fury -> Berserker Stance; Prot -> Defensive Stance. The reminder
+    -- hides once the desired stance is active and is suppressed entirely if it isn't known.
+    { key="battle_stance",  class="WARRIOR", name="Battle Stance",   castSpell=386164, buffIDs={386164},
+      check="player", specs={71}, combatOk=false, isStance=true },
     { key="berserk_stance", class="WARRIOR", name="Berserker Stance", castSpell=386196, buffIDs={386196},
-      check="player", specs={71, 72}, combatOk=false },
+      check="player", specs={72}, combatOk=false, isStance=true },
+    { key="def_stance",  class="WARRIOR", name="Defensive Stance",  castSpell=386208, buffIDs={386208},
+      check="player", specs={73}, combatOk=false, isStance=true },
     -- Shadowform: OOC only. Void Form (194249) also satisfies the check.
     -- shapeshiftIndex=1: fallback for PvP instances where aura API is restricted.
     { key="shadowform", class="PRIEST",  name="Shadowform",        castSpell=232698, buffIDs={232698, 194249},
@@ -1062,7 +1113,7 @@ local RUNE_BUFF_IDS = {1264426, 453250, 1234969, 1242347, 393438, 347901}
 
 -- Inky Black Potion
 local INKY_BLACK_ITEM = 124640
-local INKY_BLACK_BUFF = 242783  -- buff applied by Inky Black Potion
+local INKY_BLACK_BUFF = 185394  -- "Inky Blackness" buff (icon 136122); detected by aura scan, see PlayerHasInkyBlackness
 
 -------------------------------------------------------------------------------
 --  Helpers: Well Fed / Flask buff detection (by name, not spell ID secret)
@@ -1118,6 +1169,27 @@ local function PlayerHasFlaskBuff()
         _AC.ensureNames()
         for aName in pairs(_AC.byName) do
             if FLASK_NAME_SET[aName] then return true end
+        end
+    end
+    return false
+end
+
+local function PlayerHasInkyBlackness()
+    -- Aura API is restricted in PvP and M+ keystones; suppress since the buff
+    -- can't be read there and the player can't act on it mid-key (mirrors flask/food).
+    if InPvPInstance() then return true end
+    if InMythicPlusKey() then return true end
+    for i = 1, AURA_SCAN_LIMIT do
+        local aura = C_UnitAuras.GetAuraDataByIndex("player", i, "HELPFUL")
+        if not aura then break end
+        local sid = aura.spellId
+        local ic = aura.icon
+        if (sid and not isSecret(sid) and sid == INKY_BLACK_BUFF)
+        or (ic and not isSecret(ic) and ic == 136122) then
+            if IsUnderDuration(aura.duration, aura.expirationTime) then
+                return false
+            end
+            return true
         end
     end
     return false
@@ -1251,7 +1323,7 @@ end
 --  Resolve bag/equip-derived consumable display items. This is the costly part
 --  of the consumable check (Find*Item data-table walks + GetWeaponCategory) and
 --  depends ONLY on bags, equipped weapon type, and the preferred-item settings
---  (+ db.char.lastUsed*), none of which change between refreshes. Rebuilt lazily
+--  (+ db.profile.lastUsed*), none of which change between refreshes. Rebuilt lazily
 --  when one of those changes; CollectConsumables reads the resolved records each
 --  refresh and derives the icon at emit. Preserves every branch's exact item
 --  selection, fallback ordering, and hasBags/desaturated behavior.
@@ -1277,9 +1349,9 @@ function EABR.ResolveConsumables()
     R.dirty = false
     sig.pf, sig.pfd, sig.pwe = pf, pfd, pwe
 
-    local luf  = db.char and db.char.lastUsedFlask or nil
-    local lufd = db.char and db.char.lastUsedFood or nil
-    local luwe = db.char and db.char.lastUsedWeaponEnchant or nil
+    local luf  = db.profile and db.profile.lastUsedFlask or nil
+    local lufd = db.profile and db.profile.lastUsedFood or nil
+    local luwe = db.profile and db.profile.lastUsedWeaponEnchant or nil
 
     -- Augment Rune: void preferred over ethereal; nil if neither in bags.
     local runeItem = nil
@@ -1435,6 +1507,7 @@ local defaults = {
         raidBuffs = {
             showNonInstanced = false,
             showOthersMissing = true,
+            showForeign = false,
             scale = 1.0,
             enabled = {
                 motw=true, bshout=true, fort=true, ai=true, bronze=true, sky=true, hmark=true,
@@ -1444,7 +1517,7 @@ local defaults = {
             showNonInstanced = true,
             scale = 1.0,
             enabled = {
-                symbiotic=true, def_stance=true, berserk_stance=true, shadowform=true,
+                symbiotic=true, battle_stance=true, def_stance=true, berserk_stance=true, shadowform=true,
                 devo_aura=true, bol=true, bof=true, som=true, blistering_scales=true, 
                 bestow_weyrnstone=true, timelessness=true,
             },
@@ -1473,11 +1546,6 @@ local defaults = {
         unlockPos = nil,
         talentReminders = {},  -- array of {zoneIDs={}, zoneNames={}, spellID=number, spellName=string, showNotNeeded=bool}
         talentReminderYOffset = -50,
-    },
-    char = {
-        lastUsedFlask = nil,
-        lastUsedFood = nil,
-        lastUsedWeaponEnchant = nil,
     },
 }
 
@@ -1720,11 +1788,16 @@ local function GetOrCreateIcon(index)
     btn:SetFrameStrata(GetStrata())
     btn:Hide()
 
-    -- Middle-click dismiss: hide this reminder until the next loading screen
-    btn:HookScript("PostClick", function(self, button)
+    -- Middle-click dismiss: hide this reminder until the next loading screen.
+    -- Left-click on a "request" reminder (a raid buff the player can't provide)
+    -- asks the group in chat. Both buttons register Down+Up, so PostClick fires
+    -- twice per click; gate the request on the Up event (not down) to send once.
+    btn:HookScript("PostClick", function(self, button, down)
         if button == "MiddleButton" and self._dismissKey then
             _dismissedUntilLoad[self._dismissKey] = true
             if _G._EABR_RequestRefresh then _G._EABR_RequestRefresh() end
+        elseif button == "LeftButton" and not down and self._requestSpell then
+            _G._EABR_RequestBuff(self._requestSpell)
         end
     end)
 
@@ -1824,6 +1897,7 @@ do
         e.texture = nil; e.label = nil; e.unit = nil; e.desaturated = false
         e.tooltipItem = nil
         e.cat = nil; e.data = nil; e.scale = 1.0; e.dismissKey = nil
+        e.requestSpell = nil
         return e
     end
 
@@ -1849,6 +1923,8 @@ do
         end
         btn._text:SetText(m.label or "")
         btn._icon:SetDesaturated(m.desaturated or false)
+        -- Request reminders carry the spell to ask for; nil for castable ones.
+        btn._requestSpell = m.requestSpell
     end
 end
 
@@ -1942,9 +2018,32 @@ local rb = db.profile.raidBuffs
 if inInstance or rb.showNonInstanced then
     local _, iType = IsInInstance()
     local inPvP = (iType == "pvp" or iType == "arena")
+    local inGroup = IsInGroup() or IsInRaid()
+    -- Foreign buffs (ones the player can't provide) are only relevant in a
+    -- group AND when a class that can cast them is actually present, so the
+    -- request reminder never nags for an impossible buff. Build the set of
+    -- present classes once per pass instead of re-scanning per buff.
+    local presentClasses
+    if rb.showForeign and inGroup then
+        presentClasses = {}
+        presentClasses[playerClass] = true
+        if IsInRaid() then
+            for i = 1, GetNumGroupMembers() do
+                local _, c = UnitClass("raid"..i); if c then presentClasses[c] = true end
+            end
+        else
+            for i = 1, GetNumSubgroupMembers() do
+                local _, c = UnitClass("party"..i); if c then presentClasses[c] = true end
+            end
+        end
+    end
     for _, buff in ipairs(RAID_BUFFS) do
-        if rb.enabled[buff.key] and (buff.class == playerClass) and Known(buff.castSpell)
-           and not (buff.noPvP and inPvP) then
+        local isOwn = (buff.class == playerClass) and Known(buff.castSpell)
+        -- Foreign: a buff the player can't cast, shown only as a chat request
+        -- when enabled, in a group, and a provider class is present.
+        local isForeign = (not isOwn) and rb.showForeign and inGroup
+                          and presentClasses and presentClasses[buff.class] and true
+        if rb.enabled[buff.key] and (isOwn or isForeign) and not (buff.noPvP and inPvP) then
             -- In combat, skip buffs whose IDs are not all whitelisted
             local canCheck = true
             if inCombat then
@@ -1958,18 +2057,28 @@ if inInstance or rb.showNonInstanced then
             end
             if canCheck then
                 local isMissing = false
-                if buff.check == "huntersMark" then
+                if isForeign then
+                    -- Player or any in-range member missing it (group-wide).
+                    isMissing = AnyGroupMemberMissingBuff(buff.buffIDs)
+                elseif buff.check == "huntersMark" then
                     isMissing = inCombat and _huntersMarkNeeded
-                elseif rb.showOthersMissing and buff.check == "raid" and (IsInGroup() or IsInRaid()) then
+                elseif rb.showOthersMissing and buff.check == "raid" and inGroup then
                     isMissing = AnyGroupMemberMissingBuff(buff.buffIDs)
                 else
                     isMissing = not PlayerHasAuraByID(buff.buffIDs)
                 end
                 if isMissing then
                     local e = AcquireEntry()
-                    e.mode = "spell"; e.spellID = buff.castSpell
+                    if isForeign then
+                        -- Can't cast it; left-click asks the group in chat.
+                        e.mode = "texture"; e.texture = Tex(buff.castSpell)
+                        e.spellID = buff.castSpell      -- tooltip only
+                        e.requestSpell = buff.castSpell -- drives the chat request
+                    else
+                        e.mode = "spell"; e.spellID = buff.castSpell
+                        if buff.check == "huntersMark" then e.unit = "target" end
+                    end
                     e.label = ShortLabel(buff.name)
-                    if buff.check == "huntersMark" then e.unit = "target" end
                     e.cat = "raidbuff"; e.data = buff; e.scale = rb.scale or 1.0
                     e.dismissKey = buff.key and ("raidbuff:" .. buff.key) or nil
                     missing[#missing+1] = e
@@ -1987,7 +2096,8 @@ if inInstance or au.showNonInstanced then
     for _, aura in ipairs(AURAS) do
         if aura.standalone then
             -- Handled by standalone system, skip
-        elseif au.enabled[aura.key] and (aura.class == playerClass) and Known(aura.castSpell)
+        elseif au.enabled[aura.key] and (aura.class == playerClass)
+           and ((aura.isStance and GetStanceState(aura.castSpell)) or (not aura.isStance and Known(aura.castSpell)))
            and not (aura.notIfKnown and Known(aura.notIfKnown))
            and not (aura.requireTalent and not Known(aura.requireTalent))
            and not (aura.noPvP and InPvPInstance()) then
@@ -2039,6 +2149,10 @@ if inInstance or au.showNonInstanced then
                     elseif aura.check == "playerSelfCast" then
                         -- Player must have the buff from their OWN cast
                         isMissing = not PlayerHasSelfCastAuraByID(aura.buffIDs)
+                    elseif aura.isStance then
+                        -- Stance is a shapeshift form: hide once it's the active stance
+                        local _, isActive = GetStanceState(aura.castSpell)
+                        isMissing = not isActive
                     else
                         -- Use instance-specific buff list if available and in instance
                         local checkIDs = (inInstance and aura.instanceBuffIDs) or aura.buffIDs
@@ -2338,8 +2452,9 @@ local specialsActive = inInstance or co.showSpecialsNonInstanced
                 local currentZone = tostring(C_Map.GetBestMapForUnit("player") or 0)
                 if co._inkyZoneSet[currentZone] then
                     local hasPotion = EABR._resolved.inky.hasPotion
-                    local hasBuff = PlayerHasAuraByID({INKY_BLACK_BUFF})
-                    if not hasBuff and hasPotion then
+                    -- Detect the "Inky Blackness" buff by scanning auras (see PlayerHasInkyBlackness),
+                    -- mirroring flask/food. Suppressed in M+/PvP there since the aura is unreadable.
+                    if not PlayerHasInkyBlackness() and hasPotion then
                         local e = AcquireEntry()
                         e.mode = "item"; e.itemID = INKY_BLACK_ITEM
                         e.texture = GetItemIcon(INKY_BLACK_ITEM)
@@ -2933,10 +3048,11 @@ do
     for _, f in ipairs(FOOD_ITEMS) do foodSet[f.itemID] = true end
     for _, we in ipairs(WEAPON_ENCHANT_ITEMS) do weSet[we.itemID] = true end
     TrackItemUse = function(itemID)
-        if not db or not db.char then return end
-        if flaskSet[itemID] then db.char.lastUsedFlask = itemID
-        elseif foodSet[itemID] then db.char.lastUsedFood = itemID
-        elseif weSet[itemID] then db.char.lastUsedWeaponEnchant = itemID end
+        if not db or not db.profile then return end
+        -- All persistent use-tracking lives in db.profile (this DB layer has no `char` namespace).
+        if flaskSet[itemID] then db.profile.lastUsedFlask = itemID
+        elseif foodSet[itemID] then db.profile.lastUsedFood = itemID
+        elseif weSet[itemID] then db.profile.lastUsedWeaponEnchant = itemID end
     end
 end
 
@@ -3401,6 +3517,12 @@ function EABR:OnEnable()
                 break
             end
         end
+        -- "Track Missing Group Buffs" needs broad UNIT_AURA so other members'
+        -- missing foreign buffs refresh in real time, even when the player's
+        -- own class provides no raid buff.
+        if db and db.profile.raidBuffs and db.profile.raidBuffs.showForeign then
+            _needGroupAura = true
+        end
         if _needGroupAura then
             mainFrame:RegisterEvent("GROUP_JOINED")
             mainFrame:RegisterEvent("GROUP_LEFT")
@@ -3587,6 +3709,13 @@ mainFrame:SetScript("OnEvent", function(_, e, arg1, arg2, arg3)
         return
     end
 
+    if e == "PLAYER_DEAD" then
+        -- Inky Blackness (and other buffs) drop on death; refresh so the aura-based
+        -- reminders re-evaluate and reappear once the buff is lost.
+        RequestRefresh()
+        return
+    end
+
     if e == "PLAYER_ENTERING_WORLD" then
         wipe(_dismissedUntilLoad)
         RequestRefresh()
@@ -3688,7 +3817,7 @@ end)
 local _prevBagCounts = {}
 
 local function DetectUsedItem()
-    if not db or not db.char then return end
+    if not db then return end
     RebuildBagCounts()
     for itemID, oldCount in pairs(_prevBagCounts) do
         if (_bagCounts[itemID] or 0) < oldCount then

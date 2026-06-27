@@ -1656,6 +1656,26 @@ do
         return false
     end
 
+    -- True if a tracked potion is on a genuine (non-GCD) cooldown, i.e. one has
+    -- actually been consumed. WoW exposes no clean way to tell a combat potion
+    -- from a healing/mana potion (both are class 0 / subclass 1), so a ready
+    -- healing potion left in the bags would otherwise keep the reminder up even
+    -- after the player drank their combat potion. Dismiss while anything is on
+    -- cooldown; it naturally re-shows once the potion comes back up.
+    local function AnyPotionOnCooldown()
+        local now = GetTime()
+        for itemID in pairs(trackedPotions) do
+            local start, duration = GetCD(itemID)
+            if start and start > 0 then
+                local dur = duration or 0
+                if dur > 2 and (start + dur - now) > 0 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
     local function CreatePotionOverlay()
         if potionOverlay then return end
 
@@ -1737,7 +1757,7 @@ do
             HideOverlay()
             return
         end
-        if AnyPotionReady() then
+        if AnyPotionReady() and not AnyPotionOnCooldown() then
             CreatePotionOverlay()
             potionOverlay._show()
         else
