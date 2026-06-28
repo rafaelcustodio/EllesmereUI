@@ -3158,6 +3158,63 @@ function WidgetFactory:DualRow(parent, yOffset, leftCfg, rightCfg)
             RegisterWidgetRefresh(function() _updateSwatch(); ApplyDisabledState() end)
             ApplyDisabledState()
 
+        elseif t == "input" then
+            -- Text entry with a Save button on the right (mirrors the cog-popup
+            -- input). cfg.getValue/cfg.setValue use the same names as the other
+            -- DualRow controls; cfg.inputWidth and cfg.maxLetters are optional.
+            local inputW = cfg.inputWidth or 150
+            local SAVE_W = 40
+            local SAVE_GAP = 6
+            local EG = ELLESMERE_GREEN
+            local saveBtn = CreateFrame("Button", nil, region)
+            PP.Size(saveBtn, SAVE_W, 26)
+            PP.Point(saveBtn, "RIGHT", region, "RIGHT", -SIDE_PAD, 0)
+            saveBtn:SetFrameLevel(frame:GetFrameLevel() + 3)
+            local saveBg = SolidTex(saveBtn, "BACKGROUND", EG.r, EG.g, EG.b, 0.85)
+            saveBg:SetAllPoints()
+            local saveLbl = MakeFont(saveBtn, 12, nil, 1, 1, 1); saveLbl:SetAlpha(0.9)
+            saveLbl:SetText(EllesmereUI.L("Save")); saveLbl:SetPoint("CENTER")
+            saveBtn:SetScript("OnEnter", function()
+                saveBg:SetColorTexture(EG.r + (1 - EG.r) * 0.25, EG.g + (1 - EG.g) * 0.25, EG.b + (1 - EG.b) * 0.25, 0.95)
+                saveLbl:SetAlpha(1)
+            end)
+            saveBtn:SetScript("OnLeave", function() saveBg:SetColorTexture(EG.r, EG.g, EG.b, 0.85); saveLbl:SetAlpha(0.9) end)
+
+            local box = CreateFrame("EditBox", nil, region)
+            PP.Size(box, inputW, 26)
+            PP.Point(box, "RIGHT", saveBtn, "LEFT", -SAVE_GAP, 0)
+            box:SetAutoFocus(false)
+            box:SetFont(EXPRESSWAY or "Fonts\\FRIZQT__.TTF", 13, "")
+            box:SetTextColor(1, 1, 1, 0.85)
+            box:SetTextInsets(6, 6, 0, 0)
+            box:SetJustifyH("LEFT")
+            local boxBg = SolidTex(box, "BACKGROUND", 0.12, 0.12, 0.12, 0.8)
+            boxBg:SetAllPoints()
+            if cfg.maxLetters then box:SetMaxLetters(cfg.maxLetters) end
+            box:SetText(cfg.getValue and cfg.getValue() or "")
+
+            local function ApplyInput()
+                box:ClearFocus()
+                if cfg.setValue then cfg.setValue(box:GetText()) end
+                saveBg:SetColorTexture(1, 1, 1, 0.9); saveLbl:SetText(EllesmereUI.L("Saved"))
+                C_Timer.After(0.4, function()
+                    saveBg:SetColorTexture(EG.r, EG.g, EG.b, 0.85); saveLbl:SetText(EllesmereUI.L("Save"))
+                end)
+            end
+            box:SetScript("OnEnterPressed", function() ApplyInput() end)
+            box:SetScript("OnEscapePressed", function(self)
+                self:ClearFocus(); self:SetText(cfg.getValue and cfg.getValue() or "")
+            end)
+            saveBtn:SetScript("OnClick", ApplyInput)
+            controlFrame = box
+            controlAnchor = box
+            AddControlDisabledTooltip(box, cfg)
+            RegisterWidgetRefresh(function()
+                if not box:HasFocus() then box:SetText(cfg.getValue and cfg.getValue() or "") end
+                ApplyDisabledState()
+            end)
+            ApplyDisabledState()
+
         elseif t == "button" then
             -- Button inside a half-row: label is hidden, the button IS the content
             label:Hide()

@@ -10911,6 +10911,16 @@ function InitializeFrames()
             ReapplyFrameTextClassColors("targettarget")
         elseif event == "PLAYER_FOCUS_CHANGED" then
             ReapplyFrameTextClassColors("focustarget")
+            -- Re-lift the focus cast bar above nameplates. Acquiring/clearing
+            -- focus re-shows the frame, which can re-stack its children back to
+            -- the frame's base strata (MEDIUM) -- and flattened nameplates are
+            -- also MEDIUM, so they cover the bar. Deferred so it runs after any
+            -- oUF/visibility restyle that would otherwise revert the strata.
+            C_Timer.After(0, function()
+                local ff = frames.focus
+                local cbg = ff and ff.Castbar and ff.Castbar:GetParent()
+                if cbg then cbg:SetFrameStrata("HIGH") end
+            end)
         elseif arg1 == "target" then
             ReapplyFrameTextClassColors("targettarget")
         elseif arg1 == "focus" then
