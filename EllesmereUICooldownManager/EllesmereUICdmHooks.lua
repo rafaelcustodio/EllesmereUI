@@ -279,7 +279,7 @@ function ns.ApplyActiveOverlays(frame, fd, ss, isActive, bd)
     -- Active glow (per-spell)
     local hasGlow = ss and ss.activeGlow and ss.activeGlow > 0
     if isActive and hasGlow then
-        if fd.glowOverlay and not fd._activeGlowOn then
+        if fd.glowOverlay then
             -- Unified glow color takes priority
             local gr, gg, gb = ns.ResolveGlowColor(ss)
             if not gr then
@@ -294,8 +294,16 @@ function ns.ApplyActiveOverlays(frame, fd, ss, isActive, bd)
                 gg = gg or (ss.activeGlowG or 0.85)
                 gb = gb or (ss.activeGlowB or 0)
             end
-            ns.StartNativeGlow(fd.glowOverlay, ss.activeGlow, gr, gg, gb)
-            fd._activeGlowOn = true
+            -- (Re)start on first activation OR when the style/colour changed, so a
+            -- live colour edit takes effect. A steady active window with unchanged
+            -- settings does NOT restart (which would flicker the glow each tick).
+            if not fd._activeGlowOn or fd._activeGlowStyle ~= ss.activeGlow
+               or fd._activeGlowR ~= gr or fd._activeGlowG ~= gg or fd._activeGlowB ~= gb then
+                ns.StartNativeGlow(fd.glowOverlay, ss.activeGlow, gr, gg, gb)
+                fd._activeGlowOn = true
+                fd._activeGlowStyle = ss.activeGlow
+                fd._activeGlowR, fd._activeGlowG, fd._activeGlowB = gr, gg, gb
+            end
         end
     elseif fd._activeGlowOn then
         if fd.glowOverlay then ns.StopNativeGlow(fd.glowOverlay) end
@@ -303,17 +311,35 @@ function ns.ApplyActiveOverlays(frame, fd, ss, isActive, bd)
     end
 
     -- Active border color (per-spell). Recolor the icon border while active;
-    -- restore the bar's default border color on falloff. SetBorderStyleColor
-    -- handles both solid (PP) and textured borders and no-ops on a hidden border.
+    -- restore the configured color on falloff. A SQUARE border goes through
+    -- SetBorderStyleColor (handles solid + textured, no-ops on a hidden border).
+    -- A CUSTOM SHAPE draws its ring on a separate shapeBorder texture that
+    -- SetBorderStyleColor never touches, so recolor that directly and save/restore
+    -- its configured vertex color. (For the fake-active overlay, frame is the
+    -- overlay frame whose FC is seeded with the underlying shapeBorder, so the
+    -- same lookup hits the real, raised ring.)
+    local ifc = ns._ecmeFC and ns._ecmeFC[frame]
+    local shapeBorder = ifc and ifc.shapeApplied and ifc.shapeBorder
     if isActive and ss and ss.activeBorderEnabled then
-        if fd.borderFrame and EllesmereUI.SetBorderStyleColor then
-            EllesmereUI.SetBorderStyleColor(fd.borderFrame,
-                ss.activeBorderR or 1, ss.activeBorderG or 0.776,
-                ss.activeBorderB or 0.376, ss.activeBorderA or 1)
+        local abR = ss.activeBorderR or 1
+        local abG = ss.activeBorderG or 0.776
+        local abB = ss.activeBorderB or 0.376
+        local abA = ss.activeBorderA or 1
+        if shapeBorder then
+            if not fd._sbColorSaved then
+                fd._sbR, fd._sbG, fd._sbB, fd._sbA = shapeBorder:GetVertexColor()
+                fd._sbColorSaved = true
+            end
+            shapeBorder:SetVertexColor(abR, abG, abB, abA)
+        elseif fd.borderFrame and EllesmereUI.SetBorderStyleColor then
+            EllesmereUI.SetBorderStyleColor(fd.borderFrame, abR, abG, abB, abA)
         end
         fd._activeBorderOn = true
     elseif fd._activeBorderOn then
-        if fd.borderFrame and EllesmereUI.SetBorderStyleColor then
+        if shapeBorder and fd._sbColorSaved then
+            shapeBorder:SetVertexColor(fd._sbR, fd._sbG, fd._sbB, fd._sbA)
+            fd._sbColorSaved = false
+        elseif fd.borderFrame and EllesmereUI.SetBorderStyleColor then
             EllesmereUI.SetBorderStyleColor(fd.borderFrame,
                 (bd and bd.borderR) or 0, (bd and bd.borderG) or 0,
                 (bd and bd.borderB) or 0, (bd and bd.borderA) or 1)
@@ -2068,6 +2094,68 @@ local function GetOrCreateCustomBuffFrame(barKey, sid)
 end
 ns.GetOrCreateCustomBuffFrame = GetOrCreateCustomBuffFrame
 
+-- Own-frame for an item (icon + item cooldown + bag count), shared by the
+-- CD/utility injection (Phase 3) and the buff-family injection. Created once per
+-- (barKey, itemID). Uses the preset icon when known, else the live item icon for
+-- arbitrary user-added IDs. Returns nil if the icon isn't loaded yet.
+local function GetOrCreateItemPresetFrame(barKey, itemID)
+    local fkey = barKey .. ":item:" .. itemID
+    local f = _presetFrames[fkey]
+    if f then return f end
+
+    local itemPresets = ns.CDM_ITEM_PRESETS
+    local preset
+    if itemPresets then
+        for _, pr in ipairs(itemPresets) do
+            if pr.itemID == itemID then preset = pr; break end
+            if pr.altItemIDs then
+                for _, alt in ipairs(pr.altItemIDs) do
+                    if alt == itemID then preset = pr; break end
+                end
+            end
+        end
+    end
+    local icon = preset and preset.icon or C_Item.GetItemIconByID(itemID)
+    if not icon then return nil end
+
+    f = CreateFrame("Frame", nil, UIParent)
+    f:SetSize(36, 36); f:Hide()
+    -- Enable mouse motion (OnEnter/OnLeave) for tooltips but pass through clicks.
+    f:EnableMouse(true)
+    if f.SetMouseClickEnabled then f:SetMouseClickEnabled(false) end
+    local tex = f:CreateTexture(nil, "ARTWORK")
+    tex:SetAllPoints(); tex:SetTexture(icon)
+    tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    f.Icon = tex; f._tex = tex
+    local cd = CreateFrame("Cooldown", nil, f, "CooldownFrameTemplate")
+    cd:SetAllPoints(); cd:SetDrawEdge(false); cd:SetDrawBling(false)
+    cd:SetHideCountdownNumbers(true)
+    cd:EnableMouse(false)
+    if cd.SetMouseClickEnabled then cd:SetMouseClickEnabled(false) end
+    if cd.SetMouseMotionEnabled then cd:SetMouseMotionEnabled(false) end
+    f.Cooldown = cd; f._cooldown = cd
+    f._isItemPresetFrame = true
+    f._presetItemID = itemID; f._presetData = preset
+    f.cooldownID = nil; f.cooldownInfo = nil
+    f.layoutIndex = 99999
+    local countFS = f:CreateFontString(nil, "OVERLAY")
+    EllesmereUI.ApplyIconTextFont(countFS, GetCDMFont(), 11, "cdm")
+    countFS:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 2)
+    f._itemCountText = countFS
+    f:SetScript("OnEnter", function(self)
+        if not self._presetItemID then return end
+        local ffc = _ecmeFC[self]
+        local bd2 = ffc and ffc.barKey and barDataByKey[ffc.barKey]
+        if not bd2 or not bd2.showTooltip then return end
+        GameTooltip_SetDefaultAnchor(GameTooltip, self)
+        GameTooltip:SetItemByID(self._presetItemID)
+        GameTooltip:Show()
+    end)
+    f:SetScript("OnLeave", GameTooltip_Hide)
+    _presetFrames[fkey] = f
+    return f
+end
+ns.GetOrCreateItemPresetFrame = GetOrCreateItemPresetFrame
 
 -- Guard: after ENCOUNTER_END clears item-preset caches, subsequent events
 -- fire before Blizzard has finished resetting potion CDs. Without this guard
@@ -2712,6 +2800,81 @@ local function CollectAndReanchor()
         end
     end
 
+    -- Inject item own-frames into buff bars so items (e.g. food) can be tracked
+    -- there too. Negative IDs (<= -100) in assignedSpells are item markers; the
+    -- shared frame + ProcessPresetCooldowns key off _isItemPresetFrame rather than
+    -- bar type, so cooldown/count work the same as on CD/utility bars. Tracked via
+    -- HideAllInjectedCustomBuffs so removed items drop out on the next pass.
+    -- Gated behind ns._cdmAnyCustomItem (set once from saved data / the picker) so
+    -- this pass is skipped entirely for anyone who never adds a custom item.
+    if ns._cdmAnyCustomItem then
+        for _, bd in ipairs(p.cdmBars.bars) do
+            if bd.enabled and bd.barType == "buffs" then
+                local injKey = bd.key
+                local sdInj = ns.GetBarSpellData(injKey)
+                local spellList = sdInj and sdInj.assignedSpells
+                if spellList then
+                    for idx, sid in ipairs(spellList) do
+                        if type(sid) == "number" and sid <= -100 then
+                            local itemID = -sid
+                            local f = GetOrCreateItemPresetFrame(injKey, itemID)
+                            if f then
+                                _injectedCustomBuffFrames[f] = true
+                                f._ownerBarKey = injKey
+                                f.layoutIndex = 6000 + idx
+                                -- "Hide Items if Missing": mirror the CD/utility item
+                                -- path. When the bar opts in and the item (plus alts)
+                                -- isn't in bags, skip injection so it drops out of the
+                                -- layout instead of showing. Setting _hidePresenceCached
+                                -- is REQUIRED: CheckItemPresenceForHide compares
+                                -- (total > 0) ~= f._hidePresenceCached, so a nil cache
+                                -- would read as changed on every bag update and queue a
+                                -- reanchor on every loot/sell/craft for the session.
+                                local skipMissing = false
+                                if bd.hideItemsIfMissing then
+                                    local total = C_Item.GetItemCount(itemID, false, true) or 0
+                                    if total == 0 and f._presetData and f._presetData.altItemIDs then
+                                        for _, altID in ipairs(f._presetData.altItemIDs) do
+                                            total = total + (C_Item.GetItemCount(altID, false, true) or 0)
+                                        end
+                                    end
+                                    f._hidePresenceCached = (total > 0)
+                                    skipMissing = (total == 0)
+                                else
+                                    f._hidePresenceCached = nil
+                                end
+                                if skipMissing then
+                                    f:Hide()
+                                else
+                                    if f._cdStart and f._cdDur and (GetTime() < f._cdStart + f._cdDur) then
+                                        f._cooldown:SetCooldown(f._cdStart, f._cdDur)
+                                    end
+                                    if f._lastDesat ~= nil and f._tex then
+                                        f._tex:SetDesaturated(f._lastDesat)
+                                    elseif ns._MarkPresetCdDirty then
+                                        -- Fresh frame (no cached desat yet): nudge the
+                                        -- preset processor so the next BuffTicker pass
+                                        -- computes its ownership/cooldown desaturation,
+                                        -- else an in-panel sync/import leaves an unowned
+                                        -- item saturated until /reload.
+                                        ns._MarkPresetCdDirty()
+                                    end
+                                    f:Show()
+                                    local fc = FC(f)
+                                    fc.barKey = injKey
+                                    fc.spellID = sid
+                                    if not barLists[injKey] then barLists[injKey] = {} end
+                                    barLists[injKey][#barLists[injKey] + 1] =
+                                        AcquireEntry(f, sid, sid, f.layoutIndex)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     local LayoutCDMBar = ns.LayoutCDMBar
     local RefreshCDMIconAppearance = ns.RefreshCDMIconAppearance
     local ApplyCDMTooltipState = ns.ApplyCDMTooltipState
@@ -2772,7 +2935,12 @@ local function CollectAndReanchor()
                             if orderList then
                                 local oidx = 0
                                 for _, sid in ipairs(orderList) do
-                                    if type(sid) == "number" and sid > 0 then
+                                    -- Negative IDs are custom-item markers: order them
+                                    -- by their slot too (no override/base variants).
+                                    if type(sid) == "number" and sid <= -100 then
+                                        oidx = oidx + 1
+                                        if not buffOrder[sid] then buffOrder[sid] = oidx end
+                                    elseif type(sid) == "number" and sid > 0 then
                                         oidx = oidx + 1
                                         if not buffOrder[sid] then buffOrder[sid] = oidx end
                                         if _FindOverride then
@@ -3058,63 +3226,12 @@ local function CollectAndReanchor()
                                 tf:Hide()
                             end
                         elseif sid and sid <= -100 then
-                            -- Item preset (potions, healthstone, etc.)
+                            -- Item preset (potions, healthstone, etc.) or a
+                            -- user-added custom item ID. Frame creation (incl.
+                            -- the live-icon fallback for arbitrary items) is
+                            -- shared with the buff-family injection.
                             local itemID = -sid
-                            local fkey = barKey .. ":item:" .. itemID
-                            local f = _presetFrames[fkey]
-                            if not f then
-                                local itemPresets = ns.CDM_ITEM_PRESETS
-                                local preset
-                                if itemPresets then
-                                    for _, pr in ipairs(itemPresets) do
-                                        if pr.itemID == itemID then preset = pr; break end
-                                        if pr.altItemIDs then
-                                            for _, alt in ipairs(pr.altItemIDs) do
-                                                if alt == itemID then preset = pr; break end
-                                            end
-                                        end
-                                    end
-                                end
-                                local icon = preset and preset.icon or C_Item.GetItemIconByID(itemID)
-                                if icon then
-                                    f = CreateFrame("Frame", nil, UIParent)
-                                    f:SetSize(36, 36); f:Hide()
-                                    -- Enable mouse motion (OnEnter/OnLeave) for
-                                    -- tooltips but pass through clicks.
-                                    f:EnableMouse(true)
-                                    if f.SetMouseClickEnabled then f:SetMouseClickEnabled(false) end
-                                    local tex = f:CreateTexture(nil, "ARTWORK")
-                                    tex:SetAllPoints(); tex:SetTexture(icon)
-                                    tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-                                    f.Icon = tex; f._tex = tex
-                                    local cd = CreateFrame("Cooldown", nil, f, "CooldownFrameTemplate")
-                                    cd:SetAllPoints(); cd:SetDrawEdge(false); cd:SetDrawBling(false)
-                                    cd:SetHideCountdownNumbers(true)
-                                    cd:EnableMouse(false)
-                                    if cd.SetMouseClickEnabled then cd:SetMouseClickEnabled(false) end
-                                    if cd.SetMouseMotionEnabled then cd:SetMouseMotionEnabled(false) end
-                                    f.Cooldown = cd; f._cooldown = cd
-                                    f._isItemPresetFrame = true
-                                    f._presetItemID = itemID; f._presetData = preset
-                                    f.cooldownID = nil; f.cooldownInfo = nil
-                                    f.layoutIndex = 99999
-                                    local countFS = f:CreateFontString(nil, "OVERLAY")
-                                    EllesmereUI.ApplyIconTextFont(countFS, GetCDMFont(), 11, "cdm")
-                                    countFS:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 2)
-                                    f._itemCountText = countFS
-                                    f:SetScript("OnEnter", function(self)
-                                        if not self._presetItemID then return end
-                                        local ffc = _ecmeFC[self]
-                                        local bd2 = ffc and ffc.barKey and barDataByKey[ffc.barKey]
-                                        if not bd2 or not bd2.showTooltip then return end
-                                        GameTooltip_SetDefaultAnchor(GameTooltip, self)
-                                        GameTooltip:SetItemByID(self._presetItemID)
-                                        GameTooltip:Show()
-                                    end)
-                                    f:SetScript("OnLeave", GameTooltip_Hide)
-                                    _presetFrames[fkey] = f
-                                end
-                            end
+                            local f = GetOrCreateItemPresetFrame(barKey, itemID)
                             if f then
                                 -- Remember the bar that owns this frame so bag
                                 -- events can re-evaluate it even while hidden.
