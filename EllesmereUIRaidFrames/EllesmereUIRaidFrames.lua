@@ -463,6 +463,16 @@ local defaults = {
         healthTextPosition = "center",
         healthTextOffsetX  = 0,
         healthTextOffsetY  = 0,
+        -- Heal Absorb Text (1:1 with Health Text; shows the heal-absorb shield
+        -- amount in short/full format, hidden at zero). Defaults to red to match
+        -- how raid addons surface heal absorbs.
+        healAbsorbTextMode   = "none",   -- "none", "amount", "short"
+        healAbsorbTextColorMode   = "custom",  -- "class", "accent", "custom"
+        healAbsorbTextCustomColor = { r = 1, g = 0.3, b = 0.3 },
+        healAbsorbTextSize   = 9,
+        healAbsorbTextPosition = "center",
+        healAbsorbTextOffsetX  = 0,
+        healAbsorbTextOffsetY  = 0,
 
         -- Border (unified style/size, recolored by state -- matches Unit Frames)
         borderSize       = 1,
@@ -497,6 +507,9 @@ local defaults = {
         -- shared absorbFromRightEdge boolean.)
         absorbEdgeMode     = "overlay",
         healAbsorbEdgeMode = "overlay",
+        -- Lift the heal-absorb overlay above the dispel gradient (default off).
+        -- When off, the heal-absorb bar keeps its original level (below dispel).
+        healAbsorbOverDispel = false,
         -- Black backing behind the heal-absorb texture (all styles); 0 = off.
         healAbsorbBgOpacity = 25,
         -- Reduced max-health overlay (always right-anchored). Styled like Heal
@@ -576,6 +589,12 @@ local defaults = {
         dispelIconOffsetX  = 0,
         dispelIconOffsetY  = 0,
         dispelIconSize     = 16,
+        dispelClockBorder  = false,  -- animated clock-style dispel border (erases clockwise) on dispellable debuff icons
+        dispelClockExtraBorder = 0,  -- extra physical pixels added to the clock border thickness (on top of debuffBorderSize)
+        dispellableDebuffLocation = "same",      -- "same" = use the main debuff layout; else a separate anchor for dispellable debuffs
+        dispellableDebuffGrowDirection = "RIGHT",
+        dispellableDebuffOffsetX = 0,
+        dispellableDebuffOffsetY = 0,
         -- Per-dispel-type colors (defaults mirror DISPEL_COLORS). "Bleed" is the
         -- no-dispelName/physical type (stored under the "" key in DISPEL_COLORS).
         dispelColorMagic   = { r = 0.349, g = 0.475, b = 1.0 },
@@ -603,6 +622,13 @@ local defaults = {
         -- Debuffs
         debuffFilter     = "all",  -- "none", "all", "raid", "dispellable"
         hideLustDebuff   = true,
+        -- CC Debuff Glow: glow displayed debuff icons whose aura is crowd control
+        -- (Blizzard CROWD_CONTROL aura filter). Mirrors CDM's Buff Glow control.
+        -- 0 = None (default); style index 1 = Pixel Glow.
+        debuffCCGlowType       = 0,
+        debuffCCGlowClassColor = false,
+        debuffCCGlowR = 1.0, debuffCCGlowG = 0.776, debuffCCGlowB = 0.376,
+        debuffCCGlowLines = 8, debuffCCGlowThickness = 2, debuffCCGlowSpeed = 4,
         -- Defensives & Externals
         showDefensives   = true,
         showExternals    = true,
@@ -692,10 +718,14 @@ local defaults = {
 
         -- Range & misc
         oorAlpha         = 0.4,
+        -- Raid frame tooltip visibility. showTooltip is the legacy on/off key,
+        -- kept as the fallback the "Show Raid Frames Tooltip" dropdown derives
+        -- from for existing users (see ns._ResolveTooltipMode). Picking a
+        -- dropdown option writes tooltipMode = always | outOfCombat |
+        -- outOfBossCombat | never (unset = derived, so legacy profiles see no
+        -- change). Governs only the raid/party frame tooltips -- no other unit
+        -- tooltips are touched.
         showTooltip      = true,
-        -- "Show in Combat" moved to a global setting that governs all unit
-        -- tooltips: EllesmereUIDB.showUnitTooltipsInCombat (see the tooltip hook
-        -- near the top of this file). No longer a per-profile raid-frame key.
         freeRightClickCamera = false,  -- right-click + drag over a raid/party frame turns the camera (mouselook)
 
         -- Preview mode: "real", "overlay", "none"
@@ -704,6 +734,10 @@ local defaults = {
         -- Raid size overrides: { [10] = { width=X, height=Y }, ... }
         raidSizeOverrides = nil,
         autoResizeIndicators = false,
+        -- Tracked Buffs (Buff Manager) auto-resize. Defaults ON because this was
+        -- previously hardcoded always-on; the "Auto Resize Icons" dropdown now
+        -- exposes it. nil (legacy profiles) is treated as on so nothing changes.
+        autoResizeTrackedBuffs = true,
 
         -- Party frame overrides (sparse -- falls back to raid settings)
         partyFrameWidth   = 125,
@@ -720,6 +754,11 @@ local defaults = {
         partyFlipGrowth   = false,  -- DOWN->UP / RIGHT->LEFT growth flip
         partyHideSelf     = false,
         partyUnlockPos    = nil,
+        -- Party Tracked Buffs (Buff Manager) auto-resize. Defaults ON (matching
+        -- the prior hardcoded always-on behavior); nil is treated as on. The
+        -- "Auto Resize Icons" dropdown on the Party tab exposes it. Mirrors the
+        -- raid autoResizeTrackedBuffs key.
+        partyAutoResizeTrackedBuffs = true,
     }
 }
 
@@ -741,26 +780,23 @@ local unitTrackers   = {}  -- [unitToken] = tracker frame
 local inCombat       = false
 
 -------------------------------------------------------------------------------
---  Hide unit tooltips in combat (global). Extends the per-frame "Show in
---  Combat" tooltip control to EVERY unit tooltip -- nameplates, target/focus,
---  world mobs, and our own frames -- by suppressing them through the shared
---  tooltip data pipeline. The setting is global (EllesmereUIDB.showUnitTooltips
---  InCombat); unset/false = hide in combat (matches the original default).
---  Costs ~0 out of combat: InCombatLockdown() early-outs before any other work.
---  do/end keeps the helper out of file scope (this file is at the local cap).
+--  Tooltip visibility mode resolver. The "Show Raid Frames Tooltip" dropdown
+--  stores tooltipMode = always | outOfCombat | outOfBossCombat | never and
+--  governs ONLY the raid/party frame tooltips (gated in their own OnEnter --
+--  no global hook; other unit tooltips are never touched). When unset (legacy
+--  profiles), derive the mode from the old keys so existing users see no change:
+--  showTooltip=false -> never; the old global "show in combat" flag on ->
+--  always; otherwise the original out-of-combat default. `s` is a scaled raid/
+--  party/extra proxy (or db.profile). Lives on ns (not a file local) so the
+--  OnEnter handler can reach it; this file is at the Lua 5.1 local cap.
 -------------------------------------------------------------------------------
-do
-    local function HideUnitTooltipInCombat(tooltip)
-        if tooltip ~= GameTooltip then return end
-        if tooltip.IsForbidden and tooltip:IsForbidden() then return end
-        if not InCombatLockdown() then return end
-        if EllesmereUIDB and EllesmereUIDB.showUnitTooltipsInCombat then return end
-        tooltip:Hide()
-    end
-    if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall
-        and Enum and Enum.TooltipDataType then
-        TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Unit, HideUnitTooltipInCombat)
-    end
+ns._ResolveTooltipMode = function(s)
+    if not s then return "outOfCombat" end
+    local m = s.tooltipMode
+    if m ~= nil then return m end
+    if s.showTooltip == false then return "never" end
+    if EllesmereUIDB and EllesmereUIDB.showUnitTooltipsInCombat then return "always" end
+    return "outOfCombat"
 end
 
 -------------------------------------------------------------------------------
@@ -1067,6 +1103,18 @@ ns.healthBarTextures     = healthBarTextures
 ns.healthBarTextureNames = healthBarTextureNames
 ns.healthBarTextureOrder = healthBarTextureOrder
 
+-- Resolve an absorb/heal/max-health style key to a texture path. Built-in
+-- styles come from ABSORB_STYLE_TEX; "sm:" SharedMedia keys (shared with the
+-- Bar Texture dropdown, appended into healthBarTextures) fall through to the
+-- health-bar texture lookup. Used by the live render and the preview builder so
+-- a saved SM key paints identically everywhere. Special keys handled by their
+-- callers (blizzardModern / maxHealthStripes) never reach this.
+function ns.ResolveAbsorbStyleTex(style, fallback)
+    return ABSORB_STYLE_TEX[style]
+        or (EllesmereUI.ResolveTexturePath and EllesmereUI.ResolveTexturePath(healthBarTextures, style, fallback))
+        or fallback
+end
+
 -------------------------------------------------------------------------------
 --  Power bar visibility (derived from role flags)
 -------------------------------------------------------------------------------
@@ -1251,10 +1299,11 @@ do
     end
 end
 
--- Dark mode colors (must match UnitFrames exactly)
-local DARK_FILL_R, DARK_FILL_G, DARK_FILL_B = 0x11/255, 0x11/255, 0x11/255  -- #111111
-local DARK_FILL_A = 0.9
-local DARK_BG_R, DARK_BG_G, DARK_BG_B = 0x4f/255, 0x4f/255, 0x4f/255        -- #4f4f4f
+-- Dark mode colours come from the global per-profile Dark Mode palette via
+-- EllesmereUI.GetDarkModeFill() / GetDarkModeBg(), fetched live at each use so a
+-- settings change shows on the next frame refresh -- and so no file-scope locals
+-- are added (this file is at the 200 main-chunk local cap). Opacity is honoured
+-- here (Raid Frames + Unit Frames); only Resource Bars keep their own alpha.
 
 -- Paints the health-bar background (and dims the fill) for the unit's life and
 -- connection state. Dead/offline: the bg covers the FULL bar so the tint reads
@@ -1291,7 +1340,7 @@ function ns._ApplyHealthBg(d, health, s, unit)
     bg:SetPoint("TOPLEFT", health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
     bg:SetPoint("BOTTOMRIGHT", health, "BOTTOMRIGHT", 0, 0)
     if s.healthColorMode == "dark" then
-        bg:SetColorTexture(DARK_BG_R, DARK_BG_G, DARK_BG_B, 1)
+        bg:SetColorTexture(EllesmereUI.GetDarkModeBg())
     else
         -- Class-colored when bgClassColored is on, else the custom bg color
         -- (GetBgColor handles the secret-value guard + alpha = bgDarkness). Must
@@ -1306,7 +1355,8 @@ local function GetHealthColor(unit, s)
     local mode = s.healthColorMode or "class"
 
     if mode == "dark" then
-        return DARK_FILL_R, DARK_FILL_G, DARK_FILL_B
+        local dfr, dfg, dfb = EllesmereUI.GetDarkModeFill()
+        return dfr, dfg, dfb
     elseif mode == "classic" then
         -- Native WoW health gradient via Blizzard's curve system (secret-value safe)
         local color = UnitHealthPercent(unit, true, GetClassicHealthCurve())
@@ -1578,6 +1628,113 @@ local function GetHealthTextColor(unit, s)
     end
 end
 
+-- Heal absorb text color (mirrors GetHealthTextColor). Default mode "custom"
+function ns.GetHealAbsorbTextColor(unit, s)
+    s = s or db.profile
+    local mode = s.healAbsorbTextColorMode or "custom"
+    if mode == "accent" then
+        local r, g, b = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+        if r then return r, g, b end
+        return 1, 0.3, 0.3
+    elseif mode == "class" then
+        local _, classToken = UnitClass(unit)
+        if classToken then
+            local cc = EllesmereUI.GetClassColor(classToken)
+            if cc then return cc.r, cc.g, cc.b end
+        end
+        return 1, 0.3, 0.3
+    else -- "custom"
+        local c = s.healAbsorbTextCustomColor
+        if c then return c.r, c.g, c.b end
+        return 1, 0.3, 0.3
+    end
+end
+
+-- Anchor a FontString to the health bar using the shared 8-position scheme.
+-- Mirrors FB.AnchorText (defined later, after the friendly-boss subsystem) so
+-- heal-absorb text in the early frame-build path can anchor identically. An
+-- optional width clamps long "amount"-mode values like the health text does.
+function ns.AnchorRFText(fs, health, pos, ox, oy, width)
+    if not fs or not health then return end
+    fs:ClearAllPoints()
+    if width then fs:SetWidth(width); fs:SetHeight(0) end
+    ox = ox or 0; oy = oy or 0
+    if pos == "topleft" then
+        fs:SetPoint("TOPLEFT", health, "TOPLEFT", 2 + ox, -2 + oy)
+        fs:SetJustifyH("LEFT"); fs:SetJustifyV("TOP")
+    elseif pos == "top" then
+        fs:SetPoint("TOP", health, "TOP", ox, -2 + oy)
+        fs:SetJustifyH("CENTER"); fs:SetJustifyV("TOP")
+    elseif pos == "topright" then
+        fs:SetPoint("TOPRIGHT", health, "TOPRIGHT", -2 + ox, -2 + oy)
+        fs:SetJustifyH("RIGHT"); fs:SetJustifyV("TOP")
+    elseif pos == "left" then
+        fs:SetPoint("LEFT", health, "LEFT", 2 + ox, oy)
+        fs:SetJustifyH("LEFT"); fs:SetJustifyV("MIDDLE")
+    elseif pos == "right" then
+        fs:SetPoint("RIGHT", health, "RIGHT", -2 + ox, oy)
+        fs:SetJustifyH("RIGHT"); fs:SetJustifyV("MIDDLE")
+    elseif pos == "bottomleft" then
+        fs:SetPoint("BOTTOMLEFT", health, "BOTTOMLEFT", 2 + ox, 2 + oy)
+        fs:SetJustifyH("LEFT"); fs:SetJustifyV("BOTTOM")
+    elseif pos == "bottom" then
+        fs:SetPoint("BOTTOM", health, "BOTTOM", ox, 2 + oy)
+        fs:SetJustifyH("CENTER"); fs:SetJustifyV("BOTTOM")
+    elseif pos == "bottomright" then
+        fs:SetPoint("BOTTOMRIGHT", health, "BOTTOMRIGHT", -2 + ox, 2 + oy)
+        fs:SetJustifyH("RIGHT"); fs:SetJustifyV("BOTTOM")
+    else -- "center"
+        fs:SetPoint("CENTER", health, "CENTER", ox, oy)
+        fs:SetJustifyH("CENTER"); fs:SetJustifyV("MIDDLE")
+    end
+    -- Force re-render after a JustifyH change (mirrors the name/health text fns).
+    local txt = fs:GetText()
+    fs:SetText(""); fs:SetText(txt or "")
+end
+
+-- Format a heal-absorb amount into a FontString. mode: "amount" (full number),
+-- "short" (abbreviated like 240k), "none"/nil (blank). Hidden at zero:
+-- C_StringUtil.TruncateWhenZero blanks the value at zero. The amount it returns
+-- (and thus GetText afterwards) is a SECRET string for a secret absorb, so we
+-- may ONLY feed it to SetText or test its truthiness -- never compare it (== ""
+-- taints). For "short" we read GetText back and gate on truthiness alone: it is
+-- non-nil exactly when the absorb is non-zero, so we abbreviate only then.
+function ns.FormatHealAbsorbInto(fs, amt, mode)
+    if not fs then return end
+    if not mode or mode == "none" then fs:SetText(""); return end
+    fs:SetText(C_StringUtil.TruncateWhenZero(amt or 0))
+    if mode == "short" and AbbreviateNumbers and fs:GetText() then
+        fs:SetText(AbbreviateNumbers(amt or 0))
+    end
+end
+
+-- Render the live heal-absorb text on a real frame (value from the unit).
+function ns.SetHealAbsorbText(fs, unit, s)
+    if not fs then return end
+    local mode = s.healAbsorbTextMode or "none"
+    ns.FormatHealAbsorbInto(fs, (UnitGetTotalHealAbsorbs and UnitGetTotalHealAbsorbs(unit)) or 0, mode)
+    if mode ~= "none" then
+        local r, g, b = ns.GetHealAbsorbTextColor(unit, s)
+        fs:SetTextColor(r, g, b, 0.9)
+    end
+end
+
+-- Update one button's heal-absorb text using the correct scaled profile. Called
+-- from the absorb-only event path (UNIT_HEAL_ABSORB_AMOUNT_CHANGED), which does
+-- NOT run a full button update, so the text would otherwise miss the change.
+function ns.UpdateHealAbsorbTextFor(button, unit)
+    local d = GetFFD(button)
+    if not d.healAbsorbText then return end
+    if UnitIsDeadOrGhost(unit) or not UnitIsConnected(unit) then
+        d.healAbsorbText:SetText("")
+        return
+    end
+    local s = (d._isParty and ns._scaledPartyProxy)
+        or (d._isExtra and ns._scaledExtraProxy)
+        or ns._scaledProfile or db.profile
+    ns.SetHealAbsorbText(d.healAbsorbText, unit, s)
+end
+
 -- Maps a dispel type to its saved-color key. The "" type (Bleed/physical) is
 -- stored under dispelColorBleed.
 local DISPEL_COLOR_KEYS = {
@@ -1674,7 +1831,7 @@ local function ApplyAbsorbStyle(absorbBar, style, settings)
     ns.HideModernAbsorbBase(absorbBar)
     if fw then ns.HideModernAbsorbBase(fw) end
 
-    local tex = ABSORB_STYLE_TEX[style] or "Interface\\Buttons\\WHITE8X8"
+    local tex = ns.ResolveAbsorbStyleTex(style, "Interface\\Buttons\\WHITE8X8")
     local alpha = settings and (settings.absorbOpacity or 90) / 100 or (ABSORB_STYLE_ALPHA[style] or 0.8)
     local ac = settings and settings.absorbColor or { r = 1, g = 1, b = 1 }
     absorbBar:SetStatusBarTexture(tex)
@@ -1702,7 +1859,7 @@ end
 
 ns.ApplyHealAbsorbStyle = function(haBar, style, settings)
     if not haBar then return end
-    local tex = ABSORB_STYLE_TEX[style] or "Interface\\Buttons\\WHITE8X8"
+    local tex = ns.ResolveAbsorbStyleTex(style, "Interface\\Buttons\\WHITE8X8")
     local alpha = settings and (settings.healAbsorbOpacity or 75) / 100 or 0.65
     local hc = settings and settings.healAbsorbColor or { r = 0.8, g = 0.15, b = 0.15 }
     -- "Default Blizz Frames" and "Large Outlined Stripes" heal styles are
@@ -1734,7 +1891,7 @@ ns.ApplyMaxHealthStyle = function(bar, style, settings)
         tex = "Interface\\AddOns\\EllesmereUIRaidFrames\\Media\\striped-maxhp.png"
         tiled = true
     else
-        tex = ABSORB_STYLE_TEX[style] or "Interface\\Buttons\\WHITE8X8"
+        tex = ns.ResolveAbsorbStyleTex(style, "Interface\\Buttons\\WHITE8X8")
         tiled = (style == "striped" or style == "stripedReversed" or style == "largeStripes" or style == "largeStripesR" or style == "largeOutlinedStripes" or style == "largeOutlinedStripesR")
     end
     local alpha = settings and (settings.maxHealthOpacity or 100) / 100 or 1
@@ -2006,6 +2163,7 @@ local function CreateAbsorbBar(button, healthBar)
     healAbsorbBar:SetWidth(healthBar:GetWidth())
     healAbsorbBar:SetHeight(healthBar:GetHeight())
     healAbsorbBar:SetFrameLevel(healthBar:GetFrameLevel() + 1)
+    healAbsorbBar._lastOverDispel = false  -- "Show Over Dispels" applied state; off = created level
     healAbsorbBar:Hide()
 
     -- Black backing behind the heal-absorb texture (all styles; opacity user-set via
@@ -2235,6 +2393,20 @@ local function UpdateAbsorb(button, unit)
                 ha._lastHaKey = haKey
                 ns.ApplyHealAbsorbStyle(ha, haStyle, s)
             end
+            -- "Show Over Dispels" (default off): lift the heal-absorb overlay one
+            -- level above the dispel gradient (button + LVL_DISPEL_OVERLAY = +7),
+            -- staying below the border/text/auras and masked to the bar interior.
+            -- Tracked per-bar so the level is only touched when the toggle flips;
+            -- when off the bar stays at its created level, unchanged from before.
+            local overDispel = s.healAbsorbOverDispel == true
+            if ha._lastOverDispel ~= overDispel then
+                ha._lastOverDispel = overDispel
+                if overDispel then
+                    ha:SetFrameLevel(button:GetFrameLevel() + ns.LVL_DISPEL_OVERLAY + 1)
+                else
+                    ha:SetFrameLevel(hp:GetFrameLevel() + 1)
+                end
+            end
             local healAbsorbAmt = UnitGetTotalHealAbsorbs and UnitGetTotalHealAbsorbs(unit) or 0
             ha:SetWidth(hp:GetWidth()); ha:SetHeight(hp:GetHeight())
             ha:SetMinMaxValues(0, maxHealth)
@@ -2394,14 +2566,16 @@ end
 --  Debuff grid layout (shared by the live render and the options preview)
 -------------------------------------------------------------------------------
 -- Mirrors the Buff Manager's AnchorSimpleGrid.
-function ns.DebuffGridPoint(s, idx0, total)
-    local pos    = s.debuffPosition or "bottomleft"
-    local grow   = s.debuffGrowDirection or "RIGHT"
+-- opts (optional) overrides pos/grow/ox/oy for a sub-group (e.g. dispellable
+-- debuffs routed to their own anchor); size/spacing/wrap/perRow stay shared.
+function ns.DebuffGridPoint(s, idx0, total, opts)
+    local pos    = (opts and opts.pos)  or s.debuffPosition or "bottomleft"
+    local grow   = (opts and opts.grow) or s.debuffGrowDirection or "RIGHT"
     local sz     = s.debuffSize or 18
     local spc    = PixelSnap(s.debuffSpacing or 1)
     local step   = sz + spc
-    local ox     = s.debuffOffsetX or 0
-    local oy     = s.debuffOffsetY or 0
+    local ox     = (opts and opts.ox) or s.debuffOffsetX or 0
+    local oy     = (opts and opts.oy) or s.debuffOffsetY or 0
     local perRow = s.debuffPerRow or 1
     if perRow < 1 then perRow = 1 end
 
@@ -2555,6 +2729,14 @@ local function StyleButton(button)
     ns._euiUnitButtons[button] = true
 
     local s = db.profile
+    -- The Anchor* closures below are stored on `d` and RE-CALLED after
+    -- d._isParty / d._isExtra are set (StyleButton runs before that). They must
+    -- resolve the settings source LIVE via LiveS() rather than capture this raid
+    -- `s`, or party/extra frames would anchor every indicator, text and aura at
+    -- the RAID position. The body keeps the raw `s` for creation-time sizing.
+    local function LiveS()
+        return d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+    end
     local w = PixelSnap(s.frameWidth or 72)
     local h = PixelSnap(s.frameHeight or 46)
     -- The power bar is ALWAYS created (hidden) below so a later profile swap
@@ -2767,6 +2949,7 @@ local function StyleButton(button)
     end
 
     local function AnchorDispelIcon()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         dispelIcon:ClearAllPoints()
         local sz = s.dispelIconSize or 16
         dispelIcon:SetSize(sz, sz)
@@ -2819,6 +3002,7 @@ local function StyleButton(button)
     d.healthText = healthFS
 
     local function AnchorHealthText()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         healthFS:ClearAllPoints()
         local pos = s.healthTextPosition or "center"
         local ox = s.healthTextOffsetX or 0
@@ -2860,6 +3044,19 @@ local function StyleButton(button)
     AnchorHealthText()
     d.AnchorHealthText = AnchorHealthText
 
+    -- Heal absorb text (1:1 with health text; independent position/size/color).
+    local healAbsorbFS = textCarrier:CreateFontString(nil, "OVERLAY")
+    ApplyFont(healAbsorbFS, s.healAbsorbTextSize or 9)
+    healAbsorbFS:SetWordWrap(false)
+    d.healAbsorbText = healAbsorbFS
+    local function AnchorHealAbsorbText()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        ns.AnchorRFText(healAbsorbFS, health, s.healAbsorbTextPosition or "center",
+            s.healAbsorbTextOffsetX or 0, s.healAbsorbTextOffsetY or 0, (s.frameWidth or 72) * 0.75)
+    end
+    AnchorHealAbsorbText()
+    d.AnchorHealAbsorbText = AnchorHealAbsorbText
+
     -- Status text (DEAD / OFFLINE / AFK -- always shown, own position/size/color)
     local statusFS = health:CreateFontString(nil, "OVERLAY")
     local stc = s.statusTextColor or { r = 1, g = 1, b = 1 }
@@ -2870,6 +3067,7 @@ local function StyleButton(button)
     d.statusText = statusFS
 
     local function AnchorStatusText()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         statusFS:ClearAllPoints()
         local pos = s.statusTextPosition or "center"
         local ox = s.statusTextOffsetX or 0
@@ -2911,6 +3109,7 @@ local function StyleButton(button)
     d.roleIcon = roleIcon
 
     local function AnchorRoleIcon()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         roleIcon:ClearAllPoints()
         -- The position key (topleft/top/topright/left/center/right/bottomleft/
         -- bottom/bottomright) uppercases directly to a valid anchor point, so all
@@ -2956,6 +3155,7 @@ local function StyleButton(button)
     d.raidMarker = raidMarker
 
     local function AnchorRaidMarker()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         raidMarker:ClearAllPoints()
         local pos = s.raidMarkerPosition or "center"
         local ox = s.raidMarkerOffsetX or 0
@@ -2990,6 +3190,7 @@ local function StyleButton(button)
     d.readyCheck = readyCheck
 
     local function AnchorReadyCheck()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         readyCheck:ClearAllPoints()
         local pos = s.readyCheckPosition or "center"
         local ox = s.readyCheckOffsetX or 0
@@ -3046,6 +3247,33 @@ local function StyleButton(button)
         dbBorder:SetFrameLevel(icon:GetFrameLevel() + 1)
         icon._borderFrame = dbBorder
         if PP then PP.CreateBorder(dbBorder, 0, 0, 0, 1, 1) end
+
+        -- Animated dispel clock border: TWO Cooldown frames at full icon size,
+        -- parented to the button BELOW the icon. ApplyDebuffIcon insets the icon
+        -- texture by the border thickness, so the icon occludes the center and only
+        -- the inner margin -- a fixed-thickness ring INSIDE the icon -- shows. The
+        -- BRIGHT one (reverse=false) shows the remaining time and erases clockwise;
+        -- the DARK one (reverse=true) fills the exact complement (the already-
+        -- elapsed arc) in the same hue at 50% brightness, so the ring is always
+        -- whole. Solid white swipe texture so SetSwipeColor renders a flat ring.
+        local function MakeClockRing(level, reverse)
+            local cd = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
+            cd:SetFrameLevel(math.max(0, button:GetFrameLevel() + level))
+            cd:SetReverse(reverse)
+            cd:SetDrawEdge(false)
+            cd:SetDrawBling(false)
+            cd:SetDrawSwipe(true)
+            cd:SetHideCountdownNumbers(true)
+            cd:SetSwipeTexture("Interface\\Buttons\\WHITE8X8")
+            -- Full icon size, BEHIND the icon texture. ApplyDebuffIcon INSETS the
+            -- icon texture by the border thickness so only this ring's inner margin
+            -- shows -- an inset border that stays within the icon's footprint.
+            cd:SetAllPoints(icon)
+            cd:Hide()
+            return cd
+        end
+        icon._clockBorderDark = MakeClockRing(ns.LVL_AURA - 3, true)   -- elapsed arc, dark, below
+        icon._clockBorder     = MakeClockRing(ns.LVL_AURA - 2, false)  -- remaining arc, bright, above
 
         -- Text carrier above cooldown swipe AND border
         local dbFontPath = (EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("raidFrames")) or "Fonts\\FRIZQT__.TTF"
@@ -3112,13 +3340,48 @@ local function StyleButton(button)
     -- shared DebuffGridPoint helper, which mirrors the Buff Manager's
     -- AnchorSimpleGrid. For CENTER growth, call with visibleCount so each row
     -- centers on how many icons are actually shown.
+    local _dispOpts = {}
     local function AnchorDebuffs(visibleCount)
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         local total = visibleCount or #d.debuffIcons
 
-        for i, icon in ipairs(d.debuffIcons) do
+        -- Dispellable debuffs can be routed to their own anchor + growth + offsets
+        -- ("Dispellable Debuff Location"); "same" keeps everything in one grid.
+        if (s.dispellableDebuffLocation or "same") == "same" then
+            for i, icon in ipairs(d.debuffIcons) do
+                icon:ClearAllPoints()
+                local corner, fx, fy = ns.DebuffGridPoint(s, i - 1, total)
+                icon:SetPoint(corner, health, corner, fx, fy)
+            end
+            return
+        end
+
+        _dispOpts.pos  = s.dispellableDebuffLocation
+        _dispOpts.grow = s.dispellableDebuffGrowDirection or "RIGHT"
+        _dispOpts.ox   = s.dispellableDebuffOffsetX or 0
+        _dispOpts.oy   = s.dispellableDebuffOffsetY or 0
+
+        -- Per-group VISIBLE totals so CENTER growth centers each group correctly.
+        local nTotal, dTotal = 0, 0
+        for i = 1, total do
+            local icon = d.debuffIcons[i]
+            if icon then
+                if icon._isDispellable then dTotal = dTotal + 1 else nTotal = nTotal + 1 end
+            end
+        end
+
+        local nIdx, dIdx = 0, 0
+        for _, icon in ipairs(d.debuffIcons) do
             icon:ClearAllPoints()
-            local corner, fx, fy = ns.DebuffGridPoint(s, i - 1, total)
-            icon:SetPoint(corner, health, corner, fx, fy)
+            if icon._isDispellable then
+                local corner, fx, fy = ns.DebuffGridPoint(s, dIdx, dTotal, _dispOpts)
+                icon:SetPoint(corner, health, corner, fx, fy)
+                dIdx = dIdx + 1
+            else
+                local corner, fx, fy = ns.DebuffGridPoint(s, nIdx, nTotal, nil)
+                icon:SetPoint(corner, health, corner, fx, fy)
+                nIdx = nIdx + 1
+            end
         end
     end
     AnchorDebuffs()
@@ -3171,6 +3434,7 @@ local function StyleButton(button)
     -- Anchor defensive icons. For CENTER growth, call with visibleCount
     -- to dynamically center the row based on how many are actually shown.
     local function AnchorDefensives(visibleCount)
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         local pos = s.defPosition or "center"
         local ox = s.defOffsetX or 0
         local oy = s.defOffsetY or 0
@@ -3231,6 +3495,7 @@ local function StyleButton(button)
     -- vertical position via a single vertical anchor. JustifyH/V controls
     -- text alignment within the bounded region.
     local function AnchorNameText()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
         nameFS:ClearAllPoints()
         local pos = s.namePosition or "center"
         -- The Top Name Bar shows the unit name in its own band, so suppress the
@@ -3400,16 +3665,17 @@ local function StyleButton(button)
         if fd.ApplyBorderColor then fd.ApplyBorderColor() end
         -- Read through the party-aware proxy (like every other render path), not
         -- raw db.profile -- otherwise party_<key> overrides written by a custom
-        -- party "Range & Tooltip" section are never seen and the toggle (and its
-        -- in-combat sub-toggle) appear to do nothing on party frames.
+        -- party "Range & Tooltip" section are never seen and the tooltip mode
+        -- dropdown appears to do nothing on party frames.
         local s = fd._isParty and ns._scaledPartyProxy or (fd._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
-        if not s.showTooltip then return end
-        -- "Show in Combat" is now a global setting that governs ALL unit
-        -- tooltips (see EllesmereUIDB.showUnitTooltipsInCombat). Gate the raid
-        -- frame's own OnEnter on it too, since this handler explicitly Show()s
-        -- the tooltip after SetUnit (so the global suppression hook alone, which
-        -- runs during SetUnit, would be undone here).
-        if inCombat and not (EllesmereUIDB and EllesmereUIDB.showUnitTooltipsInCombat) then return end
+        -- Raid/party frame tooltips are governed by the "Show Raid Frames
+        -- Tooltip" mode, and ONLY these frames -- no other unit tooltips are
+        -- touched. never = no tooltip; outOfCombat = hidden in any combat;
+        -- outOfBossCombat = hidden during an encounter; always = always shown.
+        local ttMode = ns._ResolveTooltipMode(s)
+        if ttMode == "never" then return end
+        if ttMode == "outOfCombat" and inCombat then return end
+        if ttMode == "outOfBossCombat" and ns._inBossCombat then return end
         local u = self:GetAttribute("unit")
         if u and UnitExists(u) then
             GameTooltip_SetDefaultAnchor(GameTooltip, self)
@@ -3663,7 +3929,8 @@ local function UpdateButton(button)
         local fillTex = health:GetStatusBarTexture()
         if s.healthColorMode == "dark" then
             health:SetStatusBarColor(r, g, b, 1)
-            if fillTex then fillTex:SetAlpha(DARK_FILL_A) end
+            -- 4th return of GetDarkModeFill() is the Dark Mode Fill Opacity.
+            if fillTex then fillTex:SetAlpha(select(4, EllesmereUI.GetDarkModeFill())) end
         else
             if fillTex then fillTex:SetAlpha(1) end
             health:SetStatusBarColor(r, g, b, (s.healthBarOpacity or 100) / 100)
@@ -3805,6 +4072,15 @@ local function UpdateButton(button)
         end
     end
 
+    -- Heal absorb text
+    if d.healAbsorbText then
+        if UnitIsDeadOrGhost(unit) or not UnitIsConnected(unit) then
+            d.healAbsorbText:SetText("")
+        else
+            ns.SetHealAbsorbText(d.healAbsorbText, unit, s)
+        end
+    end
+
     -- Status text (DEAD / OFFLINE / AFK -- always shown, own position/size/color)
     if d.statusText then
         local stc = s.statusTextColor or { r = 1, g = 1, b = 1 }
@@ -3904,6 +4180,13 @@ end
 local C_UnitAuras_GetAuraDataByAuraInstanceID = C_UnitAuras.GetAuraDataByAuraInstanceID
 local C_UnitAuras_IsAuraFilteredOutByInstanceID = C_UnitAuras.IsAuraFilteredOutByInstanceID
 
+-- Crowd-control aura filter (Blizzard 11.1+ CROWD_CONTROL filter, the same one
+-- Grid2/Danders use to identify CC). An aura that is NOT filtered out by this
+-- passes = it's a crowd-control debuff. Used by the CC Debuff Glow. Stored on ns
+-- (not a file local) to stay under the Lua 200-local cap.
+ns._ccDebuffFilter = "HARMFUL|" ..
+    ((AuraUtil and AuraUtil.AuraFilters and AuraUtil.AuraFilters.CrowdControl) or "CROWD_CONTROL")
+
 -- Sated/Exhaustion spell IDs (lust debuff variants)
 local SATED_DEBUFFS = {
     [57723]  = true,  -- Exhaustion (Heroism)
@@ -3958,37 +4241,66 @@ local function ApplyDebuffIcon(icon, auraData, unit, s)
         icon._tex:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
     end
 
-    -- Border (dispel-type colored or user default)
-    local borderSz = s.debuffBorderSize or 1
-    if icon._borderFrame and PP then
-        if borderSz > 0 then
-            -- A typed (dispellable) debuff carries a non-nil dispelName even when
-            -- the name itself is a secret value (other players' debuffs inside
-            -- instances); physical debuffs have a nil dispelName. So this nil
-            -- check is the secret-safe "is it dispellable" test.
-            local dispelName = auraData.dispelName
-            local dc
-            if dispelName ~= nil then
-                if not issecretvalue(dispelName) then
-                    -- Clean string: direct per-type color lookup.
-                    dc = GetDispelColor(dispelName, s)
-                else
-                    -- Secret dispel type: resolve through Blizzard's color curve
-                    -- so the user's custom dispel color still applies without ever
-                    -- reading the secret (same route as the health-bar dispel border).
-                    if not ns._dispelCurve then ns._RebuildDispelCurves() end
-                    local curve = (s == ns._scaledPartyProxy) and ns._dispelCurveParty or ns._dispelCurve
-                    local iid = auraData.auraInstanceID
-                    if curve and iid and C_UnitAuras.GetAuraDispelTypeColor then
-                        local col = C_UnitAuras.GetAuraDispelTypeColor(unit, iid, curve)
-                        if col then
-                            local sc = ns._dispelScratch
-                            sc.r, sc.g, sc.b = col:GetRGB()
-                            dc = sc
-                        end
+    -- A typed (dispellable) debuff carries a non-nil dispelName even when the
+    -- name itself is a secret value (other players' debuffs inside instances);
+    -- physical debuffs have a nil dispelName. So this nil check is the
+    -- secret-safe "is it dispellable" test (used by the border AND clock border).
+    local dispelName = auraData.dispelName
+    local isDispellable = dispelName ~= nil
+    icon._isDispellable = isDispellable   -- consumed by AnchorDebuffs for the split layout
+    -- When on, dispellable debuffs swap their static colored border for the
+    -- animated clock border (erases clockwise) and drop the face pie swipe.
+    local wantClockBorder = isDispellable and s.dispelClockBorder == true
+
+    -- Resolve the dispel-type color once (secret-safe); shared by the static
+    -- border and the animated clock border. dcDark is the same hue at 50%
+    -- brightness for the clock border's already-elapsed arc.
+    local dc, dcDark
+    if dispelName ~= nil then
+        if not issecretvalue(dispelName) then
+            -- Clean string: direct per-type color lookup.
+            dc = GetDispelColor(dispelName, s)
+            if dc then
+                local sd = ns._dispelScratchDark
+                sd.r, sd.g, sd.b = dc.r * 0.5, dc.g * 0.5, dc.b * 0.5
+                dcDark = sd
+            end
+        else
+            -- Secret dispel type: resolve through Blizzard's color curves so the
+            -- user's custom dispel color still applies without ever reading the
+            -- secret (same route as the health-bar dispel border). A parallel
+            -- pre-darkened curve yields the 50%-blacker shade, also secret-safe.
+            if not ns._dispelCurve then ns._RebuildDispelCurves() end
+            local party = (s == ns._scaledPartyProxy)
+            local curve     = party and ns._dispelCurveParty     or ns._dispelCurve
+            local curveDark = party and ns._dispelCurveDarkParty or ns._dispelCurveDark
+            local iid = auraData.auraInstanceID
+            if iid and C_UnitAuras.GetAuraDispelTypeColor then
+                if curve then
+                    local col = C_UnitAuras.GetAuraDispelTypeColor(unit, iid, curve)
+                    if col then
+                        local sc = ns._dispelScratch
+                        sc.r, sc.g, sc.b = col:GetRGB()
+                        dc = sc
+                    end
+                end
+                if curveDark then
+                    local cold = C_UnitAuras.GetAuraDispelTypeColor(unit, iid, curveDark)
+                    if cold then
+                        local sd = ns._dispelScratchDark
+                        sd.r, sd.g, sd.b = cold:GetRGB()
+                        dcDark = sd
                     end
                 end
             end
+        end
+    end
+
+    -- Border (dispel-type colored or user default). Hidden when the animated
+    -- clock border takes over for this dispellable debuff.
+    local borderSz = s.debuffBorderSize or 1
+    if icon._borderFrame and PP then
+        if borderSz > 0 and not wantClockBorder then
             if dc then
                 PP.UpdateBorder(icon._borderFrame, borderSz, dc.r, dc.g, dc.b, 1)
             else
@@ -4003,7 +4315,9 @@ local function ApplyDebuffIcon(icon, auraData, unit, s)
 
     -- Duration swipe + text (secret-safe via DurationObject + GetCountdownFontString)
     if icon._cooldown then
-        local wantSwipe = s.debuffShowSwipe
+        -- Border-only clock: suppress the face pie swipe when active so ONLY
+        -- the perimeter ring animates for this dispellable debuff.
+        local wantSwipe = s.debuffShowSwipe and not wantClockBorder
         local wantDurText = s.debuffShowDurText
         if wantSwipe or wantDurText then
             -- Permanent auras return a degenerate 0,0 duration object; a
@@ -4060,6 +4374,76 @@ local function ApplyDebuffIcon(icon, auraData, unit, s)
         end
     end
 
+    -- Animated dispel clock border: a fixed-thickness colored ring that starts
+    -- fully drawn and erases clockwise as the debuff expires. The cooldown rings
+    -- are full icon size BEHIND the texture; insetting the texture by the border
+    -- thickness leaves only the inner margin (the ring) visible -- an INSET border
+    -- that stays within the icon's footprint (no layout shift). Engine-driven
+    -- (SetCooldownFromDurationObject), so it stays correct on secret-duration
+    -- debuffs where a Lua timer cannot read the remaining time.
+    if icon._clockBorder then
+        if wantClockBorder then
+            local cb, cbd = icon._clockBorder, icon._clockBorderDark
+            -- Inset ring thickness = main debuff border size + extra, in physical
+            -- pixels at the icon's effective scale (matches the static border).
+            -- The rings are full icon size; shrinking the icon texture by `ring`
+            -- exposes exactly that inner margin (and nothing outside the icon).
+            local ringPx = (s.debuffBorderSize or 1) + (s.dispelClockExtraBorder or 0)
+            local es = icon:GetEffectiveScale()
+            local onePixel = (es and es > 0 and PP and PP.perfect) and (PP.perfect / es) or 1
+            local ring = ringPx * onePixel
+            local applied = false
+            local iid = auraData.auraInstanceID
+            if iid and not issecretvalue(iid) and C_UnitAuras.GetAuraDuration then
+                local durObj = C_UnitAuras.GetAuraDuration(unit, iid)
+                if durObj then
+                    cb:SetCooldownFromDurationObject(durObj)
+                    cbd:SetCooldownFromDurationObject(durObj)
+                    if durObj.IsZero and cb.SetAlphaFromBoolean then
+                        cb:SetAlphaFromBoolean(durObj:IsZero(), 0, 1)
+                        cbd:SetAlphaFromBoolean(durObj:IsZero(), 0, 1)
+                    else
+                        cb:SetAlpha(1); cbd:SetAlpha(1)
+                    end
+                    applied = true
+                end
+            else
+                local dur, exp = auraData.duration, auraData.expirationTime
+                if dur and exp and not issecretvalue(dur) and not issecretvalue(exp) and dur > 0 then
+                    cb:SetCooldown(exp - dur, dur)
+                    cbd:SetCooldown(exp - dur, dur)
+                    cb:SetAlpha(1); cbd:SetAlpha(1)
+                    applied = true
+                end
+            end
+            if applied then
+                -- Tint each swipe; SetVertexColor accepts secret values and
+                -- SetSwipeColor is assumed to behave the same. Bright ring shows
+                -- the remaining time; the reversed dark ring fills the elapsed
+                -- complement in the same hue at 50% brightness.
+                local c  = dc     or s.debuffBorderColor or { r = 1, g = 1, b = 1 }
+                local cd = dcDark or c
+                cb:SetSwipeColor(c.r, c.g, c.b, 1)
+                cbd:SetSwipeColor(cd.r, cd.g, cd.b, 1)
+                -- Inset the icon texture so the rings show only as an inner margin.
+                icon._tex:ClearAllPoints()
+                icon._tex:SetPoint("TOPLEFT", icon, "TOPLEFT", ring, -ring)
+                icon._tex:SetPoint("BOTTOMRIGHT", icon, "BOTTOMRIGHT", -ring, ring)
+                cb:Show(); cbd:Show()
+            else
+                cb:Clear(); cb:Hide()
+                cbd:Clear(); cbd:Hide()
+                icon._tex:ClearAllPoints(); icon._tex:SetAllPoints()
+            end
+        else
+            icon._clockBorder:Hide()
+            if icon._clockBorderDark then icon._clockBorderDark:Hide() end
+            -- Clock border insets the icon texture; restore full size when off.
+            icon._tex:ClearAllPoints()
+            icon._tex:SetAllPoints()
+        end
+    end
+
     -- Stacks (secret-safe via Blizzard API)
     if icon._count then
         if s.debuffShowStacks and C_UnitAuras.GetAuraApplicationDisplayCount then
@@ -4095,6 +4479,61 @@ local function ApplyDebuffIcon(icon, auraData, unit, s)
     icon:Show()
 end
 
+-- CC Debuff Glow: glow a displayed debuff icon when its aura is crowd control.
+-- Mirrors CDM's Buff Glow (per-icon overlay + EllesmereUI.Glows.StartGlow). The
+-- glow is restarted only when style/size/colour/pixel-params change so a steady
+-- glow never resets on a plain aura tick. Secret-safe: the CC test uses the
+-- Blizzard filter API, and we never read a secret aura field. Defined on ns (not
+-- a file local) to stay under the Lua 200-local cap.
+function ns.ApplyDebuffCCGlow(icon, auraData, unit, s)
+    local Glows = EllesmereUI.Glows
+    local gType = s.debuffCCGlowType or 0
+    local iid = auraData and auraData.auraInstanceID
+    local isCC = gType > 0 and iid and not issecretvalue(iid)
+        and C_UnitAuras_IsAuraFilteredOutByInstanceID
+        and not C_UnitAuras_IsAuraFilteredOutByInstanceID(unit, iid, ns._ccDebuffFilter)
+    if isCC and Glows and Glows.StartGlow then
+        local gov = icon._ccGlowOverlay
+        if not gov then
+            gov = CreateFrame("Frame", nil, icon)
+            gov:SetAllPoints(icon)
+            gov:SetFrameLevel(icon:GetFrameLevel() + 5)
+            gov:EnableMouse(false)
+            icon._ccGlowOverlay = gov
+        end
+        local cr, cg, cb = s.debuffCCGlowR or 1.0, s.debuffCCGlowG or 0.776, s.debuffCCGlowB or 0.376
+        if s.debuffCCGlowClassColor then
+            local _, classFile = UnitClass("player")
+            local cc = classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile]
+            if cc then cr, cg, cb = cc.r, cc.g, cc.b end
+        end
+        local sz = s.debuffSize or 18
+        local oN, oTh, oPer
+        if gType == 1 then  -- Pixel Glow uses the Lines/Thickness/Speed params
+            oN, oTh, oPer = s.debuffCCGlowLines or 8, s.debuffCCGlowThickness or 2, s.debuffCCGlowSpeed or 4
+        end
+        if (not gov._euiGlowActive) or gov._ccStyle ~= gType or gov._ccW ~= sz
+           or gov._ccCR ~= cr or gov._ccCG ~= cg or gov._ccCB ~= cb
+           or gov._ccN ~= oN or gov._ccTh ~= oTh or gov._ccPer ~= oPer then
+            Glows.StartGlow(gov, gType, sz, cr, cg, cb, oN and { N = oN, th = oTh, period = oPer } or nil)
+            gov._ccStyle, gov._ccW = gType, sz
+            gov._ccCR, gov._ccCG, gov._ccCB = cr, cg, cb
+            gov._ccN, gov._ccTh, gov._ccPer = oN, oTh, oPer
+        end
+    elseif icon._ccGlowOverlay and icon._ccGlowOverlay._euiGlowActive and Glows and Glows.StopGlow then
+        Glows.StopGlow(icon._ccGlowOverlay)
+    end
+end
+
+-- Stop a debuff icon's CC glow (pool reuse / hidden / filter off). On ns to stay
+-- under the Lua 200-local cap.
+function ns.StopDebuffCCGlow(icon)
+    local gov = icon._ccGlowOverlay
+    if gov and gov._euiGlowActive and EllesmereUI.Glows and EllesmereUI.Glows.StopGlow then
+        EllesmereUI.Glows.StopGlow(gov)
+    end
+end
+
 -- Render the cached debuff list to icon frames
 local function RenderDebuffs(d, s, unit)
     local debuffCache = d.debuffCache
@@ -4122,17 +4561,25 @@ local function RenderDebuffs(d, s, unit)
             local icon = d.debuffIcons[shown]
             if icon then
                 ApplyDebuffIcon(icon, auraData, unit, s)
+                ns.ApplyDebuffCCGlow(icon, auraData, unit, s)
             end
         end
     end
     for j = shown + 1, #d.debuffIcons do
         local icon = d.debuffIcons[j]
         icon:Hide()
+        icon._isDispellable = nil
+        if icon._clockBorder then icon._clockBorder:Hide() end
+        if icon._clockBorderDark then icon._clockBorderDark:Hide() end
+        ns.StopDebuffCCGlow(icon)
         if icon._durText and ns.UnregisterDurText then ns.UnregisterDurText(icon._durText) end
     end
 
-    -- CENTER growth: re-anchor based on actual visible count
-    if (s.debuffGrowDirection or "RIGHT") == "CENTER" and d.AnchorDebuffs then
+    -- Re-anchor when the layout depends on this render's composition: CENTER
+    -- growth (needs the visible count) OR dispellable-debuff separation (needs to
+    -- know which icons are dispellable, which changes every update).
+    if d.AnchorDebuffs and ((s.debuffGrowDirection or "RIGHT") == "CENTER"
+       or (s.dispellableDebuffLocation or "same") ~= "same") then
         d.AnchorDebuffs(shown)
     end
 end
@@ -4162,7 +4609,7 @@ local function UpdateDebuffs(button, unit, updateInfo)
     local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
 
     if s.debuffFilter == "none" then
-        for _, icon in ipairs(d.debuffIcons) do icon:Hide() end
+        for _, icon in ipairs(d.debuffIcons) do icon:Hide(); ns.StopDebuffCCGlow(icon) end
         if d.debuffCache then wipe(d.debuffCache) end
         return
     end
@@ -4821,6 +5268,7 @@ end
 
 -- Scratch color reused for dispel overlays (avoids a per-call table alloc).
 ns._dispelScratch = ns._dispelScratch or {}
+ns._dispelScratchDark = ns._dispelScratchDark or {}
 
 -- Build the dispel-type -> color curves from the user's custom colors. Blizzard's
 -- GetAuraDispelTypeColor evaluates this curve against an aura's (secret) dispel
@@ -4831,12 +5279,12 @@ ns._dispelScratch = ns._dispelScratch or {}
 -- (not file locals) to respect the 200-local main-chunk cap.
 function ns._RebuildDispelCurves()
     if not (C_CurveUtil and C_CurveUtil.CreateColorCurve) then return end
-    local function build(profile)
+    local function build(profile, mult)
         local c = C_CurveUtil.CreateColorCurve()
         c:SetType(Enum.LuaCurveType.Step)
         local function add(idx, key, dr, dg, db)
             local col = profile and profile[key]
-            c:AddPoint(idx, CreateColor(col and col.r or dr, col and col.g or dg, col and col.b or db))
+            c:AddPoint(idx, CreateColor((col and col.r or dr) * mult, (col and col.g or dg) * mult, (col and col.b or db) * mult))
         end
         add(0,  "dispelColorMagic",   0.349, 0.475, 1.0)   -- none: harmless default
         add(1,  "dispelColorMagic",   0.349, 0.475, 1.0)
@@ -4847,8 +5295,13 @@ function ns._RebuildDispelCurves()
         add(11, "dispelColorBleed",   0.75,  0.15,  0.15)
         return c
     end
-    ns._dispelCurve = build(ns._scaledProfile)
-    ns._dispelCurveParty = build(ns._scaledPartyProxy)
+    -- Bright (full) curves + parallel 50%-darkened curves for the clock border's
+    -- already-elapsed arc. Darkening is applied here to the user's CLEAN color
+    -- values at build time, never to a secret per-frame color.
+    ns._dispelCurve          = build(ns._scaledProfile,    1)
+    ns._dispelCurveParty     = build(ns._scaledPartyProxy, 1)
+    ns._dispelCurveDark      = build(ns._scaledProfile,    0.5)
+    ns._dispelCurveDarkParty = build(ns._scaledPartyProxy, 0.5)
 end
 
 -- Per-type visibility curves for the dispel-type icons. Each curve is white at
@@ -5111,6 +5564,22 @@ end
 
 function ERF:UpdateAllFrames()
     UpdateAllButtons()
+    -- Party / Extra / Boss frames are NOT in `allButtons`, so UpdateAllButtons
+    -- misses them. Repaint their health (fill + background) too, so colour and
+    -- Dark Mode changes pushed through ApplyColorsToOUF reach every frame type,
+    -- not just raid. _UpdateButtonHealth is lightweight + combat-safe and self-
+    -- guards on unstyled / non-existent units.
+    if ns._UpdateButtonHealth then
+        if ns._partyUnitToButton then
+            for _, btn in pairs(ns._partyUnitToButton) do ns._UpdateButtonHealth(btn) end
+        end
+        if ns._xfUnitToButton then
+            for _, btn in pairs(ns._xfUnitToButton) do ns._UpdateButtonHealth(btn) end
+        end
+        if ns._FB and ns._FB.buttons then
+            for _, btn in ipairs(ns._FB.buttons) do ns._UpdateButtonHealth(btn) end
+        end
+    end
 end
 
 -- Lightweight: only toggle raid markers on each button (for RAID_TARGET_UPDATE)
@@ -5219,7 +5688,8 @@ ns._UpdateButtonHealth = function(button)
         local fillTex = health:GetStatusBarTexture()
         if s.healthColorMode == "dark" then
             health:SetStatusBarColor(r, g, b, 1)
-            if fillTex then fillTex:SetAlpha(DARK_FILL_A) end
+            -- 4th return of GetDarkModeFill() is the Dark Mode Fill Opacity.
+            if fillTex then fillTex:SetAlpha(select(4, EllesmereUI.GetDarkModeFill())) end
         else
             if fillTex then fillTex:SetAlpha(1) end
             health:SetStatusBarColor(r, g, b, (s.healthBarOpacity or 100) / 100)
@@ -5266,6 +5736,15 @@ ns._UpdateButtonHealth = function(button)
             d.healthText:SetTextColor(htr, htg, htb, 0.9)
         else
             d.healthText:SetText("")
+        end
+    end
+
+    -- Heal absorb text
+    if d.healAbsorbText then
+        if UnitIsDeadOrGhost(unit) or not UnitIsConnected(unit) then
+            d.healAbsorbText:SetText("")
+        else
+            ns.SetHealAbsorbText(d.healAbsorbText, unit, s)
         end
     end
 
@@ -5532,6 +6011,11 @@ FB.Update = function(b)
         end
     end
 
+    if b._healAbsorbText then
+        if UnitIsDeadOrGhost(unit) then b._healAbsorbText:SetText("")
+        else ns.SetHealAbsorbText(b._healAbsorbText, unit, s) end
+    end
+
     FB.ApplyBorderColor(b)
 end
 
@@ -5584,6 +6068,9 @@ FB.EnsureBuilt = function()
         local healthFS = carrier:CreateFontString(nil, "OVERLAY")
         healthFS:SetWordWrap(false)
         b._healthText = healthFS
+        local healAbsorbFS = carrier:CreateFontString(nil, "OVERLAY")
+        healAbsorbFS:SetWordWrap(false)
+        b._healAbsorbText = healAbsorbFS
 
         -- Border frame (same construction as the raid buttons; styled via the
         -- shared raid border settings in FB.StyleBorder)
@@ -5770,6 +6257,13 @@ FB.ApplyStyle = function(owner)
         end
         FB.AnchorText(b._healthText, b._health, s.healthTextPosition or "center",
             s.healthTextOffsetX or 0, s.healthTextOffsetY or 0)
+        if b._healAbsorbText then
+            ApplyFont(b._healAbsorbText, s.healAbsorbTextSize or 9)
+            b._healAbsorbText:SetWidth(w * 0.75)
+            b._healAbsorbText:SetHeight(0)
+            FB.AnchorText(b._healAbsorbText, b._health, s.healAbsorbTextPosition or "center",
+                s.healAbsorbTextOffsetX or 0, s.healAbsorbTextOffsetY or 0)
+        end
         FB.StyleBorder(b)
     end
 end
@@ -6220,6 +6714,10 @@ XF.Layout = function()
             ApplyFont(d.healthText, xs.healthTextSize or 9)
             if d.AnchorHealthText then d.AnchorHealthText() end
         end
+        if d.healAbsorbText then
+            ApplyFont(d.healAbsorbText, xs.healAbsorbTextSize or 9)
+            if d.AnchorHealAbsorbText then d.AnchorHealAbsorbText() end
+        end
         if d.statusText then
             ApplyFont(d.statusText, xs.statusTextSize or 14)
             if d.AnchorStatusText then d.AnchorStatusText() end
@@ -6332,6 +6830,7 @@ XF.EnsureBuilt = function()
             elseif event == "UNIT_ABSORB_AMOUNT_CHANGED" or event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED"
                 or event == "UNIT_HEAL_PREDICTION" or event == "UNIT_MAX_HEALTH_MODIFIERS_CHANGED" then
                 UpdateAbsorb(b, unit)
+                if event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED" then ns.UpdateHealAbsorbTextFor(b, unit) end
             elseif event == "UNIT_THREAT_LIST_UPDATE" or event == "UNIT_THREAT_SITUATION_UPDATE" then
                 local d = GetFFD(b)
                 if d.threatFrame then
@@ -7002,7 +7501,12 @@ function ns._UpdateGroupNumbers()
     end
 end
 
-local function LayoutGroups()
+-- Real layout work. Call only through LayoutGroups() below, which wraps this in a
+-- coalescing re-entrancy guard. Mutating secure group headers here (Hide/Show/
+-- SetAttribute) and resizing the container makes Blizzard re-anchor their children
+-- synchronously, which can re-enter layout through our own hooks. Stored on ns
+-- (not a new file-scope local) because this chunk is at the 200-local cap.
+ns._LayoutGroupsImpl = function()
     if not containerFrame then return end
     if InCombatLockdown() then return end
 
@@ -7241,6 +7745,44 @@ local function LayoutGroups()
     ns._UpdateGroupNumbers()
 end
 
+-- Coalescing re-entrancy guard around the secure-header relayout. A LayoutGroups()
+-- call that arrives while a layout is already running is NOT dropped -- dropping it
+-- would leave frames stale (a roster change or size flip mid-layout would be lost).
+-- Instead the re-entrant call marks the pass dirty and the in-flight call re-runs
+-- once it returns. Bounded to 3 passes so a non-converging header feedback loop
+-- (our SetAttribute/SetSize -> Blizzard re-anchors children -> our hook -> here)
+-- can never spin the CPU into a "script ran too long" watchdog kill. pcall keeps the
+-- busy flag honest: if the body errors we clear the flag and rethrow, so a single
+-- error can never freeze every future layout until /reload. State lives on ns to
+-- avoid adding file-scope locals (this chunk is at the 200-local cap); the wrapper
+-- reuses the slot the impl used to hold, so this adds no new main-chunk local.
+local function LayoutGroups()
+    if ns._inLayoutGroups then
+        ns._layoutGroupsDirty = true
+        return
+    end
+    ns._inLayoutGroups = true
+    local passes = 0
+    repeat
+        ns._layoutGroupsDirty = false
+        passes = passes + 1
+        local ok, err = pcall(ns._LayoutGroupsImpl)
+        if not ok then
+            ns._inLayoutGroups = false
+            return geterrorhandler()(err)
+        end
+    until (not ns._layoutGroupsDirty) or passes >= 3
+    ns._inLayoutGroups = false
+    -- Cap reached with work still pending: a genuine non-converging relayout loop.
+    -- The guard kept it from freezing the client; surface it once (out of combat)
+    -- so it stays diagnosable instead of silently masking a real bug.
+    if ns._layoutGroupsDirty and not ns._layoutLoopWarned and not InCombatLockdown() then
+        ns._layoutLoopWarned = true
+        print("|cffff5555EllesmereUI Raid Frames:|r layout did not settle after 3 passes; " ..
+            "a re-entrant loop was bounded. Please report this if frames look wrong.")
+    end
+end
+
 local RangeUpdate  -- forward declaration (defined in Range fading section below)
 
 -------------------------------------------------------------------------------
@@ -7285,11 +7827,13 @@ local function ReloadFrames()
         local baseW = db.profile.frameWidth or 72
         local baseH = db.profile.frameHeight or 46
         local scale = math.min(ns._activeSizeW / baseW, ns._activeSizeH / baseH)
-        sizeScale = math.max(math.min(scale, 1.3), 0.7)
+        sizeScale = math.max(math.min(scale, 1.5), 0.7)
     end
-    -- Buff Manager indicators ALWAYS follow the size-derived scale; the Auto
-    -- Resize toggle gates only the other indicators/auras/text sizes.
-    ns._bmScale = sizeScale
+    -- Auto Resize Icons (two independent checkboxes): Tracked Buffs gates the
+    -- Buff Manager scale; Indicators & Auras gates indicator/aura/text sizes.
+    -- Tracked Buffs defaults on (nil treated as on) to preserve the prior
+    -- hardcoded always-on behavior.
+    ns._bmScale = (db.profile.autoResizeTrackedBuffs ~= false) and sizeScale or 1
     ns._indicatorScale = db.profile.autoResizeIndicators and sizeScale or 1
 
     local powerH = IsPowerBarEnabled(s) and PixelSnap(s.powerHeight or 4) or 0
@@ -7341,6 +7885,12 @@ local function ReloadFrames()
         if d.healthText then
             ApplyFont(d.healthText, s.healthTextSize or 9)
             if d.AnchorHealthText then d.AnchorHealthText() end
+        end
+
+        -- Heal absorb text
+        if d.healAbsorbText then
+            ApplyFont(d.healAbsorbText, s.healAbsorbTextSize or 9)
+            if d.AnchorHealAbsorbText then d.AnchorHealAbsorbText() end
         end
 
         -- Status text (DEAD/OFFLINE/AFK)
@@ -7540,6 +8090,7 @@ ns._ResizePartyButtons = function(w, h)
                 end
                 if d.nameText then ApplyFont(d.nameText, pp.nameSize or 10) end
                 if d.healthText then ApplyFont(d.healthText, pp.healthTextSize or 9) end
+                if d.healAbsorbText then ApplyFont(d.healAbsorbText, pp.healAbsorbTextSize or 9) end
                 if d.statusText then ApplyFont(d.statusText, pp.statusTextSize or 14) end
             end
             -- BM buffs ALWAYS follow the size-derived scale (independent of
@@ -7903,6 +8454,7 @@ local function GhostAuraCheck()
                 if d.debuffIcons then
                     for _, icon in ipairs(d.debuffIcons) do
                         icon:Hide()
+                        ns.StopDebuffCCGlow(icon)
                         if icon._durText and ns.UnregisterDurText then
                             ns.UnregisterDurText(icon._durText)
                         end
@@ -8170,6 +8722,12 @@ local function OnEvent(self, event, arg1, ...)
                 ns._LayoutPartyFrames()
             end
         end
+    elseif event == "ENCOUNTER_START" then
+        -- Drives the raid/party frame "Out of Boss Combat" tooltip mode (read in
+        -- the frame OnEnter via ns._inBossCombat).
+        ns._inBossCombat = true
+    elseif event == "ENCOUNTER_END" then
+        ns._inBossCombat = false
     elseif event == "PLAYER_ROLES_ASSIGNED" then
         -- Roles changed: refresh raid sort so the player's-group nameList
         -- (Show Self First) re-orders the rest by the new roles. The other
@@ -8366,7 +8924,10 @@ local function OnEvent(self, event, arg1, ...)
     elseif event == "UNIT_ABSORB_AMOUNT_CHANGED" or event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED"
         or event == "UNIT_HEAL_PREDICTION" or event == "UNIT_MAX_HEALTH_MODIFIERS_CHANGED" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
-        if btn then local t0 = ns.ProfBegin("UpdateAbsorb:OTHER"); UpdateAbsorb(btn, arg1); ns.ProfEnd("UpdateAbsorb:OTHER", t0) end
+        if btn then
+            local t0 = ns.ProfBegin("UpdateAbsorb:OTHER"); UpdateAbsorb(btn, arg1); ns.ProfEnd("UpdateAbsorb:OTHER", t0)
+            if event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED" then ns.UpdateHealAbsorbTextFor(btn, arg1) end
+        end
     elseif event == "UNIT_NAME_UPDATE" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then UpdateButton(btn) end
@@ -8517,6 +9078,12 @@ local function OnEvent(self, event, arg1, ...)
             end
         end
     elseif event == "PLAYER_ENTERING_WORLD" then
+        -- Re-sync the boss-combat flag on load. IsEncounterInProgress() still
+        -- reports an active encounter after a mid-fight /reload or zone (where
+        -- ENCOUNTER_START already fired and will not fire again), so "Out of Boss
+        -- Combat" keeps suppressing; otherwise this clears a stale flag from a
+        -- missed ENCOUNTER_END so tooltips are not stuck hidden.
+        ns._inBossCombat = (IsEncounterInProgress and IsEncounterInProgress()) or false
         C_Timer.After(0.5, function()
             -- Zoning in mid-combat (e.g. into a raid where trash is already
             -- pulled) must NOT run the reload here: ReloadFrames calls SetSize on
@@ -8625,6 +9192,8 @@ do
             "namePosition", "nameOffsetX", "nameOffsetY",
             "healthTextMode", "healthTextColorMode", "healthTextCustomColor",
             "healthTextSize", "healthTextPosition", "healthTextOffsetX", "healthTextOffsetY",
+            "healAbsorbTextMode", "healAbsorbTextColorMode", "healAbsorbTextCustomColor",
+            "healAbsorbTextSize", "healAbsorbTextPosition", "healAbsorbTextOffsetX", "healAbsorbTextOffsetY",
         },
         indicators = {
             "roleIconStyle", "roleIconSize", "roleIconPosition", "roleIconOffsetX", "roleIconOffsetY", "roleIconHideInCombat",
@@ -8653,7 +9222,7 @@ do
             "topNameBarTextOffsetX", "topNameBarTextOffsetY", "topNameBarTextAlign",
         },
         rangeTooltip = {
-            "oorAlpha", "showTooltip",
+            "oorAlpha", "showTooltip", "tooltipMode",
         },
         defensives = {
             "showDefensives", "showExternals",
@@ -8670,6 +9239,8 @@ do
             "debuffPosition", "debuffOffsetX", "debuffOffsetY",
             "debuffGrowDirection", "debuffPerRow", "debuffWrapDirection",
             "debuffCap", "debuffHideTooltips",
+            "dispellableDebuffLocation", "dispellableDebuffGrowDirection",
+            "dispellableDebuffOffsetX", "dispellableDebuffOffsetY",
         },
         debuffStyle = {
             "debuffSize", "debuffBorderSize", "debuffBorderColor", "debuffSpacing",
@@ -8740,7 +9311,7 @@ ns._xfBmScale = 1
 local INDICATOR_SCALE_KEYS = {}
 for _, k in ipairs({
     -- Font sizes
-    "nameSize", "healthTextSize", "statusTextSize",
+    "nameSize", "healthTextSize", "healAbsorbTextSize", "statusTextSize",
     "debuffStacksTextSize", "debuffDurTextSize", "defDurTextSize",
     -- Icon sizes
     "roleIconSize", "leaderIconSize", "raidMarkerSize",
@@ -8748,11 +9319,13 @@ for _, k in ipairs({
     -- Offsets
     "nameOffsetX", "nameOffsetY",
     "healthTextOffsetX", "healthTextOffsetY",
+    "healAbsorbTextOffsetX", "healAbsorbTextOffsetY",
     "statusTextOffsetX", "statusTextOffsetY",
     "roleIconOffsetX", "roleIconOffsetY",
     "leaderIconOffsetX", "leaderIconOffsetY",
     "raidMarkerOffsetX", "raidMarkerOffsetY",
     "debuffOffsetX", "debuffOffsetY",
+    "dispellableDebuffOffsetX", "dispellableDebuffOffsetY",
     "debuffStacksOffsetX", "debuffStacksOffsetY",
     "debuffDurTextOffsetX", "debuffDurTextOffsetY",
     "defOffsetX", "defOffsetY",
@@ -8801,7 +9374,7 @@ end })
 
 -- Compute the party indicator/aura scale (mirrors the raid auto-resize in
 -- ReloadFrames). Party frames have a fixed size (no tiers), so the scale is the
--- party frame size relative to the configured raid base, clamped to [0.7, 1.3].
+-- party frame size relative to the configured raid base, clamped to [0.7, 1.5].
 -- Independent of raid: gated on partyAutoResizeIndicators (default off).
 ns._UpdatePartyIndicatorScale = function()
     if not (db and db.profile) then return end
@@ -8811,9 +9384,11 @@ ns._UpdatePartyIndicatorScale = function()
     local pw = s.partyFrameWidth or s.frameWidth or 125
     local ph = s.partyFrameHeight or s.frameHeight or 60
     local scale = math.max(math.min(math.min(pw / baseW, ph / baseH), 1.3), 0.7)
-    -- Buff Manager indicators ALWAYS follow the size-derived scale; the
-    -- toggle gates only the other indicators/auras/text sizes.
-    ns._partyBmScale = scale
+    -- Auto Resize Icons (two independent checkboxes): Tracked Buffs gates the
+    -- Buff Manager scale; Indicators & Auras gates indicator/aura/text sizes.
+    -- Tracked Buffs defaults on (nil treated as on) to preserve the prior
+    -- hardcoded always-on behavior.
+    ns._partyBmScale = (s.partyAutoResizeTrackedBuffs ~= false) and scale or 1
     ns._partyIndicatorScale = s.partyAutoResizeIndicators and scale or 1
 end
 
@@ -9322,6 +9897,12 @@ ns.ReloadPartyFrames = function()
             if d.AnchorHealthText then d.AnchorHealthText() end
         end
 
+        -- Heal absorb text
+        if d.healAbsorbText then
+            ApplyFont(d.healAbsorbText, pp.healAbsorbTextSize or 9)
+            if d.AnchorHealAbsorbText then d.AnchorHealAbsorbText() end
+        end
+
         -- Status text
         if d.statusText then
             local stc = raw.statusTextColor or { r = 1, g = 1, b = 1 }
@@ -9446,6 +10027,16 @@ local function RegisterWithUnlockMode()
             noAnchorTo = true,
             noAnchorTarget = true,
             noResize = true,
+            -- RF positions its own container via _ApplyTierOffset (base 20-man
+            -- top-left + per-tier offset, tier-footprint-INDEPENDENT), re-run on
+            -- init / PEW / roster + tier changes / combat end. The centralized
+            -- ApplySavedPositions init loop re-anchors at unlockPos.point using
+            -- the CURRENT (per-tier) container size, which diverges from that
+            -- scheme for every non-20 size (Y-only for side/bottom anchors) and
+            -- clobbers the correct position ~0.6s after login. noInitHook keeps
+            -- that loop from touching the container so _ApplyTierOffset stays the
+            -- sole position authority. (Mover, save/load, anchors are unaffected.)
+            noInitHook = true,
 
             getFrame = function() return containerFrame end,
             getSize  = function()
@@ -9462,11 +10053,11 @@ local function RegisterWithUnlockMode()
                 db.profile.unlockPos = nil
             end,
             applyPos = function()
-                local pos = db.profile.unlockPos
-                if pos and containerFrame then
-                    containerFrame:ClearAllPoints()
-                    containerFrame:SetPoint(pos.point, UIParent, pos.relPoint, pos.x, pos.y)
-                end
+                -- Delegate to the tier-aware authority (base top-left + per-tier
+                -- offset) so any framework apply matches _ApplyTierOffset instead
+                -- of the old re-anchor-at-unlockPos.point scheme, which used the
+                -- current tier's container size and mispositioned non-20 sizes.
+                if ns._ApplyTierOffset then ns._ApplyTierOffset() end
             end,
         }),
         EllesmereUI.MakeUnlockElement({
@@ -10866,6 +11457,13 @@ local function CreatePreviewFrame(index)
     healthFS:SetPoint("CENTER", health, "CENTER", 0, 0)
     healthFS:SetTextColor(1, 1, 1, 0.9)
 
+    -- Heal absorb text (preview)
+    local healAbsorbFS = textCarrier:CreateFontString(nil, "OVERLAY")
+    ApplyFont(healAbsorbFS, s.healAbsorbTextSize or 9)
+    healAbsorbFS:SetWordWrap(false)
+    healAbsorbFS:SetJustifyH("CENTER")
+    healAbsorbFS:SetPoint("CENTER", health, "CENTER", 0, 0)
+
     -- Status text (DEAD / OFFLINE / AFK)
     local statusFS = textCarrier:CreateFontString(nil, "OVERLAY")
     local pvStc = s.statusTextColor or { r = 1, g = 1, b = 1 }
@@ -10926,6 +11524,7 @@ local function CreatePreviewFrame(index)
     f._topNameBarBg = tnbBg
     f._topNameBarText = tnbText
     f._healthText = healthFS
+    f._healAbsorbText = healAbsorbFS
     f._statusText = statusFS
     f._roleIcon = roleIcon
     f._leaderIcon = leaderIcon
@@ -11241,8 +11840,9 @@ local function ApplyPreviewData(f, index)
         local mode = s.healthColorMode or "class"
         local fillTex = f._health:GetStatusBarTexture()
         if mode == "dark" then
-            f._health:SetStatusBarColor(DARK_FILL_R, DARK_FILL_G, DARK_FILL_B, 1)
-            if fillTex then fillTex:SetAlpha(DARK_FILL_A) end
+            local dfr, dfg, dfb, dfa = EllesmereUI.GetDarkModeFill()
+            f._health:SetStatusBarColor(dfr, dfg, dfb, 1)
+            if fillTex then fillTex:SetAlpha(dfa) end
         elseif mode == "classic" then
             if fillTex then fillTex:SetAlpha(1) end
             local pct = healthPct / 100
@@ -11283,7 +11883,7 @@ local function ApplyPreviewData(f, index)
             f._bg:ClearAllPoints()
             f._bg:SetPoint("TOPLEFT", f._health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
             f._bg:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
-            f._bg:SetColorTexture(DARK_BG_R, DARK_BG_G, DARK_BG_B, 1)
+            f._bg:SetColorTexture(EllesmereUI.GetDarkModeBg())
         else
             -- BG covers the missing-health portion only (never behind the fill),
             -- matching the real-frame themed branch + Dark mode. Keeps the preview
@@ -11360,7 +11960,7 @@ local function ApplyPreviewData(f, index)
         end
         if absStyle ~= "none" and absorbAmt > 0 then
             local modern = (absStyle == "blizzardModern")
-            local tex = ABSORB_STYLE_TEX[absStyle] or "Interface\\Buttons\\WHITE8X8"
+            local tex = ns.ResolveAbsorbStyleTex(absStyle, "Interface\\Buttons\\WHITE8X8")
             local alpha = (s.absorbOpacity or 90) / 100
             local tiled = (absStyle == "striped" or absStyle == "stripedReversed" or absStyle == "largeStripes" or absStyle == "largeStripesR" or absStyle == "largeOutlinedStripes" or absStyle == "largeOutlinedStripesR")
             local hpW = w
@@ -11517,7 +12117,7 @@ local function ApplyPreviewData(f, index)
         end
         local haAmt = ns.previewHealAbsorbValues[index] or 0
         if haStyle ~= "none" and haAmt > 0 then
-            local haTex = ABSORB_STYLE_TEX[haStyle] or "Interface\\Buttons\\WHITE8X8"
+            local haTex = ns.ResolveAbsorbStyleTex(haStyle, "Interface\\Buttons\\WHITE8X8")
             local haAlpha = (s.healAbsorbOpacity or 75) / 100
             local hc = s.healAbsorbColor or { r = 0.8, g = 0.15, b = 0.15 }
             if haStyle == "healBlizzModern" or haStyle == "largeOutlinedStripes" or haStyle == "largeOutlinedStripesR" then hc = { r = 1, g = 1, b = 1 } end
@@ -12140,6 +12740,33 @@ local function ApplyPreviewData(f, index)
             f._healthText:SetTextColor(htr, htg, htb, 0.9)
         else
             f._healthText:SetText("")
+        end
+    end
+
+    -- Heal absorb text (preview): a representative value so the user can see
+    -- and position it. Mirrors the health-text preview color resolution.
+    if f._healAbsorbText then
+        local haMode = s.healAbsorbTextMode or "none"
+        ApplyFont(f._healAbsorbText, s.healAbsorbTextSize or 9)
+        ns.AnchorRFText(f._healAbsorbText, f._health, s.healAbsorbTextPosition or "center",
+            s.healAbsorbTextOffsetX or 0, s.healAbsorbTextOffsetY or 0, (s.frameWidth or 72) * 0.75)
+        if haMode ~= "none" and not isDead and not isOffline then
+            ns.FormatHealAbsorbInto(f._healAbsorbText, math.floor(healthPct * 3000), haMode)
+            local haCM = s.healAbsorbTextColorMode or "custom"
+            local hr, hg, hb = 1, 0.3, 0.3
+            if haCM == "accent" then
+                local ar, ag, ab = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                if ar then hr, hg, hb = ar, ag, ab end
+            elseif haCM == "class" then
+                local cc = EllesmereUI.GetClassColor(classToken)
+                if cc then hr, hg, hb = cc.r, cc.g, cc.b end
+            else
+                local c = s.healAbsorbTextCustomColor
+                if c then hr, hg, hb = c.r, c.g, c.b end
+            end
+            f._healAbsorbText:SetTextColor(hr, hg, hb, 0.9)
+        else
+            f._healAbsorbText:SetText("")
         end
     end
 
@@ -13844,6 +14471,8 @@ function ERF:OnEnable()
     eventFrame:RegisterEvent("PARTY_MEMBER_DISABLE")
     eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
     eventFrame:RegisterEvent("UNIT_PHASE")
+    eventFrame:RegisterEvent("ENCOUNTER_START")
+    eventFrame:RegisterEvent("ENCOUNTER_END")
 
     -- Per-unit event trackers: one frame per unit.
     -- RegisterUnitEvent only accepts 1-2 units per call, so each unit gets

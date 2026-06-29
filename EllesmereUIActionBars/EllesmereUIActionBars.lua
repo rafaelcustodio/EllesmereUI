@@ -5444,7 +5444,9 @@ local function BuildVisibilityString(info, s, visOverride)
         elseif vis == "out_of_combat" then
             petShow = "[nocombat] show; hide"
         elseif vis == "show_dragonriding" then
-            petShow = "[advflyable,mounted,flying] show; hide"
+            petShow = "[advflyable,flying] show; hide"
+        elseif vis == "show_not_dragonriding" then
+            petShow = "[advflyable,flying] hide; show"
         elseif s.combatShowEnabled then
             petShow = "[combat] show; hide"
         elseif s.combatHideEnabled then
@@ -5482,9 +5484,14 @@ local function BuildVisibilityString(info, s, visOverride)
     elseif vis == "solo" then
         return hidePrefix .. "[nogroup] show; hide"
     elseif vis == "show_dragonriding" then
-        -- Show only while flying on a skyriding mount. The secure state driver
-        -- re-evaluates this automatically (incl. the flying transition).
-        return hidePrefix .. "[advflyable,mounted,flying] show; hide"
+            -- No "mounted": Druid Flight Form is a shapeshift, not a mount, so it
+            -- would never match. This covers skyriding mounts and
+            -- Flight Form (advflyable excludes ordinary flying)
+        return hidePrefix .. "[advflyable,flying] show; hide"
+    elseif vis == "show_not_dragonriding" then
+            -- Exact inverse of show_dragonriding: hide while dragonriding,
+            -- show otherwise. hidePrefix still force-hides in pet battle/vehicle.
+        return hidePrefix .. "[advflyable,flying] hide; show"
     end
     return hidePrefix .. "show"
 end
@@ -5844,6 +5851,140 @@ function EAB:RefreshRuntimeVisibility()
     end
 end
 
+-------------------------------------------------------------------------------
+--  Myslot compatibility
+--  Myslot exports settings by automating a PickupAction + PlaceAction on every
+--  populated action slot (60+ in a row). With bars/buttons that hide empty
+--  slots or use conditional visibility, each pickup/place forces a costly
+--  secure show/hide pass; back-to-back that stalls the client for many seconds.
+--
+--  The user-confirmed cure is the "Visibility: Always + Always Show Buttons"
+--  config, so while Myslot's window is open we apply exactly that to every bar
+--  (the same change the options toggles make). To do it SAFELY we back each
+--  bar's real visibility settings up to the saved variables BEFORE overwriting,
+--  then restore on close. Because the backup is persisted, a /reload (or
+--  logout) with the window still open can never strand the user on "always":
+--  EAB:OnInitialize calls RestoreMyslotBackup unconditionally on the next
+--  login, before any bar is built, so the swap is always undone.
+-------------------------------------------------------------------------------
+-- Settings swapped to force a bar fully visible. Listed once so backup and
+-- overwrite stay in sync. Wrapped in do/end (with the two methods below) so
+-- this stays a block upvalue, not a chunk-level local -- this file sits at
+-- Lua 5.1's 200-local-per-chunk cap.
+do
+local MYSLOT_VIS_FIELDS = {
+    "barVisibility", "alwaysHidden", "mouseoverEnabled", "mouseoverAlpha",
+    "_savedBarAlpha", "combatShowEnabled", "combatHideEnabled", "alwaysShowButtons",
+}
+
+-- Restore real visibility settings from the persisted backup, then clear it.
+-- Safe to call anytime (no-op if no backup). NOT gated on Myslot being enabled,
+-- so it self-heals even if Myslot was disabled since the backup was written.
+function EAB:RestoreMyslotBackup()
+    local backup = self.db and self.db.profile and self.db.profile._myslotVisBackup
+    if not backup then return false end
+    for key, saved in pairs(backup) do
+        local s = self.db.profile.bars[key]
+        if s then
+            for _, f in ipairs(MYSLOT_VIS_FIELDS) do s[f] = saved[f] end
+        end
+    end
+    self.db.profile._myslotVisBackup = nil
+    return true
+end
+
+function EAB:SetMyslotForceShow(on)
+    on = not not on
+    -- The persisted backup's presence IS the "are we forcing" state, so this
+    -- survives /reload without a separate flag.
+    local forcing = self.db.profile._myslotVisBackup ~= nil
+    if on == forcing then return end
+
+    if on then
+        -- Capture real values and PERSIST the backup BEFORE overwriting, so the
+        -- backup always exists if any field was changed (crash/reload-safe).
+        local backup = {}
+        for _, info in ipairs(BAR_CONFIG) do
+            local s = self.db.profile.bars[info.key]
+            if s then
+                local saved = {}
+                for _, f in ipairs(MYSLOT_VIS_FIELDS) do saved[f] = s[f] end
+                backup[info.key] = saved
+            end
+        end
+        self.db.profile._myslotVisBackup = backup
+        -- Overwrite to "always" + "always show buttons" (mirrors the options'
+        -- ApplyVisibilityKey("always"), incl. restoring a mouseover bar's real
+        -- alpha so it doesn't stay faded).
+        for _, info in ipairs(BAR_CONFIG) do
+            local s = self.db.profile.bars[info.key]
+            if s then
+                local wasMouseover = s.mouseoverEnabled
+                s.barVisibility = "always"
+                s.alwaysHidden = false
+                s.mouseoverEnabled = false
+                if wasMouseover and s._savedBarAlpha then
+                    s.mouseoverAlpha = s._savedBarAlpha
+                    s._savedBarAlpha = nil
+                end
+                s.combatShowEnabled = false
+                s.combatHideEnabled = false
+                s.alwaysShowButtons = true
+            end
+        end
+    else
+        self:RestoreMyslotBackup()
+    end
+
+    -- Re-apply -- the same calls the options "Visibility"/"Always Show Buttons"
+    -- toggles make, now that the real settings reflect the desired state.
+    if not InCombatLockdown() then
+        self:RefreshRuntimeVisibility()
+        self:RefreshMouseover()
+        self:ApplyCombatVisibility()
+        for _, info in ipairs(BAR_CONFIG) do
+            self:ApplyAlwaysShowButtons(info.key)
+        end
+    end
+    if EllesmereUI and EllesmereUI.RefreshPage then EllesmereUI:RefreshPage() end
+end
+end -- do: MYSLOT_VIS_FIELDS scope
+
+do
+    -- Only wire up the integration when the user has Myslot enabled. When it is
+    -- not, the watcher is never created and SetMyslotForceShow never runs, so no
+    -- settings are ever swapped. (The OnInitialize restore still runs regardless,
+    -- so a leftover backup from when Myslot was enabled always self-heals.)
+    local function MyslotEnabled()
+        if C_AddOns and C_AddOns.GetAddOnEnableState then
+            return C_AddOns.GetAddOnEnableState("Myslot") > 0
+        end
+        return true
+    end
+    if MyslotEnabled() then
+        -- Myslot exposes its main window via LibStub("Myslot-5.0").MainFrame.
+        -- Hook its show/hide to toggle the force-show override. No-op if Myslot
+        -- exposes no frame.
+        local hooked = false
+        local function TryHookMyslot()
+            if hooked or not LibStub then return hooked end
+            local lib = LibStub:GetLibrary("Myslot-5.0", true)
+            local frame = lib and lib.MainFrame
+            if not frame then return false end
+            hooked = true
+            frame:HookScript("OnShow", function() EAB:SetMyslotForceShow(true) end)
+            frame:HookScript("OnHide", function() EAB:SetMyslotForceShow(false) end)
+            if frame:IsShown() then EAB:SetMyslotForceShow(true) end
+            return true
+        end
+        local watcher = CreateFrame("Frame")
+        watcher:RegisterEvent("PLAYER_LOGIN")
+        watcher:RegisterEvent("ADDON_LOADED")
+        watcher:SetScript("OnEvent", function()
+            if TryHookMyslot() then watcher:UnregisterAllEvents() end
+        end)
+    end
+end
 
 -------------------------------------------------------------------------------
 --  "Toggle Action Bar" visibility keybind
@@ -7909,6 +8050,12 @@ function EAB:OnInitialize()
     -- Expose for ApplyAnchorPosition's growth-direction edge read.
     EllesmereUI._abBarPositions = self.db.profile.barPositions
 
+    -- Myslot safety net: if a previous session ended while Myslot's window was
+    -- open (e.g. /reload), the real bar visibility settings were swapped to
+    -- "always". Restore them now -- before any bar is built -- so the swap can
+    -- never persist. Unconditional (see EAB:SetMyslotForceShow).
+    self:RestoreMyslotBackup()
+
     -- Mark whether we need to capture Blizzard layout on first install.
     -- The actual capture is deferred to PLAYER_ENTERING_WORLD when
     -- Edit Mode has fully applied bar positions/sizes.
@@ -7985,6 +8132,17 @@ function EAB:OnInitialize()
     SlashCmdList["ELLESMEREACTIONBARS"] = function(msg)
         if EllesmereUI and EllesmereUI.ShowModule then
             EllesmereUI:ShowModule("EllesmereUIActionBars")
+        end
+    end
+
+    SLASH_EABQUICKKEYBIND1 = "/kb"
+    SlashCmdList["EABQUICKKEYBIND"] = function(msg)
+        if InCombatLockdown() then return end
+        if not C_AddOns.IsAddOnLoaded("Blizzard_QuickKeybind") then
+            C_AddOns.LoadAddOn("Blizzard_QuickKeybind")
+        end
+        if QuickKeybindFrame then
+            QuickKeybindFrame:Show()
         end
     end
 
@@ -9059,6 +9217,38 @@ function EAB:FinishSetup()
     _petEventFrame:RegisterUnitEvent("UNIT_PET", "player")
     _petEventFrame:RegisterUnitEvent("UNIT_AURA", "pet")
     _petEventFrame:SetScript("OnEvent", UpdatePetBar)
+
+    -- Stance bar GCD / cooldown swipe.
+    --
+    -- Blizzard drives the shapeshift cooldown swipe exclusively through the
+    -- StanceBar frame's UPDATE_SHAPESHIFT_COOLDOWN -> StanceBarMixin:UpdateState.
+    -- HideBlizzardBars() unregisters all events on the StanceBar frame, so that
+    -- path is dead. The swipe only ever appeared by accident: a bar transition
+    -- (form change, Ascendance, etc.) makes ValidateActionBarTransition re-Show()
+    -- StanceBar, whose OnShow -> Update -> UpdateState sets the cooldown on the
+    -- (reparented but identical) StanceButton frames before our OnShow hook
+    -- re-hides the now-empty bar. A plain GCD from a spell that does NOT change
+    -- form fires UPDATE_SHAPESHIFT_COOLDOWN with no transition, so nothing ran
+    -- and the form-lockout swipe was invisible.
+    --
+    -- Mirror Blizzard's cooldown update directly on our reused StanceButtons.
+    -- Visual-only (CooldownFrame_Set touches no protected state), so it is safe
+    -- during combat, same as the pet PET_BAR_UPDATE_COOLDOWN path above.
+    local function UpdateStanceCooldowns()
+        local numForms = GetNumShapeshiftForms()
+        for i = 1, numForms do
+            local btn = _G["StanceButton" .. i]
+            if btn and btn.cooldown then
+                local start, duration, enable = GetShapeshiftFormCooldown(i)
+                CooldownFrame_Set(btn.cooldown, start, duration, enable)
+            end
+        end
+    end
+    local _stanceEventFrame = CreateFrame("Frame")
+    _stanceEventFrame:RegisterEvent("UPDATE_SHAPESHIFT_COOLDOWN")
+    _stanceEventFrame:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
+    _stanceEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    _stanceEventFrame:SetScript("OnEvent", UpdateStanceCooldowns)
 
 
     -- Talent changes can cause Blizzard to re-show hidden bars.
@@ -10713,6 +10903,272 @@ EAB_UpdateQuickKeybindButtons = function(show)
     end
 end
 
+_quickKeybindState.macroButtons = setmetatable({}, { __mode = "k" })
+
+-- Macro quick-keybind uses our OWN capture overlay instead of Blizzard's
+-- QuickKeybindButtonTemplateMixin. Driving Blizzard's secure input path from
+-- addon code (the old QuickKeybindFrame:OnKeyDown call) tainted it, so any key
+-- Blizzard passes through during capture -- e.g. F11 = SCREENSHOT, which it RUNs
+-- via the protected RunBinding -- threw ADDON_ACTION_FORBIDDEN. Capturing on a
+-- plain frame we own consumes the key before Blizzard's input handler sees it,
+-- so every key (including system/function keys) binds cleanly with no taint.
+
+_quickKeybindState.GetMacroBindingContext = function(command)
+    return C_KeyBindings and C_KeyBindings.GetBindingContextForAction
+        and C_KeyBindings.GetBindingContextForAction(command)
+end
+
+_quickKeybindState.SetOutput = function(text)
+    if QuickKeybindFrame and QuickKeybindFrame.SetOutputText then
+        QuickKeybindFrame:SetOutputText(text)
+    end
+end
+
+_quickKeybindState.NormalizeMacroBindInput = function(input)
+    input = GetConvertedKeyOrButton and GetConvertedKeyOrButton(input) or input
+    if IsKeyPressIgnoredForBinding and IsKeyPressIgnoredForBinding(input) then return end
+    return input
+end
+
+_quickKeybindState.SetMacroButtonTooltip = function(button)
+    if not button or not button.commandName or not QuickKeybindTooltip then return end
+    QuickKeybindTooltip:SetOwner(button, "ANCHOR_RIGHT")
+    GameTooltip_AddHighlightLine(QuickKeybindTooltip, GetBindingName(button.commandName))
+
+    local key1 = GetBindingKeyForAction(button.commandName)
+    if key1 then
+        GameTooltip_AddInstructionLine(QuickKeybindTooltip, key1)
+        GameTooltip_AddNormalLine(QuickKeybindTooltip, ESCAPE_TO_UNBIND)
+    else
+        GameTooltip_AddErrorLine(QuickKeybindTooltip, NOT_BOUND)
+        GameTooltip_AddNormalLine(QuickKeybindTooltip, PRESS_KEY_TO_BIND)
+    end
+
+    QuickKeybindTooltip:Show()
+end
+
+_quickKeybindState.BindMacroInput = function(input)
+    -- Rebinding during combat is unsafe and the rest of QKB is combat-gated, so
+    -- match that here even though our capture frame is insecure.
+    if InCombatLockdown() then return end
+    local button = _quickKeybindState.hoveredMacroButton
+    if not button then return end
+
+    _quickKeybindState.UpdateMacroButtonCommand(button)
+    local command = button.commandName
+    if not command then return end
+
+    local context = _quickKeybindState.GetMacroBindingContext(command)
+    local old1, old2 = GetBindingKey(command, nil, context)
+
+    if input == "ESCAPE" then
+        -- Full unbind: clear EVERY key bound to this macro, matching the rebind
+        -- path below (which clears both old keys before setting the new one).
+        if old1 then SetBinding(old1, nil, context) end
+        if old2 then SetBinding(old2, nil, context) end
+        _quickKeybindState.SetOutput(KEY_UNBOUND)
+        _quickKeybindState.SetMacroButtonTooltip(button)
+        return
+    end
+
+    local key = _quickKeybindState.NormalizeMacroBindInput(input)
+    if not key then return end
+
+    local newKey = CreateKeyChordStringUsingMetaKeyState and CreateKeyChordStringUsingMetaKeyState(key) or key
+    if old1 then SetBinding(old1, nil, context) end
+    if old2 then SetBinding(old2, nil, context) end
+    SetBinding(newKey, nil, context)
+
+    if SetBinding(newKey, command, context) then
+        _quickKeybindState.SetOutput(KEY_BOUND)
+    else
+        if old1 then SetBinding(old1, command, context) end
+        if old2 then SetBinding(old2, command, context) end
+    end
+
+    _quickKeybindState.SetMacroButtonTooltip(button)
+end
+
+_quickKeybindState.GetMacroBindFrame = function()
+    if _quickKeybindState.macroBindFrame then return _quickKeybindState.macroBindFrame end
+
+    -- A plain (insecure) frame we fully own -- never a secure template. Capturing
+    -- input on it consumes the keypress, so it never reaches Blizzard's secure
+    -- input path (no SetPropagateKeyboardInput, default = consume).
+    local frame = CreateFrame("Frame", nil, UIParent)
+    frame:SetFrameStrata("FULLSCREEN_DIALOG")
+    frame:SetFrameLevel(1000)
+    frame:EnableMouse(true)
+    frame:EnableKeyboard(true)
+    frame:EnableMouseWheel(true)
+    frame:Hide()
+
+    frame:SetScript("OnLeave", function(self)
+        local button = self.button
+        self.button = nil
+        _quickKeybindState.hoveredMacroButton = nil
+        self:Hide()
+        if QuickKeybindTooltip then QuickKeybindTooltip:Hide() end
+        if button then _quickKeybindState.RefreshMacroButton(button) end
+    end)
+    frame:SetScript("OnKeyDown", function(_, key)
+        _quickKeybindState.BindMacroInput(key)
+    end)
+    frame:SetScript("OnMouseUp", function(_, mouseButton)
+        if mouseButton ~= "LeftButton" and mouseButton ~= "RightButton" then
+            _quickKeybindState.BindMacroInput(mouseButton)
+        end
+    end)
+    frame:SetScript("OnMouseWheel", function(_, delta)
+        _quickKeybindState.BindMacroInput(delta > 0 and "MOUSEWHEELUP" or "MOUSEWHEELDOWN")
+    end)
+
+    _quickKeybindState.macroBindFrame = frame
+    return frame
+end
+
+_quickKeybindState.HideMacroBindFrame = function()
+    local frame = _quickKeybindState.macroBindFrame
+    if not frame then return end
+
+    local button = frame.button
+    frame.button = nil
+    _quickKeybindState.hoveredMacroButton = nil
+    frame:Hide()
+    if QuickKeybindTooltip then QuickKeybindTooltip:Hide() end
+    if button then _quickKeybindState.RefreshMacroButton(button, false) end
+end
+
+_quickKeybindState.UpdateMacroButtonCommand = function(button)
+    if not button or not MacroFrame or not MacroFrame.GetMacroDataIndex or not GetMacroInfo then return end
+
+    local index
+    if (button == MacroFrameSelectedMacroButton or button == MacroFrame.SelectedMacroButton)
+        and MacroFrame.GetSelectedIndex then
+        local selected = MacroFrame:GetSelectedIndex()
+        if selected then index = MacroFrame:GetMacroDataIndex(selected) end
+    elseif button.GetElementData then
+        local data = button:GetElementData()
+        if data then index = MacroFrame:GetMacroDataIndex(data) end
+    end
+
+    local name = index and GetMacroInfo(index)
+    button.commandName = name and ("MACRO " .. name) or nil
+end
+
+_quickKeybindState.RefreshMacroButton = function(button, show)
+    if not button then return end
+    _quickKeybindState.UpdateMacroButtonCommand(button)
+    if show == nil then
+        show = _quickKeybindState.open
+    end
+    EAB_SetQuickKeybindEffects(button, show and button:IsShown())
+end
+
+-- On hover (in QKB mode) park the capture overlay over the macro button and arm
+-- its tooltip, so the next key/mouse/wheel press binds to THIS macro.
+_quickKeybindState.SelectMacroButton = function(button)
+    if not _quickKeybindState.open then return end
+    _quickKeybindState.UpdateMacroButtonCommand(button)
+    if not button.commandName then return end
+
+    _quickKeybindState.hoveredMacroButton = button
+
+    local frame = _quickKeybindState.GetMacroBindFrame()
+    frame.button = button
+    frame:ClearAllPoints()
+    frame:SetAllPoints(button)
+    frame:Show()
+
+    _quickKeybindState.RefreshMacroButton(button, true)
+    if button.QuickKeybindHighlightTexture then
+        button.QuickKeybindHighlightTexture:SetAlpha(1)
+    end
+    _quickKeybindState.SetMacroButtonTooltip(button)
+end
+
+_quickKeybindState.InitMacroButton = function(button)
+    if not button or EFD(button).qkbMacroHooked or not QuickKeybindButtonTemplateMixin then return end
+
+    -- No Mixin / QuickKeybindButton* method calls: those invoke Blizzard's secure
+    -- input path from addon code and taint it. Our own capture overlay (above)
+    -- handles all key/mouse/wheel input; these hooks only manage hover + visuals.
+    -- Do NOT EnableMouseWheel on the Blizzard button -- with no wheel handler it
+    -- would swallow scroll and break the macro list; the overlay owns the wheel.
+    if not button.QuickKeybindHighlightTexture then
+        local tex = button:CreateTexture(nil, "OVERLAY")
+        tex:SetAllPoints(button)
+        tex:SetBlendMode("ADD")
+        tex:SetAlpha(0.5)
+        tex:Hide()
+        button.QuickKeybindHighlightTexture = tex
+    end
+
+    button:HookScript("OnShow", function(self)
+        _quickKeybindState.RefreshMacroButton(self)
+    end)
+    button:HookScript("OnHide", function(self)
+        _quickKeybindState.RefreshMacroButton(self, false)
+    end)
+    button:HookScript("OnClick", function(self)
+        _quickKeybindState.UpdateMacroButtonCommand(self)
+        if _quickKeybindState.open then
+            _quickKeybindState.SetMacroButtonTooltip(self)
+        end
+    end)
+    button:HookScript("OnEnter", function(self)
+        _quickKeybindState.SelectMacroButton(self)
+    end)
+    button:HookScript("OnLeave", function(self)
+        -- The overlay sits over the button, so the button's OnLeave fires the
+        -- instant we park it. Ignore that case; the overlay's own OnLeave tears
+        -- down when the cursor truly leaves.
+        local frame = _quickKeybindState.macroBindFrame
+        if frame and frame:IsShown() and frame.button == self then return end
+        if _quickKeybindState.hoveredMacroButton == self then
+            _quickKeybindState.hoveredMacroButton = nil
+        end
+        if QuickKeybindTooltip then QuickKeybindTooltip:Hide() end
+        _quickKeybindState.RefreshMacroButton(self)
+    end)
+
+    local fd = EFD(button)
+    fd.qkbMacroHooked = true
+    _quickKeybindState.macroButtons[button] = true
+    _quickKeybindState.RefreshMacroButton(button)
+end
+
+_quickKeybindState.UpdateMacroButtons = function(show)
+    if show == false then
+        _quickKeybindState.HideMacroBindFrame()
+    end
+    for button in pairs(_quickKeybindState.macroButtons) do
+        _quickKeybindState.RefreshMacroButton(button, show)
+    end
+end
+
+_quickKeybindState.InitMacroFrame = function()
+    if _quickKeybindState.macroFrameHooked or not MacroFrame or not QuickKeybindButtonTemplateMixin then return end
+
+    _quickKeybindState.InitMacroButton(MacroFrameSelectedMacroButton or MacroFrame.SelectedMacroButton)
+
+    local scrollBox = MacroFrame.MacroSelector and MacroFrame.MacroSelector.ScrollBox
+    if not scrollBox or not scrollBox.ForEachFrame then return end
+
+    _quickKeybindState.macroScrollUpdate = function(frame)
+        if not frame or not frame.GetView or not frame:GetView() then return end
+        frame:ForEachFrame(_quickKeybindState.InitMacroButton)
+        _quickKeybindState.UpdateMacroButtons(_quickKeybindState.open)
+    end
+    C_Timer_After(0, function()
+        _quickKeybindState.macroScrollUpdate(scrollBox)
+    end)
+    hooksecurefunc(scrollBox, "Update", _quickKeybindState.macroScrollUpdate)
+
+    _quickKeybindState.macroFrameHooked = true
+    _quickKeybindState.UpdateMacroButtons(_quickKeybindState.open)
+end
+
 local function EAB_UpdateQuickKeybindVisibility(show)
     if InCombatLockdown() then return end
 
@@ -10961,7 +11417,9 @@ _quickKeybindState.Open = function()
     _quickKeybindState.closePending = false
     _quickKeybindState.open = true
     _quickKeybindState.InitButtons()
+    _quickKeybindState.InitMacroFrame()
     EAB_UpdateQuickKeybindButtons(true)
+    _quickKeybindState.UpdateMacroButtons(true)
     EAB_UpdateQuickKeybindVisibility(true)
     _quickKeybindState.ShowDim()
 end
@@ -10976,6 +11434,7 @@ local function EAB_QuickKeybindClose()
         _quickKeybindState.open = false
         _quickKeybindState.closePending = true
         EAB_UpdateQuickKeybindButtons(false)
+        _quickKeybindState.UpdateMacroButtons(false)
         -- Mouseover fading is alpha-only and already operates during combat,
         -- so restore that presentation immediately even though secure
         -- visibility drivers still have to wait until combat ends.
@@ -10985,13 +11444,15 @@ local function EAB_QuickKeybindClose()
     end
     _quickKeybindState.open = false
     EAB_UpdateQuickKeybindButtons(false)
+    _quickKeybindState.UpdateMacroButtons(false)
     _quickKeybindState.FinishClose()
 end
 
 -- Defer hook until QuickKeybindFrame exists (it loads after PLAYER_LOGIN).
 _qkbHookFrame = CreateFrame("Frame")
 _qkbHookFrame:RegisterEvent("PLAYER_LOGIN")
-_qkbHookFrame:SetScript("OnEvent", function(self, event)
+_qkbHookFrame:RegisterEvent("ADDON_LOADED")
+_qkbHookFrame:SetScript("OnEvent", function(self, event, addonName)
     if event == "PLAYER_LOGIN" then
         self:UnregisterEvent("PLAYER_LOGIN")
         C_Timer_After(1, function()
@@ -11023,8 +11484,17 @@ _qkbHookFrame:SetScript("OnEvent", function(self, event)
                 end
                 qfd.quickKeybindOnShow = _quickKeybindState.Open
                 qfd.quickKeybindOnHide = EAB_QuickKeybindClose
+                _quickKeybindState.InitMacroFrame()
+                if _quickKeybindState.macroFrameHooked then
+                    self:UnregisterEvent("ADDON_LOADED")
+                end
             end
         end)
+    elseif event == "ADDON_LOADED" and (addonName == "Blizzard_MacroUI" or addonName == "Blizzard_QuickKeybind") then
+        _quickKeybindState.InitMacroFrame()
+        if _quickKeybindState.macroFrameHooked then
+            self:UnregisterEvent("ADDON_LOADED")
+        end
     elseif event == "PLAYER_REGEN_ENABLED" then
         self:UnregisterEvent("PLAYER_REGEN_ENABLED")
         if _quickKeybindState.closePending then
@@ -11064,4 +11534,3 @@ end)
         C_Timer.After(0.5, ScanABSwiftmend)
     end)
 end)()
-

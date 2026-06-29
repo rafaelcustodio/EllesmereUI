@@ -277,6 +277,7 @@ local RACE_RACIALS = {
     ZandalariTroll     = { 291944 },
     Vulpera            = { 312411 },
     Mechagnome         = { 312924 },
+    Nightborne         = { 260364 },
     -- Wing Buffet (357214) is available to every Dracthyr class, but
     -- Evokers already have it tracked by Blizzard's CDM category, so
     -- gate the custom-racial entry off for Evokers to avoid duplicate
@@ -295,6 +296,11 @@ for _, racials in pairs(RACE_RACIALS) do
         ALL_RACIAL_SPELLS[sid] = true
     end
 end
+-- Exposed for the RPT sync: it must recognize the racial slot for ANY race, not
+-- just the current character's, so a profile shared across different-race
+-- characters syncs the racial slot too (NormalizeRacialAssignments then remaps
+-- the stored ID to each character's own racial when the spec builds).
+ns.ALL_RACIAL_SPELLS = ALL_RACIAL_SPELLS
 
 local _myRacials = {}
 local _myRacialsSet = {}
@@ -399,9 +405,9 @@ local CDM_ITEM_PRESETS = {
     {
         key      = "invis_potion",
         name     = "Invisibility Potion",
-        icon     = 134764,
-        itemID   = 211756,
-        altItemIDs = { 241304, 241305 },
+        icon     = 7548917,
+        itemID   = 241302,
+        altItemIDs = { 241303 },
     },
     {
         key      = "healthstone",
@@ -409,7 +415,6 @@ local CDM_ITEM_PRESETS = {
         icon     = 538745,
         itemID   = 5512,
         spellID  = 6262,
-        altItemIDs = { 224464 },
         combatLockout = true,
     },
     {
@@ -417,7 +422,6 @@ local CDM_ITEM_PRESETS = {
         name     = "Demonic Healthstone",
         itemID   = 224464,
         spellID  = 452930,
-        altItemIDs = { 5512 },
         combatLockout = true,
     },
 }
@@ -571,7 +575,53 @@ function ns.GetSpecProfilesForProfile(profileName)
     return bucket.specProfiles
 end
 
--- specProfiles table for the active profile (the live CDM bucket).
+-- Cross-spec "broadcast" set for Tracking Bars: a lookup of bar identities (preset
+-- key or custom spellID) the user has pushed to every spec via "Add Bar to All
+-- Specs". Lives on the profile bucket OUTSIDE specProfiles, so it persists across
+-- spec switches/reloads and forks with the profile (same as specProfiles). Drives
+-- the Add/Remove toggle label on the Tracking Bars page.
+function ns.GetActiveTBBBroadcastSet()
+    local name = ns.GetActiveProfileName()
+    -- Ensure the bucket exists (with legacy seeding) via the canonical accessor.
+    ns.GetSpecProfilesForProfile(name)
+    local sa = SpellStore.Get()
+    local bucket = sa.profiles and sa.profiles[name]
+    if not bucket then return {} end
+    if not bucket.tbbBroadcast then bucket.tbbBroadcast = {} end
+    return bucket.tbbBroadcast
+end
+
+-- Active SPELL LAYOUT name. Layouts are a shared, account-wide library
+-- (spellAssignments.profiles[name] = the layout buckets) with a SINGLE
+-- account-wide active pointer (spellAssignments.activeLayout). Spell layouts are
+-- DETACHED from EUI profiles: a profile only changes the active layout if it has
+-- an opt-in binding (spellAssignments.profileBindings) applied via
+-- ns.ApplyProfileBinding on profile load. Self-heals to a valid layout.
+function ns.GetActiveLayoutName()
+    local sa = SpellStore.Get()
+    if not sa.profiles then sa.profiles = {} end
+    local name = sa.activeLayout
+    if type(name) ~= "string" or type(sa.profiles[name]) ~= "table" then
+        -- Self-heal: prefer a layout named after the current profile (legacy seed
+        -- naming), else any existing layout, else the profile name (creates it).
+        local cur = (EllesmereUIDB and EllesmereUIDB.activeProfile) or "Default"
+        name = nil
+        if type(sa.profiles[cur]) == "table" then
+            name = cur
+        else
+            for n, v in pairs(sa.profiles) do
+                if type(v) == "table" then name = n; break end
+            end
+        end
+        name = name or cur
+        sa.activeLayout = name
+    end
+    return name
+end
+
+-- specProfiles table for the active PROFILE (the live CDM bucket). Spell content
+-- is per-EUI-profile and switches with the profile -- no account-wide layout
+-- pointer mediates rendering.
 function ns.GetActiveSpecProfiles()
     return ns.GetSpecProfilesForProfile(ns.GetActiveProfileName())
 end
@@ -617,6 +667,51 @@ function ns.GetBarSpellDataForSpec(barKey, specKey)
     return bs
 end
 
+-- Custom Active State store. Keyed by spellID at the PROFILE level (shared
+-- across every bar and spec in this profile) so a preset's custom active state
+-- travels with the spell wherever it is placed -- no re-adding. The settings key
+-- matches assignedSpells: positive = racial / custom spell; negative = item /
+-- trinket-slot preset. Entry shape: { duration, activeSwipeMode,
+-- activeSwipeClassColor, activeSwipeR/G/B/A, activeGlow, glowColor, glowColorR/G/B }.
+function ns.GetCustomActiveStates()
+    local p = ECME and ECME.db and ECME.db.profile
+    if not p then return nil end
+    if not p.customActiveStates then p.customActiveStates = {} end
+    return p.customActiveStates
+end
+
+-- Read (or, with create=true, lazily create) the entry for one spell key.
+function ns.GetCustomActiveState(spellID, create)
+    local store = ns.GetCustomActiveStates()
+    if not store then return nil end
+    local e = store[spellID]
+    if not e and create then e = {}; store[spellID] = e end
+    return e
+end
+
+-- Map an icon's identity token to its SETTINGS key. Trinket SLOTS (-13/-14) key
+-- their per-spell settings by the EQUIPPED item (-itemID) so each trinket tracks
+-- separately -- bar allocation is untouched (still slot-based). Everything else
+-- (item presets, racials, custom spells) keys by its own token.
+function ns.ResolveCustomActiveKey(frameKey)
+    if frameKey == -13 or frameKey == -14 then
+        local itemID = GetInventoryItemID("player", -frameKey)
+        if itemID then return -itemID end
+    end
+    return frameKey
+end
+
+-- Does this icon have a custom Cooldown State Effect (preset cd-state)? Used by
+-- the appearance refresh so it doesn't clear a preset's _cdStateHidden flag --
+-- presets store cdState in customActiveStates, not per-bar spellSettings.
+function ns.PresetHasCdState(frame)
+    local fc = ns._ecmeFC and ns._ecmeFC[frame]
+    if not fc or not fc.spellID then return false end
+    local key = ns.ResolveCustomActiveKey(fc.spellID)
+    local cas = ns.GetCustomActiveState(key)
+    return (cas and cas.cdStateEffect ~= nil) or false
+end
+
 -- Max Stacks Glow gate: set ns._cdmAnyMaxStacksGlow once if any saved spell (any
 -- spec) has the glow enabled. RefreshCDMIconAppearance then skips its per-icon
 -- watch check entirely for anyone who never uses the feature -- 0 cost when off.
@@ -645,8 +740,8 @@ function ns.RescanMaxStacksGlowFlag()
     end
 end
 
--- Audio Effect gate: set ns._cdmAnyBuffSound once if any saved buff icon (any
--- spec) has an Audio Effect sound chosen. DecorateFrame / RefreshCDMIconAppearance
+-- Audio on Buff Gain/Loss gate: set ns._cdmAnyBuffSound once if any saved buff
+-- icon (any spec) has a gain OR loss sound chosen. DecorateFrame / RefreshCDMIconAppearance
 -- then skip attaching the apply-edge sound hook entirely for anyone who never uses
 -- the feature -- 0 cost when off. Same scanned-once + runtime-enable contract as
 -- RescanMaxStacksGlowFlag (the option's setValue flips the flag live).
@@ -662,8 +757,37 @@ function ns.RescanBuffSoundFlag()
                 local ssAll = bs and bs.spellSettings
                 if ssAll then
                     for _, ss in pairs(ssAll) do
-                        if ss and ss.buffActiveSoundKey and ss.buffActiveSoundKey ~= "none" then
+                        if ss and ((ss.buffActiveSoundKey and ss.buffActiveSoundKey ~= "none")
+                            or (ss.buffLostSoundKey and ss.buffLostSoundKey ~= "none")) then
                             ns._cdmAnyBuffSound = true
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Audio Effect on CD Ready gate: set ns._cdmAnyCdReadySound once if any saved
+-- cd/utility icon (any spec) has a CD-ready sound chosen. The per-frame
+-- SetDesaturated edge hook then no-ops entirely for anyone who never uses it.
+-- Same monotonic, scanned-once contract as RescanBuffSoundFlag (runtime enables
+-- are handled by the option's setValue).
+function ns.RescanCdReadySoundFlag()
+    if ns._cdmAnyCdReadySound or ns._cdReadySoundFlagScanned then return end
+    local sp = SpellStore and SpellStore.GetSpecProfiles and SpellStore.GetSpecProfiles()
+    if not sp then return end
+    ns._cdReadySoundFlagScanned = true
+    for _, prof in pairs(sp) do
+        local barSpells = prof and prof.barSpells
+        if barSpells then
+            for _, bs in pairs(barSpells) do
+                local ssAll = bs and bs.spellSettings
+                if ssAll then
+                    for _, ss in pairs(ssAll) do
+                        if ss and ss.cdReadySoundKey and ss.cdReadySoundKey ~= "none" then
+                            ns._cdmAnyCdReadySound = true
                             return
                         end
                     end
@@ -692,6 +816,34 @@ function ns.RescanChargeCdTextFlag()
                     for _, ss in pairs(ssAll) do
                         if ss and ss.chargeHideCdText then
                             ns._cdmAnyChargeHideCdText = true
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Custom Item gate: set ns._cdmAnyCustomItem once if any saved bar (any spec)
+-- tracks a custom item (an assignedSpells entry <= -100). The buff-bar injection
+-- pass is then skipped entirely for anyone who never adds one -- 0 cost when off.
+-- Same monotonic, scanned-once contract as the flags above (the picker flips the
+-- flag live when an item is added).
+function ns.RescanCustomItemFlag()
+    if ns._cdmAnyCustomItem or ns._customItemFlagScanned then return end
+    local sp = SpellStore and SpellStore.GetSpecProfiles and SpellStore.GetSpecProfiles()
+    if not sp then return end
+    ns._customItemFlagScanned = true
+    for _, prof in pairs(sp) do
+        local barSpells = prof and prof.barSpells
+        if barSpells then
+            for _, bs in pairs(barSpells) do
+                local assigned = bs and bs.assignedSpells
+                if assigned then
+                    for _, sid in ipairs(assigned) do
+                        if type(sid) == "number" and sid <= -100 then
+                            ns._cdmAnyCustomItem = true
                             return
                         end
                     end
@@ -1055,6 +1207,13 @@ local function ProcessSpecChange(newSpecKey)
     if EllesmereUI and EllesmereUI.OnSpecSwitchComplete then
         EllesmereUI.OnSpecSwitchComplete()
     end
+
+    -- Refresh the CDM options pages now that _cachedSpecKey is swapped. The
+    -- options' own PLAYER_SPECIALIZATION_CHANGED watcher races this swap (that
+    -- event can fire before SPELLS_CHANGED), so driving the refresh from here
+    -- guarantees the page rebuilds against the new spec instead of leaving the
+    -- previous spec's selected bar on screen.
+    if ns.OnTBBSpecChanged then ns.OnTBBSpecChanged() end
 end
 ns.ProcessSpecChange = ProcessSpecChange
 
@@ -1334,6 +1493,198 @@ local GLOW_STYLES = {
       rows = 5, columns = 5, frames = 25, duration = 0.3, frameW = 48, frameH = 48, texPadding = 1.25 },
 }
 ns.GLOW_STYLES = GLOW_STYLES
+
+-------------------------------------------------------------------------------
+--  Cross-surface Pandemic Glow sync (CDM bars + Nameplates) -- BEST EFFORT
+--  Glow styles are identified by NAME, never by raw index: CDM, Nameplates and
+--  the shared engine order their lists differently, so the same integer means a
+--  different style on each surface (this silently swapped styles). Each surface
+--  also advertises a different subset, so the sync is best-effort: a style a
+--  surface can't render is coerced to its nearest supported one, and the coerced
+--  value is what gets STORED -- so the dropdown name and the preview image always
+--  match what is actually displayed.
+--    - CDM icon bars  : full set + "Blizzard Default" (-1 = Blizzard's own glow)
+--    - Nameplate icons: same set MINUS "Blizzard Default" (no native glow there)
+-------------------------------------------------------------------------------
+local PG_BLIZZ_NAME = "Blizzard Default"
+
+-- CDM icon-bar style index <-> canonical name
+local function PG_CdmNameFromIndex(idx)
+    if idx == -1 then return PG_BLIZZ_NAME end
+    local e = GLOW_STYLES[idx]
+    return (e and e.name) or "Pixel Glow"
+end
+local function PG_CdmIndexFromName(name)
+    if name == PG_BLIZZ_NAME then return -1 end
+    for i = 1, #GLOW_STYLES do
+        if GLOW_STYLES[i].name == name then return i end
+    end
+    return 1  -- Pixel Glow
+end
+
+-- Nameplate style index <-> canonical name (no Blizzard Default; coerce to Pixel)
+local function PG_NameplateNameFromIndex(idx)
+    local list = EllesmereUI.NameplatePandemicGlowStyles
+    local e = list and list[idx]
+    return (e and e.name) or "Pixel Glow"
+end
+local function PG_NameplateIndexFromName(name)
+    local list = EllesmereUI.NameplatePandemicGlowStyles
+    if name and name ~= PG_BLIZZ_NAME and list then
+        for i = 1, #list do
+            if list[i].name == name then return i end
+        end
+    end
+    return 1  -- Pixel Glow (covers Blizzard Default / anything unsupported)
+end
+
+-- Tracked Buff Bars render as rectangles: only Pixel(1)/Auto-Cast(4) work there.
+local function PG_TbbIndexFromName(name)
+    return (name == "Auto-Cast Shine") and 4 or 1
+end
+-- A TBB may STORE a non-renderable style (e.g. -1 default) but DISPLAYS it as
+-- Pixel; compare what's shown, not what's stored.
+local function PG_TbbEffectiveStyle(dst)
+    return (dst.pandemicGlowStyle == 4) and 4 or 1
+end
+
+local function PG_GetNPProfile()
+    if not EllesmereUIDB or not EllesmereUIDB.profiles then return nil end
+    local pName = EllesmereUIDB.activeProfile or "Default"
+    local prof = EllesmereUIDB.profiles[pName]
+    return prof and prof.addons and prof.addons.EllesmereUINameplates
+end
+
+-- Write a canonical payload into a destination, coercing the style through the
+-- destination's own name->index resolver (so the stored index is renderable).
+local function PG_Write(dst, payload, indexFromName)
+    dst.pandemicGlow          = payload.on
+    dst.pandemicGlowStyle     = indexFromName(payload.styleName or "Pixel Glow")
+    dst.pandemicGlowColor     = payload.color and CopyTable(payload.color) or nil
+    dst.pandemicGlowLines     = payload.lines
+    dst.pandemicGlowThickness = payload.thickness
+    dst.pandemicGlowSpeed     = payload.speed
+end
+
+-- True when dst already displays what PG_Write(dst, payload) would store. When
+-- both are off nothing is shown, so leftover style/color is irrelevant.
+-- actualStyleFn lets a surface report its EFFECTIVE (displayed) style when that
+-- differs from the raw stored value (e.g. rectangle TBBs); defaults to stored.
+local function PG_Matches(dst, payload, indexFromName, actualStyleFn)
+    if (dst.pandemicGlow or false) ~= (payload.on or false) then return false end
+    if not payload.on then return true end
+    local actual = actualStyleFn and actualStyleFn(dst) or (dst.pandemicGlowStyle or 1)
+    if actual ~= indexFromName(payload.styleName or "Pixel Glow") then return false end
+    local dc = dst.pandemicGlowColor or {}
+    local pc = payload.color or {}
+    if (dc.r or 1) ~= (pc.r or 1) or (dc.g or 1) ~= (pc.g or 1) or (dc.b or 0) ~= (pc.b or 0) then return false end
+    if (dst.pandemicGlowLines or 8) ~= (payload.lines or 8) then return false end
+    if (dst.pandemicGlowThickness or 2) ~= (payload.thickness or 2) then return false end
+    if (dst.pandemicGlowSpeed or 4) ~= (payload.speed or 4) then return false end
+    return true
+end
+
+-- Build a canonical payload from a CDM icon bar.
+function EllesmereUI.PandemicPayloadFromCdmBar(bd)
+    return {
+        on        = bd.pandemicGlow == true,
+        styleName = PG_CdmNameFromIndex(bd.pandemicGlowStyle or 1),
+        color     = bd.pandemicGlowColor,
+        lines     = bd.pandemicGlowLines,
+        thickness = bd.pandemicGlowThickness,
+        speed     = bd.pandemicGlowSpeed,
+    }
+end
+
+-- Build a payload from a rectangle bar (Tracked Buff Bar): rectangles only
+-- render Pixel/Auto-Cast, so report the EFFECTIVE displayed style, not the raw
+-- stored one (which may be e.g. -1 "Blizzard Default", shown there as Pixel).
+function EllesmereUI.PandemicPayloadFromRectBar(bd)
+    return {
+        on        = bd.pandemicGlow == true,
+        styleName = (bd.pandemicGlowStyle == 4) and "Auto-Cast Shine" or "Pixel Glow",
+        color     = bd.pandemicGlowColor,
+        lines     = bd.pandemicGlowLines,
+        thickness = bd.pandemicGlowThickness,
+        speed     = bd.pandemicGlowSpeed,
+    }
+end
+
+-- Build a payload from the nameplate profile.
+function EllesmereUI.PandemicPayloadFromNameplate(np)
+    return {
+        on        = np.pandemicGlow == true,
+        styleName = PG_NameplateNameFromIndex(np.pandemicGlowStyle or 1),
+        color     = np.pandemicGlowColor,
+        lines     = np.pandemicGlowLines,
+        thickness = np.pandemicGlowThickness,
+        speed     = np.pandemicGlowSpeed,
+    }
+end
+
+-- Apply a canonical payload to all sync surfaces (CDM icon bars, Tracked Buff
+-- Bars, Nameplates), best-effort. opts.skipCdmKey / opts.skipNameplates exclude
+-- the source surface; opts.skipTbbBar excludes one TBB (its source bar table).
+function EllesmereUI.ApplyPandemicGlowToAll(payload, opts)
+    opts = opts or {}
+    if not opts.skipNameplates then
+        local np = PG_GetNPProfile()
+        if np and EllesmereUI.NameplatePandemicGlowStyles then
+            PG_Write(np, payload, PG_NameplateIndexFromName)
+        end
+    end
+    local p = ECME.db and ECME.db.profile
+    if p and p.cdmBars and p.cdmBars.bars then
+        for _, b in ipairs(p.cdmBars.bars) do
+            if b.key ~= opts.skipCdmKey and not b.isGhostBar and b.barType ~= "custom_buff" then
+                PG_Write(b, payload, PG_CdmIndexFromName)
+            end
+        end
+    end
+    -- Tracked Buff Bars (active spec) -- rectangles, so style coerces to Pixel/Auto-Cast.
+    local tbb = ns.GetTrackedBuffBars and ns.GetTrackedBuffBars()
+    if tbb and tbb.bars then
+        for _, b in ipairs(tbb.bars) do
+            if b ~= opts.skipTbbBar then
+                PG_Write(b, payload, PG_TbbIndexFromName)
+            end
+        end
+    end
+    if ns.BuildAllCDMBars then ns.BuildAllCDMBars() end
+    if ns.BuildTrackedBuffBars then ns.BuildTrackedBuffBars() end
+    if _G._ENP_RefreshAllSettings then _G._ENP_RefreshAllSettings() end
+end
+
+-- True when every (non-skipped) surface already matches the payload.
+function EllesmereUI.IsPandemicGlowSyncedToAll(payload, opts)
+    opts = opts or {}
+    if not opts.skipNameplates then
+        local np = PG_GetNPProfile()
+        if np and EllesmereUI.NameplatePandemicGlowStyles
+           and not PG_Matches(np, payload, PG_NameplateIndexFromName) then
+            return false
+        end
+    end
+    local p = ECME.db and ECME.db.profile
+    if p and p.cdmBars and p.cdmBars.bars then
+        for _, b in ipairs(p.cdmBars.bars) do
+            if b.key ~= opts.skipCdmKey and not b.isGhostBar and b.barType ~= "custom_buff"
+               and not PG_Matches(b, payload, PG_CdmIndexFromName) then
+                return false
+            end
+        end
+    end
+    local tbb = ns.GetTrackedBuffBars and ns.GetTrackedBuffBars()
+    if tbb and tbb.bars then
+        for _, b in ipairs(tbb.bars) do
+            if b ~= opts.skipTbbBar
+               and not PG_Matches(b, payload, PG_TbbIndexFromName, PG_TbbEffectiveStyle) then
+                return false
+            end
+        end
+    end
+    return true
+end
 
 StartNativeGlow = function(overlay, style, cr, cg, cb, opts)
     if not overlay then return end
@@ -3494,6 +3845,104 @@ ApplyShapeToCDMIcon = function(icon, shape, barData, ssb)
 end
 ns.ApplyShapeToCDMIcon = ApplyShapeToCDMIcon
 
+-------------------------------------------------------------------------------
+--  Mirror an icon's custom shape onto a fake-active overlay's own icon + swipe
+-------------------------------------------------------------------------------
+-- The CDM "fake active" engine (EllesmereUICdmFakeActive.lua) draws its own
+-- saturated icon + swipe on top of a CDM icon during a custom active window.
+-- That overlay must copy the underlying icon's custom shape, otherwise a square
+-- icon/swipe is drawn over the shaped icon and the mask looks "broken". We reuse
+-- the underlying icon's shapeMask -- masking is screen-space and the overlay
+-- covers the same region, so one mask masks both. A none/cropped shape clears
+-- any mask we previously added and restores a plain square swipe.
+function ns.ApplyShapeToOverlay(icon, oIcon, oCd, barData)
+    if not icon then return end
+    local ifc = FC(icon)
+    local mask = ifc.shapeMask
+    local shape = ifc.shapeApplied and ifc.shapeName or nil
+
+    -- Drop any mask refs we added before (the shape may have changed / cleared).
+    if mask then
+        if oIcon then pcall(oIcon.RemoveMaskTexture, oIcon, mask) end
+        if oCd then pcall(oCd.RemoveMaskTexture, oCd, mask) end
+    end
+
+    local maskTex = shape and CDM_SHAPES.masks[shape]
+    if not shape or shape == "none" or shape == "cropped" or not mask or not maskTex then
+        -- Square overlay. IconTexture already copied the underlying texcoords.
+        if oIcon then oIcon:ClearAllPoints(); oIcon:SetAllPoints(oIcon:GetParent()) end
+        if oCd then
+            pcall(oCd.SetSwipeTexture, oCd, "Interface\\Buttons\\WHITE8x8")
+            if oCd.SetUseCircularEdge then pcall(oCd.SetUseCircularEdge, oCd, false) end
+        end
+        return
+    end
+
+    local zoom = (barData and barData.iconZoom) or 0.08
+
+    -- Match the underlying tex geometry: point-expand + texcoord-expand.
+    local shapeOffset  = CDM_SHAPES.iconExpandOffsets[shape] or 0
+    local shapeDefault = CDM_SHAPES.zoomDefaults[shape] or 0.06
+    local iconExp = CDM_SHAPES.iconExpand + shapeOffset + ((zoom - shapeDefault) * 200)
+    if iconExp < 0 then iconExp = 0 end
+    local halfIE = iconExp / 2
+    if oIcon then
+        oIcon:ClearAllPoints()
+        EllesmereUI.PP.Point(oIcon, "TOPLEFT", icon, "TOPLEFT", -halfIE, halfIE)
+        EllesmereUI.PP.Point(oIcon, "BOTTOMRIGHT", icon, "BOTTOMRIGHT", halfIE, -halfIE)
+        local insetPx = CDM_SHAPES.insets[shape] or 17
+        local visRatio = (128 - 2 * insetPx) / 128
+        local expand = ((1 / visRatio) - 1) * 0.5
+        oIcon:SetTexCoord(-expand, 1 + expand, -expand, 1 + expand)
+        oIcon:AddMaskTexture(mask)
+    end
+    if oCd then
+        oCd:ClearAllPoints()
+        oCd:SetAllPoints(icon)
+        pcall(oCd.AddMaskTexture, oCd, mask)
+        if oCd.SetSwipeTexture then pcall(oCd.SetSwipeTexture, oCd, maskTex) end
+        local useCircular = (shape ~= "square" and shape ~= "csquare")
+        if oCd.SetUseCircularEdge then pcall(oCd.SetUseCircularEdge, oCd, useCircular) end
+        local edgeScale = CDM_SHAPES.edgeScales[shape] or 0.60
+        if oCd.SetEdgeScale then pcall(oCd.SetEdgeScale, oCd, edgeScale) end
+    end
+end
+
+-------------------------------------------------------------------------------
+--  Style a fake-active overlay's own countdown number to match Duration Text
+-------------------------------------------------------------------------------
+-- The overlay (EllesmereUICdmFakeActive.lua) runs its own Cooldown widget, whose
+-- number would otherwise render in Blizzard's default font. Mirror the same
+-- Duration Text styling the real icon gets in RefreshCDMIconAppearance: font,
+-- size (scale-compensated), colour, centre offset, and the show/hide toggle. ssb
+-- is the resolved per-icon settings and falls back to the bar's values (nil is
+-- fine). Call AFTER SetCooldown so Blizzard's countdown FontString exists.
+function ns.StyleOverlayCooldownText(oCd, barData, ssb, iconScale)
+    if not oCd then return end
+    iconScale = iconScale or 1
+    if iconScale < 0.01 then iconScale = 1 end
+    local fontScale = 1 / iconScale
+    local showCD = barData and barData.showCooldownText
+    if ssb and ssb.showCooldownText ~= nil then showCD = ssb.showCooldownText end
+    oCd:SetHideCountdownNumbers(not showCD)
+    if not showCD then return end
+    local cdFont = GetCDMFont()
+    local cdSize = ((ssb and ssb.cooldownFontSize) or (barData and barData.cooldownFontSize) or 12) * fontScale
+    local cdR = (ssb and ssb.cooldownTextR) or (barData and barData.cooldownTextR) or 1
+    local cdG = (ssb and ssb.cooldownTextG) or (barData and barData.cooldownTextG) or 1
+    local cdB = (ssb and ssb.cooldownTextB) or (barData and barData.cooldownTextB) or 1
+    local cdX = (ssb and ssb.cooldownTextX) or (barData and barData.cooldownTextX) or 0
+    local cdY = (ssb and ssb.cooldownTextY) or (barData and barData.cooldownTextY) or 0
+    for _, rgn in pairs({ oCd:GetRegions() }) do
+        if rgn and rgn.GetObjectType and rgn:GetObjectType() == "FontString" then
+            EllesmereUI.ApplyIconTextFont(rgn, cdFont, cdSize, "cdm")
+            rgn:SetTextColor(cdR, cdG, cdB)
+            rgn:ClearAllPoints()
+            rgn:SetPoint("CENTER", oCd, "CENTER", cdX, cdY)
+        end
+    end
+end
+
 -- (UpdateCustomBarIcons removed -- all bars now use hook-based CollectAndReanchor)
 
 -- (UpdateCDMBarIcons removed -- replaced by hook-based CollectAndReanchor)
@@ -3543,9 +3992,16 @@ local function RefreshCDMIconAppearance(barKey)
         if ns._cdmAnyChargeHideCdText and not isBuffFamilyBar and ns.WatchChargeCdTextIfEnabled then
             ns.WatchChargeCdTextIfEnabled(icon)
         end
+        -- Same login/refresh coverage for "Audio Effect on CD Ready" on CHARGE spells:
+        -- they fire at max charges, which the SetDesaturated edge never signals, so
+        -- register them on the SPELL_UPDATE_CHARGES watcher here. Gated on the feature
+        -- flag; non-charge spells self-skip inside WatchCdReadySoundIfEnabled.
+        if ns._cdmAnyCdReadySound and not isBuffFamilyBar and ns.WatchCdReadySoundIfEnabled then
+            ns.WatchCdReadySoundIfEnabled(icon)
+        end
         if isBuffFamilyBar then
-            -- Per-icon Audio Effect: attach the apply-edge sound hook once, and only
-            -- when the feature is in use anywhere (gate = 0 cost otherwise).
+            -- Per-icon Audio on Buff Gain/Loss: attach the gain+loss sound hooks once,
+            -- and only when the feature is in use anywhere (gate = 0 cost otherwise).
             if ns._cdmAnyBuffSound and ns.EnsureBuffSoundHook then ns.EnsureBuffSoundHook(icon) end
             local fcb = _ecmeFC[icon]
             -- Resolve by the DISPLAYED spell first (GetCanonicalSpellIDForFrame --
@@ -3734,6 +4190,11 @@ local function RefreshCDMIconAppearance(barKey)
         -- applies on the authoritative border render, square or shaped.
         local shape = barData.iconShape or "none"
         ApplyShapeToCDMIcon(icon, shape, barData, ssb)
+        -- A restyle just reset this icon's mask + border level out from under any
+        -- live fake-active overlay (border size / shape change while the active
+        -- window is open). Re-sync the overlay so it re-shapes and re-lifts the
+        -- border above itself instead of waiting for the next trigger.
+        if ns.FakeActive_OnIconRestyled then ns.FakeActive_OnIconRestyled(icon) end
 
         -- Reset glow so glow type change takes effect on next tick.
         -- Do NOT reset isActive -- that causes a 1-frame flash where the
@@ -3843,8 +4304,13 @@ local function RefreshCDMIconAppearance(barKey)
                     end
                 end
             elseif fc and fc._cdStateHidden then
-                fc._cdStateHidden = false
-                icon:SetAlpha(barData.barOpacity or 1)
+                -- A preset keeps its hidden state from the Fake-Active engine (its
+                -- cdState lives in customActiveStates, not per-bar spellSettings),
+                -- so don't clear it here or the icon flashes visible.
+                if not (ns.PresetHasCdState and ns.PresetHasCdState(icon)) then
+                    fc._cdStateHidden = false
+                    icon:SetAlpha(barData.barOpacity or 1)
+                end
             end
         end
     end
@@ -4187,19 +4653,45 @@ local function EnsureFocusCastProxy()
 end
 ns.EnsureFocusCastProxy = EnsureFocusCastProxy
 
--- Per-icon "Audio Effect": play a sound when a buff becomes active. Blizzard's
--- buff cooldown-viewer item frames fire TriggerAuraAppliedAlert on the apply
--- edge, so we hooksecurefunc it (taint-safe post-hook, no polling) and play the
--- per-icon sound. The frame's GetSpellID is a SECRET value while the aura is
--- active, so we resolve the clean canonical id via GetCanonicalSpellIDForFrame
--- (the same id the options menu writes the setting under) -- never index a table
--- with the live secret id. Hooked-frame + throttle state live in a do-block,
--- off the Blizzard frame table per the no-custom-props rule. Reuses the
--- FocusKick sound table so the option list stays identical to Focus Cast Sound.
+-- Per-icon "Audio on Buff Gain / Loss": play a sound when a buff becomes active
+-- (gain) or drops (loss). Blizzard's buff cooldown-viewer item frames fire
+-- TriggerAuraAppliedAlert on the apply edge and TriggerAuraRemovedAlert on the
+-- drop edge, so we hooksecurefunc both (taint-safe post-hook, no polling) and
+-- play the matching per-icon sound. The frame's GetSpellID is a SECRET value
+-- while the aura is active, so we resolve the clean canonical id via
+-- GetCanonicalSpellIDForFrame (the same id the options menu writes the setting
+-- under) -- never index a table with the live secret id. Hooked-frame + throttle
+-- state live in a do-block, off the Blizzard frame table per the no-custom-props
+-- rule. Reuses the FocusKick sound table so the option list stays identical to
+-- Focus Cast Sound. The two edges use separate throttle tables so they never
+-- suppress each other.
 do
     local _soundHooked = setmetatable({}, { __mode = "k" })
-    local _soundThrottle = {}            -- [spellID] = last GetTime() (dedupe rapid re-applies)
+    local _soundThrottle = {}            -- [spellID] = last GetTime() (gain dedupe)
+    local _soundThrottleLost = {}        -- [spellID] = last GetTime() (loss dedupe)
     local SOUND_MIN_GAP = 0.3
+    -- Resolve the per-icon sound for one edge and play it (throttled). `field` is
+    -- the spell-setting key ("buffActiveSoundKey" gain / "buffLostSoundKey" loss);
+    -- `throttle` is the matching dedupe table. Identical resolution for both edges.
+    local function PlayBuffEdgeSound(f, field, throttle)
+        local fc = _ecmeFC[f]
+        local barKey = fc and fc.barKey
+        if not barKey then return end
+        local sd = ns.GetBarSpellData and ns.GetBarSpellData(barKey)
+        if not sd or not sd.spellSettings then return end
+        local sid = ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(f)
+        if not sid then return end
+        local ss = (ns.ResolveSpellSettings and ns.ResolveSpellSettings(f, sid, sd))
+            or sd.spellSettings[sid]
+        local key = ss and ss[field]
+        if not key or key == "none" then return end
+        local now = GetTime()
+        local last = throttle[sid]
+        if last and (now - last) < SOUND_MIN_GAP then return end
+        throttle[sid] = now
+        local path = FOCUSKICK_SOUND_PATHS[key]
+        if path then PlaySoundFile(path, "Master") end
+    end
     function ns.EnsureBuffSoundHook(frame)
         if not frame or _soundHooked[frame] then return end
         -- Own placeholder/custom frames (and anything that isn't a Blizzard buff
@@ -4210,24 +4702,14 @@ do
         end
         _soundHooked[frame] = true
         hooksecurefunc(frame, "TriggerAuraAppliedAlert", function(f)
-            local fc = _ecmeFC[f]
-            local barKey = fc and fc.barKey
-            if not barKey then return end
-            local sd = ns.GetBarSpellData and ns.GetBarSpellData(barKey)
-            if not sd or not sd.spellSettings then return end
-            local sid = ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(f)
-            if not sid then return end
-            local ss = (ns.ResolveSpellSettings and ns.ResolveSpellSettings(f, sid, sd))
-                or sd.spellSettings[sid]
-            local key = ss and ss.buffActiveSoundKey
-            if not key or key == "none" then return end
-            local now = GetTime()
-            local last = _soundThrottle[sid]
-            if last and (now - last) < SOUND_MIN_GAP then return end
-            _soundThrottle[sid] = now
-            local path = FOCUSKICK_SOUND_PATHS[key]
-            if path then PlaySoundFile(path, "Master") end
+            PlayBuffEdgeSound(f, "buffActiveSoundKey", _soundThrottle)
         end)
+        -- Loss edge: Blizzard fires TriggerAuraRemovedAlert when the buff drops.
+        if type(frame.TriggerAuraRemovedAlert) == "function" then
+            hooksecurefunc(frame, "TriggerAuraRemovedAlert", function(f)
+                PlayBuffEdgeSound(f, "buffLostSoundKey", _soundThrottleLost)
+            end)
+        end
     end
 end
 
@@ -5021,7 +5503,9 @@ BuildAllCDMBars = function()
     EnsureFocusKickBar()
     ns.RescanMaxStacksGlowFlag()  -- set the Max Stacks Glow gate (once) before refresh
     ns.RescanChargeCdTextFlag()   -- set the Hide CD Text (Charges) gate (once) before refresh
-    ns.RescanBuffSoundFlag()      -- set the Audio Effect gate (once) before refresh
+    ns.RescanBuffSoundFlag()      -- set the Audio on Buff Gain/Loss gate (once) before refresh
+    ns.RescanCdReadySoundFlag()   -- set the Audio Effect on CD Ready gate (once) before refresh
+    ns.RescanCustomItemFlag()     -- set the custom-item buff-injection gate (once)
 
     local p = ECME.db.profile
 
@@ -5404,6 +5888,42 @@ end
 function ns.ReseedAssignedSpellsFromLiveIcons()
     local p = ECME and ECME.db and ECME.db.profile
     if not p or not p.cdmBars then return end
+
+    -- Both-state guards (mirror EnsureAssignedSpells). This appends live-icon
+    -- spells back into assignedSpells; without these it could re-materialize a
+    -- spell that is currently HIDDEN (ghosted) or already OWNED by another bar,
+    -- recreating a both-state. The sole caller (RepopulateFromBlizzard) pre-wipes
+    -- the ghost and Blizzard-sourced assignments, so these are normally no-ops --
+    -- but they keep Reseed safe regardless of caller or ordering.
+    local sp = ns.GetActiveSpecProfiles and ns.GetActiveSpecProfiles()
+    local sk = ns.GetActiveSpecKey and ns.GetActiveSpecKey()
+    local aprof = sp and sk and sp[sk]
+    -- Skip entirely while an imported layout is pending its first-load ghosting:
+    -- its tracked spells spill onto default bars until the migration ghosts them,
+    -- and materializing those spills would defeat the import-authoritative hide.
+    if aprof and aprof._importGhostMode then return end
+
+    -- Spell -> owning bar (variant-aware), built once. A live icon whose stored
+    -- owner is a DIFFERENT bar is a transient spillover we must not materialize.
+    local ownerOf
+    if aprof and aprof.barSpells and ns.StoreVariantValue then
+        for k, bsd in pairs(aprof.barSpells) do
+            if k ~= GHOST_CD_BAR_KEY
+               and type(bsd) == "table" and type(bsd.assignedSpells) == "table" then
+                for _, csid in ipairs(bsd.assignedSpells) do
+                    if type(csid) == "number" and csid > 0 then
+                        ownerOf = ownerOf or {}
+                        ns.StoreVariantValue(ownerOf, csid, k, false)
+                    end
+                end
+            end
+        end
+    end
+
+    local ghostSd = ns.GetBarSpellData and ns.GetBarSpellData(GHOST_CD_BAR_KEY)
+    local ghostList = ghostSd and ghostSd.assignedSpells
+    local FindVar = ns.FindVariantIndexInList
+
     for _, barData in ipairs(p.cdmBars.bars) do
         if not barData.isGhostBar
            and barData.key ~= "buffs"
@@ -5422,8 +5942,15 @@ function ns.ReseedAssignedSpellsFromLiveIcons()
                     local fc = ns._ecmeFC and ns._ecmeFC[icon]
                     local sid = fc and fc.spellID
                     if type(sid) == "number" and sid > 0 and not seen[sid] then
-                        sd.assignedSpells[#sd.assignedSpells + 1] = sid
-                        seen[sid] = true
+                        -- Never materialize a hidden (ghosted) spell, or a spell a
+                        -- DIFFERENT bar already owns (variant-aware).
+                        local owner = ownerOf and ns.ResolveVariantValue
+                                      and ns.ResolveVariantValue(ownerOf, sid)
+                        local ghosted = ghostList and FindVar and FindVar(ghostList, sid)
+                        if not ghosted and not (owner and owner ~= barData.key) then
+                            sd.assignedSpells[#sd.assignedSpells + 1] = sid
+                            seen[sid] = true
+                        end
                     end
                 end
             end

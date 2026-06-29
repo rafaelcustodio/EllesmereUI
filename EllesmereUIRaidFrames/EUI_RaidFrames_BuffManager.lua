@@ -2733,12 +2733,13 @@ function ns.BM_BuildSimplePreview(parent, s, fontPath, PP, centerX, topY)
     local mode = s.healthColorMode or "class"
     local fillTex = health:GetStatusBarTexture()
     if mode == "dark" then
-        health:SetStatusBarColor(0x11/255, 0x11/255, 0x11/255, 1)
-        if fillTex then fillTex:SetAlpha(0.9) end
+        local dfr, dfg, dfb, dfa = EllesmereUI.GetDarkModeFill()
+        health:SetStatusBarColor(dfr, dfg, dfb, 1)
+        if fillTex then fillTex:SetAlpha(dfa) end
         bg:ClearAllPoints()
         bg:SetPoint("TOPLEFT", fillTex, "TOPRIGHT", 0, 0)
         bg:SetPoint("BOTTOMRIGHT", health, "BOTTOMRIGHT", 0, 0)
-        bg:SetColorTexture(0x4f/255, 0x4f/255, 0x4f/255, 1)
+        bg:SetColorTexture(EllesmereUI.GetDarkModeBg())
     elseif mode == "classic" then
         local pct = 0.85
         local r = pct < 0.5 and 1 or (1 - (pct - 0.5) * 2)
@@ -3121,13 +3122,13 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
         local title = card:CreateFontString(nil, "OVERLAY")
         title:SetFont(fontPath, 15, "")
         title:SetPoint("TOPLEFT", card, "TOPLEFT", 16, -16)
-        title:SetText("Buff Display Mode")
+        title:SetText(EllesmereUI.L("Buff Display Mode"))
         title:SetTextColor(1, 1, 1, 0.95)
 
         local desc = card:CreateFontString(nil, "OVERLAY")
         desc:SetFont(fontPath, 12, "")
         desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -6)
-        desc:SetText("Choose how buffs are displayed on raid frames.")
+        desc:SetText(EllesmereUI.L("Choose how buffs are displayed on raid frames."))
         desc:SetTextColor(1, 1, 1, 0.5)
 
         -- Segmented two-button toggle (active = green, inactive = dark).
@@ -3150,7 +3151,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
             local lbl = btn:CreateFontString(nil, "OVERLAY")
             lbl:SetFont(fontPath, 13, "")
             lbl:SetPoint("CENTER")
-            lbl:SetText(m.label)
+            lbl:SetText(EllesmereUI.L(m.label))
             if active then
                 bg:SetColorTexture(EG.r, EG.g, EG.b, 0.85)
                 lbl:SetTextColor(1, 1, 1, 1)
@@ -3761,7 +3762,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
                 local indLbl = popup:CreateFontString(nil, "OVERLAY")
                 indLbl:SetFont(fontPath, 11, "")
                 indLbl:SetPoint("TOPLEFT", popup, "TOPLEFT", POPUP_PAD, py)
-                indLbl:SetText("Indicator")
+                indLbl:SetText(EllesmereUI.L("Indicator"))
                 indLbl:SetTextColor(1, 1, 1, 0.6)
                 py = py - LABEL_H - LBL_GAP
 
@@ -3785,7 +3786,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
                 local cTx = cBtn:CreateFontString(nil, "OVERLAY")
                 cTx:SetPoint("CENTER")
                 cTx:SetFont(fontPath, 12, "")
-                cTx:SetText("Create")
+                cTx:SetText(EllesmereUI.L("Create"))
                 cTx:SetTextColor(1, 1, 1)
                 cBtn:SetScript("OnEnter", function() cBg:SetColorTexture(0.07, 0.62, 0.49, 1) end)
                 cBtn:SetScript("OnLeave", function() cBg:SetColorTexture(0.05, 0.52, 0.39, 0.8) end)
@@ -3937,11 +3938,11 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
         specLabel:SetFont(fontPath, 12, "")
         specLabel:SetPoint("TOP", leftFixed, "TOPLEFT", specCenterX, groupTopY)
         specLabel:SetJustifyH("CENTER")
-        specLabel:SetText("Editing Spec")
+        specLabel:SetText(EllesmereUI.L("Editing Spec"))
         specLabel:SetTextColor(1, 1, 1, 0.75)
 
         local specDDValues = {}
-        for k, v in pairs(SPEC_DD_VALUES) do specDDValues[k] = v end
+        for k, v in pairs(SPEC_DD_VALUES) do specDDValues[k] = EllesmereUI.L(v) end
         specDDValues._menuOpts = {
             maxHeight = 300,
             icon = function(key)
@@ -4005,12 +4006,13 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
         local mode = s.healthColorMode or "class"
         local fillTex = health:GetStatusBarTexture()
         if mode == "dark" then
-            health:SetStatusBarColor(0x11/255, 0x11/255, 0x11/255, 1)
-            if fillTex then fillTex:SetAlpha(0.9) end
+            local dfr, dfg, dfb, dfa = EllesmereUI.GetDarkModeFill()
+            health:SetStatusBarColor(dfr, dfg, dfb, 1)
+            if fillTex then fillTex:SetAlpha(dfa) end
             bg:ClearAllPoints()
             bg:SetPoint("TOPLEFT", fillTex, "TOPRIGHT", 0, 0)
             bg:SetPoint("BOTTOMRIGHT", health, "BOTTOMRIGHT", 0, 0)
-            bg:SetColorTexture(0x4f/255, 0x4f/255, 0x4f/255, 1)
+            bg:SetColorTexture(EllesmereUI.GetDarkModeBg())
         elseif mode == "classic" then
             local pct = 0.85
             local r = pct < 0.5 and 1 or (1 - (pct - 0.5) * 2)
@@ -4287,7 +4289,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
             hintFS:SetJustifyH("CENTER")
             hintFS:SetWordWrap(false)
             hintFS:SetTextColor(0.75, 0.75, 0.75, 0.65)
-            hintFS:SetText("For Icons: Left click to edit group, Right click to custom size individual")
+            hintFS:SetText(EllesmereUI.L("For Icons: Left click to edit group, Right click to custom size individual"))
             hintBtn:SetSize(hintFS:GetStringWidth() + 8, 14)
             hintBtn:SetScript("OnEnter", function() hintFS:SetTextColor(1, 1, 1, 0.85) end)
             hintBtn:SetScript("OnLeave", function() hintFS:SetTextColor(0.75, 0.75, 0.75, 0.65) end)
@@ -4453,7 +4455,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
         else
             settingsTitle:SetTextColor(0.05, 0.82, 0.62)
         end
-        settingsTitle:SetText(typeName .. " Indicator")
+        settingsTitle:SetText(EllesmereUI.L(typeName .. " Indicator"))
 
         local spellNames = {}
         if ind.spells then
@@ -4461,7 +4463,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
                 spellNames[#spellNames + 1] = SPELL_NAME_BY_ID[sid] or tostring(sid)
             end
         end
-        spellsTitle:SetText(#spellNames > 0 and ("(" .. table.concat(spellNames, ", ") .. ")") or "(no spells)")
+        spellsTitle:SetText(#spellNames > 0 and ("(" .. table.concat(spellNames, ", ") .. ")") or EllesmereUI.L("(no spells)"))
 
         -- Helper: build a DualRow inside leftFrame
         local function SettingsRow(leftCfg, rightCfg)
@@ -4802,7 +4804,7 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
                         for _, id in ipairs(ind.spells) do
                             names[#names + 1] = SPELL_NAME_BY_ID[id] or tostring(id)
                         end
-                        spellsTitle:SetText(#names > 0 and ("(" .. table.concat(names, ", ") .. ")") or "(no spells)")
+                        spellsTitle:SetText(#names > 0 and ("(" .. table.concat(names, ", ") .. ")") or EllesmereUI.L("(no spells)"))
                         local pv = ns._bmPreviewFrame
                         if pv and pv._health and ns.BM_ApplyPreviewIndicators then
                             ns.BM_ApplyPreviewIndicators(pv, 1, db.profile)
@@ -5596,9 +5598,9 @@ function ns.BM_BuildPage(pageName, parent, yOffset)
         end
     else
         if selectedSpecKey then
-            settingsTitle:SetText("Create an indicator to get started.")
+            settingsTitle:SetText(EllesmereUI.L("Create an indicator to get started."))
         else
-            settingsTitle:SetText("Select a spec above.")
+            settingsTitle:SetText(EllesmereUI.L("Select a spec above."))
         end
         settingsTitle:SetTextColor(0.4, 0.4, 0.4)
         spellsTitle:SetText("")

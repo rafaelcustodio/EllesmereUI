@@ -4,6 +4,39 @@
 --  tab of Global Settings. No UI code here -- only gameplay behaviour.
 -------------------------------------------------------------------------------
 
+-------------------------------------------------------------------------------
+--  Per-profile storage for QoL "extras" (Secondary Stats + FPS counter).
+--  These were account-wide on the EllesmereUIDB root; they now live in the QoL
+--  profile DB (folder EllesmereUIQoL) so they travel with profiles, export/
+--  import, and module sync. The migration in EllesmereUI_Migration.lua seeds
+--  every existing profile from the old account-wide values, so nobody loses
+--  their setup. Reads fall back to the frozen account-wide root for any profile
+--  that has no per-profile value yet (newly created profiles, sync gaps);
+--  writes always go per-profile. Mirrors the crosshair read/fallback pattern.
+--
+--  This shares EllesmereUIQoLDB with the Cursor / BattleRes / Bloodlust modules
+--  -- each NewDB call merges its own defaults into the SAME profile table, and
+--  the profile system repoints every handle on a profile swap.
+-------------------------------------------------------------------------------
+local _qolExtrasDB
+local function QoLExtrasProfile()
+    if not _qolExtrasDB and EllesmereUI and EllesmereUI.Lite and EllesmereUI.Lite.NewDB then
+        _qolExtrasDB = EllesmereUI.Lite.NewDB("EllesmereUIQoLDB", { profile = {} })
+    end
+    return _qolExtrasDB and _qolExtrasDB.profile
+end
+function EllesmereUI.QoLExtrasGet(k)
+    local p = QoLExtrasProfile()
+    if p and p[k] ~= nil then return p[k] end
+    return EllesmereUIDB and EllesmereUIDB[k]
+end
+function EllesmereUI.QoLExtrasSet(k, v)
+    local p = QoLExtrasProfile()
+    if p then p[k] = v; return end
+    if not EllesmereUIDB then EllesmereUIDB = {} end
+    EllesmereUIDB[k] = v
+end
+
 local qolFrame = CreateFrame("Frame")
 qolFrame:RegisterEvent("PLAYER_LOGIN")
 qolFrame:SetScript("OnEvent", function(self)
@@ -1038,7 +1071,7 @@ do
                 statsFrame._classHex = "ffffff"
             end
         end
-        local c = EllesmereUIDB and EllesmereUIDB.secondaryStatsColor
+        local c = EllesmereUI.QoLExtrasGet("secondaryStatsColor")
         local cr, cg, cb
         if c then
             cr, cg, cb = c.r, c.g, c.b
@@ -1060,8 +1093,8 @@ do
             format("|cff%sMastery:|r  |cffffffff%.2f%%|r", labelHex, mastery) .. "\n" ..
             format("|cff%sVers:|r  |cffffffff%.2f%%|r", labelHex, vers)
 
-        if EllesmereUIDB and EllesmereUIDB.showTertiaryStats then
-            local tc = EllesmereUIDB.tertiaryStatsColor
+        if EllesmereUI.QoLExtrasGet("showTertiaryStats") then
+            local tc = EllesmereUI.QoLExtrasGet("tertiaryStatsColor")
             local tr, tg, tb
             if tc then
                 tr, tg, tb = tc.r, tc.g, tc.b
@@ -1083,7 +1116,7 @@ do
     end
 
     local function ApplySecondaryStats()
-        local enabled = EllesmereUIDB and EllesmereUIDB.showSecondaryStats
+        local enabled = EllesmereUI.QoLExtrasGet("showSecondaryStats")
         if not enabled then
             if statsFrame then
                 statsFrame:Hide()
@@ -1105,7 +1138,7 @@ do
             if EllesmereUI and EllesmereUI.PrimeFontShadow then EllesmereUI.PrimeFontShadow(statsText, EllesmereUI.GetFontUseShadow("extras")) end
             statsText:SetFont(font, 12, EllesmereUI.GetFontOutlineFlag("extras"))
         end
-        local pos = EllesmereUIDB and EllesmereUIDB.secondaryStatsPos
+        local pos = EllesmereUI.QoLExtrasGet("secondaryStatsPos")
         local scale = 1.0
         if pos then
             if pos.point then
@@ -1170,7 +1203,7 @@ do
     local function CreateFPSCounter()
         if fpsFrame then return end
         local FONT = EllesmereUI.GetFontPath("extras")
-        local FONT_SIZE = (EllesmereUIDB and EllesmereUIDB.fpsTextSize) or 12
+        local FONT_SIZE = EllesmereUI.QoLExtrasGet("fpsTextSize") or 12
         local LABEL_SIZE = FONT_SIZE - 2
         fpsFrame = CreateFrame("Frame", "EUI_FPSCounter", UIParent)
         fpsFrame:SetSize(60, 20)
@@ -1214,8 +1247,7 @@ do
         fpsFrame._textLocal = fsLocalVal
 
         local function UpdateFPS(self)
-            local db = EllesmereUIDB or {}
-            local c = db.fpsColor
+            local c = EllesmereUI.QoLExtrasGet("fpsColor")
             local cr, cg, cb, ca = 1, 1, 1, 1
             if c then cr, cg, cb, ca = c.r or 1, c.g or 1, c.b or 1, c.a or 1 end
             fsFps:SetTextColor(cr, cg, cb, ca)
@@ -1229,9 +1261,10 @@ do
             local fps = floor(GetFramerate() + 0.5)
             fsFps:SetText(fps .. " fps")
 
-            local showWorld = db.fpsShowWorldMS
-            local showLocal = (db.fpsShowLocalMS == nil) and true or db.fpsShowLocalMS
-            local hideLabel = db.fpsHideLabel
+            local showWorld = EllesmereUI.QoLExtrasGet("fpsShowWorldMS")
+            local _localMS = EllesmereUI.QoLExtrasGet("fpsShowLocalMS")
+            local showLocal = (_localMS == nil) and true or _localMS
+            local hideLabel = EllesmereUI.QoLExtrasGet("fpsHideLabel")
             local _, _, latHome, latWorld = GetNetStats()
 
             fsFps:ClearAllPoints()
@@ -1306,10 +1339,10 @@ do
     end
 
     EllesmereUI._applyFPSCounter = function()
-        local shouldShow = EllesmereUIDB and EllesmereUIDB.showFPS
+        local shouldShow = EllesmereUI.QoLExtrasGet("showFPS")
         if shouldShow then
             CreateFPSCounter()
-            local sz = (EllesmereUIDB and EllesmereUIDB.fpsTextSize) or 12
+            local sz = EllesmereUI.QoLExtrasGet("fpsTextSize") or 12
             local lblSz = sz - 2
             local fp = EllesmereUI.GetFontPath("extras")
             local outF = EllesmereUI.GetFontOutlineFlag("extras")
@@ -1318,7 +1351,7 @@ do
             if fpsFrame._textLocal then fpsFrame._textLocal:SetFont(fp, sz, outF) end
             if fpsFrame._lblWorld then fpsFrame._lblWorld:SetFont(fp, lblSz, outF) end
             if fpsFrame._lblLocal then fpsFrame._lblLocal:SetFont(fp, lblSz, outF) end
-            local pos = EllesmereUIDB and EllesmereUIDB.fpsPos
+            local pos = EllesmereUI.QoLExtrasGet("fpsPos")
             if pos and pos.point then
                 if pos.scale then pcall(function() fpsFrame:SetScale(pos.scale) end) end
                 fpsFrame:ClearAllPoints()
@@ -1349,23 +1382,22 @@ do
                 end,
                 noResize = true,
                 savePos = function(key, point, relPoint, x, y)
-                    if not EllesmereUIDB then EllesmereUIDB = {} end
                     if not point then return end
-                    EllesmereUIDB.fpsPos = { point = point, relPoint = relPoint, x = x, y = y }
+                    EllesmereUI.QoLExtrasSet("fpsPos", { point = point, relPoint = relPoint, x = x, y = y })
                     if fpsFrame and not EllesmereUI._unlockActive then
                         fpsFrame:ClearAllPoints()
                         fpsFrame:SetPoint(point, UIParent, relPoint or point, x or 0, y or 0)
                     end
                 end,
                 loadPos = function()
-                    return EllesmereUIDB and EllesmereUIDB.fpsPos
+                    return EllesmereUI.QoLExtrasGet("fpsPos")
                 end,
                 clearPos = function()
-                    if EllesmereUIDB then EllesmereUIDB.fpsPos = nil end
+                    EllesmereUI.QoLExtrasSet("fpsPos", nil)
                 end,
                 applyPos = function()
                     if not fpsFrame then return end
-                    local pos = EllesmereUIDB and EllesmereUIDB.fpsPos
+                    local pos = EllesmereUI.QoLExtrasGet("fpsPos")
                     if pos and pos.point then
                         fpsFrame:ClearAllPoints()
                         fpsFrame:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, pos.x or 0, pos.y or 0)
@@ -1394,11 +1426,10 @@ do
                 end,
                 noResize = true,
                 savePos = function(key, point, relPoint, x, y)
-                    if not EllesmereUIDB then EllesmereUIDB = {} end
                     if not point then return end
                     -- Scale lives in this same table; carry it over so a drag doesn't wipe it.
-                    local prev = EllesmereUIDB.secondaryStatsPos
-                    EllesmereUIDB.secondaryStatsPos = { point = point, relPoint = relPoint, x = x, y = y, scale = prev and prev.scale }
+                    local prev = EllesmereUI.QoLExtrasGet("secondaryStatsPos")
+                    EllesmereUI.QoLExtrasSet("secondaryStatsPos", { point = point, relPoint = relPoint, x = x, y = y, scale = prev and prev.scale })
                     if not EllesmereUI._unlockActive then
                         local f = EllesmereUI._getSecondaryStatsFrame and EllesmereUI._getSecondaryStatsFrame()
                         if f then
@@ -1408,15 +1439,15 @@ do
                     end
                 end,
                 loadPos = function()
-                    return EllesmereUIDB and EllesmereUIDB.secondaryStatsPos
+                    return EllesmereUI.QoLExtrasGet("secondaryStatsPos")
                 end,
                 clearPos = function()
-                    if EllesmereUIDB then EllesmereUIDB.secondaryStatsPos = nil end
+                    EllesmereUI.QoLExtrasSet("secondaryStatsPos", nil)
                 end,
                 applyPos = function()
                     local f = EllesmereUI._getSecondaryStatsFrame and EllesmereUI._getSecondaryStatsFrame()
                     if not f then return end
-                    local pos = EllesmereUIDB and EllesmereUIDB.secondaryStatsPos
+                    local pos = EllesmereUI.QoLExtrasGet("secondaryStatsPos")
                     if pos and pos.point then
                         f:ClearAllPoints()
                         f:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, pos.x or 0, pos.y or 0)
@@ -1429,13 +1460,12 @@ do
     local fpsBind = CreateFrame("Button", "EUI_FPSBindBtn", UIParent)
     fpsBind:Hide()
     fpsBind:SetScript("OnClick", function()
-        if not EllesmereUIDB then EllesmereUIDB = {} end
-        EllesmereUIDB.showFPS = not EllesmereUIDB.showFPS
+        EllesmereUI.QoLExtrasSet("showFPS", not EllesmereUI.QoLExtrasGet("showFPS"))
         if EllesmereUI._applyFPSCounter then EllesmereUI._applyFPSCounter() end
     end)
 
     C_Timer.After(1, function()
-        if EllesmereUIDB and EllesmereUIDB.showFPS then
+        if EllesmereUI.QoLExtrasGet("showFPS") then
             EllesmereUI._applyFPSCounter()
         end
         local function ApplyFPSBind()
@@ -1683,6 +1713,69 @@ end
 -------------------------------------------------------------------------------
 do
     local crosshairFrame
+
+    -- Crosshair settings: the account-wide EllesmereUIDB root is the inherited
+    -- global default (preserved, never cleared); the QoL per-profile DB holds
+    -- per-profile settings. Existing users keep their current crosshair until a
+    -- profile overrides it.
+    -- CrosshairDB() is nil until the Cursor module creates it.
+    local function CrosshairDB()
+        return _G._ECL_AceDB and _G._ECL_AceDB.profile
+    end
+    EllesmereUI.GetCrosshairDB = CrosshairDB
+
+    -- Effective read: profile override -> global root -> nil (inline default).
+    local function CrosshairGet(k)
+        local p = CrosshairDB()
+        if p and p[k] ~= nil then return p[k] end
+        return EllesmereUIDB and EllesmereUIDB[k]
+    end
+    EllesmereUI.GetCrosshairValue = CrosshairGet
+
+    -- Melee-range detection, use a per-spec melee-range spell
+    local SPEC_SPELLS = {
+        [65]   = 853,    [66]   = 96231,  [70]   = 96231,             -- Paladin (Holy: Hammer of Justice 10yd; Ret/Prot: Rebuke)
+        [250]  = 316239, [251]  = 316239, [252]  = 316239,            -- Death Knight
+        [577]  = 162794, [581]  = 344859, [1480] = 473662,            -- Demon Hunter
+        [255]  = 186270,                                              -- Hunter (Survival)
+        [102]  = 5221,   [103]  = 5221,   [104]  = 5221, [105] = 5221,-- Druid (gated by form)
+        [268]  = 205523, [269]  = 205523, [270]  = 205523,            -- Monk
+        [71]   = 1464,   [72]   = 1464,   [73]   = 23922,             -- Warrior
+        [263]  = 17364,                                               -- Shaman (Enhancement)
+        [259]  = 1752,   [260]  = 1752,   [261]  = 1752,              -- Rogue
+        [1467] = 362969, [1468] = 362969, [1473] = 362969,            -- Evoker
+    }
+    local DRUID_MELEE_FORMS = { [1] = true, [2] = true }  -- Bear, Cat
+
+    local _, _chPlayerClass = UnitClass("player")
+    local _meleeSpell  -- cached melee spell for the current spec (nil = ranged spec)
+
+    local function RefreshCrosshairMeleeSpell()
+        local specID
+        if PlayerUtil and PlayerUtil.GetCurrentSpecID then
+            specID = PlayerUtil.GetCurrentSpecID()
+        elseif GetSpecialization then
+            local idx = GetSpecialization()
+            if idx then specID = (GetSpecializationInfo(idx)) end
+        end
+        _meleeSpell = (specID and SPEC_SPELLS[specID]) or nil
+    end
+    RefreshCrosshairMeleeSpell()
+
+    -- True only when there is an attackable, living target out of melee range.
+    -- Druids count only while in a melee form (Cat/Bear).
+    local function TargetOutOfMelee()
+        if not _meleeSpell then return false end
+        if _chPlayerClass == "DRUID" and not DRUID_MELEE_FORMS[GetShapeshiftForm()] then
+            return false
+        end
+        if not (UnitExists("target") and UnitCanAttack("player", "target")
+                and not UnitIsDead("target")) then
+            return false
+        end
+        return C_Spell.IsSpellInRange(_meleeSpell, "target") == false
+    end
+
     local function CreateCrosshair()
         if crosshairFrame then return end
         crosshairFrame = CreateFrame("Frame", "EUI_CharacterCrosshair", UIParent)
@@ -1693,21 +1786,61 @@ do
         crosshairFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
         crosshairFrame:SetSize(1, 1)
 
-        local function MakeArm()
-            local t = crosshairFrame:CreateTexture(nil, "OVERLAY")
+        local function MakeArm(layer)
+            local t = crosshairFrame:CreateTexture(nil, layer or "OVERLAY")
             if t.SetSnapToPixelGrid then
                 t:SetSnapToPixelGrid(false)
                 t:SetTexelSnappingBias(0)
             end
             return t
         end
-        crosshairFrame._hBar = MakeArm()
-        crosshairFrame._vBar = MakeArm()
+        -- Borders sit on artwork so the overlay arms render on top of them.
+        crosshairFrame._hBorder = MakeArm("ARTWORK")
+        crosshairFrame._vBorder = MakeArm("ARTWORK")
+        crosshairFrame._hBar = MakeArm("OVERLAY")
+        crosshairFrame._vBar = MakeArm("OVERLAY")
+
+        -- Throttled recolor when the target is out of melee range. No-ops unless
+        -- the feature is enabled and the class has a mapped melee spell.
+        local meleeAccum = 0
+        crosshairFrame:SetScript("OnUpdate", function(self, elapsed)
+            meleeAccum = meleeAccum + elapsed
+            if meleeAccum < 0.15 then return end
+            meleeAccum = 0
+            local nc = self._normalColor
+            if not nc then return end
+            if not (CrosshairGet("crosshairMeleeColorEnabled") and _meleeSpell) then
+                if self._meleeActive then
+                    self._meleeActive = false
+                    self._hBar:SetColorTexture(nc.r, nc.g, nc.b, nc.a)
+                    self._vBar:SetColorTexture(nc.r, nc.g, nc.b, nc.a)
+                end
+                return
+            end
+            local outOfRange = TargetOutOfMelee()
+            if outOfRange ~= self._meleeActive then
+                self._meleeActive = outOfRange
+                local c = outOfRange and (CrosshairGet("crosshairMeleeColor") or { r = 1, g = 0, b = 0, a = 1 }) or nc
+                self._hBar:SetColorTexture(c.r or 1, c.g or 0, c.b or 0, c.a or 1)
+                self._vBar:SetColorTexture(c.r or 1, c.g or 0, c.b or 0, c.a or 1)
+            end
+        end)
     end
 
+    -- Hardcoded presets (the original look): thickness + total arm length. The
+    -- options dropdown stamps these onto the H/V Width/Length values, and they
+    -- are the fallback here when those values are unset. Cog sliders fine-tune.
+    EllesmereUI.CROSSHAIR_PRESETS = {
+        Thin   = { width = 1, length = 40 },
+        Normal = { width = 2, length = 40 },
+        Thick  = { width = 3, length = 40 },
+    }
+
     EllesmereUI._applyCrosshair = function()
-        local PP = EllesmereUI.PanelPP
-        local size = EllesmereUIDB and EllesmereUIDB.crosshairSize or "None"
+        local PP = EllesmereUI.PP
+        -- Effective reads (profile override -> global root -> inline default)
+        local G = CrosshairGet
+        local size = G("crosshairSize") or "None"
         if size == "None" then
             if crosshairFrame then crosshairFrame:Hide() end
             return
@@ -1715,37 +1848,98 @@ do
 
         CreateCrosshair()
 
-        local c = EllesmereUIDB and EllesmereUIDB.crosshairColor
+        local c = G("crosshairColor")
         local cr = c and c.r or 1
         local cg = c and c.g or 1
         local cb = c and c.b or 1
         local ca = c and c.a or 0.75
 
-        local thickness = (size == "Thin") and 1 or (size == "Thick") and 3 or 2
-        local ARM = PP.Scale(20)
+        -- Preset gives the baseline width/length, sliders override per axis.
+        local preset = EllesmereUI.CROSSHAIR_PRESETS[size] or EllesmereUI.CROSSHAIR_PRESETS.Normal
+        local hWidth = G("crosshairHWidth") or preset.width
+        local vWidth = G("crosshairVWidth") or preset.width
+        local hLen   = G("crosshairHLength") or preset.length
+        local vLen   = G("crosshairVLength") or preset.length
+        local xOff   = G("crosshairXOffset") or 0
+        local yOff   = G("crosshairYOffset") or 0
+        local bSize  = G("crosshairBorderSize") or 0
+        local bc     = G("crosshairBorderColor") or { r = 0, g = 0, b = 0, a = 1 }
 
-        local hBar = crosshairFrame._hBar
-        local vBar = crosshairFrame._vBar
+        -- (0,0) = screen center
+        crosshairFrame:ClearAllPoints()
+        crosshairFrame:SetPoint("CENTER", UIParent, "CENTER", xOff, yOff)
 
-        hBar:SetColorTexture(cr, cg, cb, ca)
+        local hBar, vBar = crosshairFrame._hBar, crosshairFrame._vBar
+        local hBorder, vBorder = crosshairFrame._hBorder, crosshairFrame._vBorder
+
         hBar:ClearAllPoints()
-        hBar:SetPoint("LEFT",  crosshairFrame, "CENTER", -ARM, 0)
-        hBar:SetPoint("RIGHT", crosshairFrame, "CENTER",  ARM, 0)
-        hBar:SetHeight(thickness)
+        hBar:SetSize(PP.Scale(hLen), PP.Scale(hWidth))
+        hBar:SetPoint("CENTER", crosshairFrame, "CENTER", 0, 0)
+        hBar:SetColorTexture(cr, cg, cb, ca)
 
-        vBar:SetColorTexture(cr, cg, cb, ca)
         vBar:ClearAllPoints()
-        vBar:SetPoint("TOP",    crosshairFrame, "CENTER", 0,  ARM)
-        vBar:SetPoint("BOTTOM", crosshairFrame, "CENTER", 0, -ARM)
-        vBar:SetWidth(thickness)
+        vBar:SetSize(PP.Scale(vWidth), PP.Scale(vLen))
+        vBar:SetPoint("CENTER", crosshairFrame, "CENTER", 0, 0)
+        vBar:SetColorTexture(cr, cg, cb, ca)
 
-        crosshairFrame:Show()
+        -- Base colour for the out-of-melee-range recolor, reset the melee state
+        -- so the OnUpdate re-applies the range colour next tick if still needed.
+        crosshairFrame._normalColor = { r = cr, g = cg, b = cb, a = ca }
+        crosshairFrame._meleeActive = false
+
+        -- Pixel border: a slightly larger bar of border colour behind each arm.
+        if bSize and bSize > 0 then
+            local bp = PP.Scale(bSize)
+            local br, bg, bb, ba = bc.r or 0, bc.g or 0, bc.b or 0, bc.a or 1
+            hBorder:ClearAllPoints()
+            hBorder:SetSize(PP.Scale(hLen) + bp * 2, PP.Scale(hWidth) + bp * 2)
+            hBorder:SetPoint("CENTER", crosshairFrame, "CENTER", 0, 0)
+            hBorder:SetColorTexture(br, bg, bb, ba)
+            hBorder:Show()
+            vBorder:ClearAllPoints()
+            vBorder:SetSize(PP.Scale(vWidth) + bp * 2, PP.Scale(vLen) + bp * 2)
+            vBorder:SetPoint("CENTER", crosshairFrame, "CENTER", 0, 0)
+            vBorder:SetColorTexture(br, bg, bb, ba)
+            vBorder:Show()
+        else
+            hBorder:Hide()
+            vBorder:Hide()
+        end
+
+        -- Visibility: always / combat / instances / instances_combat (both).
+        local vis = G("crosshairVisibility") or "always"
+        local inCombat = InCombatLockdown() or UnitAffectingCombat("player")
+        local show = true
+        if vis == "combat" then
+            show = inCombat
+        elseif vis == "instances" then
+            show = IsInInstance()
+        elseif vis == "instances_combat" then
+            show = IsInInstance() and inCombat
+        end
+        if show then crosshairFrame:Show() else crosshairFrame:Hide() end
+    end
+
+    -- Re-evaluate visibility on combat / zone transitions, and refresh the
+    -- cached melee spell when the spec changes.
+    do
+        local visWatch = CreateFrame("Frame")
+        visWatch:RegisterEvent("PLAYER_REGEN_DISABLED")
+        visWatch:RegisterEvent("PLAYER_REGEN_ENABLED")
+        visWatch:RegisterEvent("PLAYER_ENTERING_WORLD")
+        visWatch:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+        visWatch:SetScript("OnEvent", function(_, event)
+            if event == "PLAYER_SPECIALIZATION_CHANGED" or event == "PLAYER_ENTERING_WORLD" then
+                RefreshCrosshairMeleeSpell()
+            end
+            -- _applyCrosshair self-guards: nil DB -> returns, "None" -> hides,
+            -- and runs the one-time migration once the profile DB is ready.
+            if EllesmereUI._applyCrosshair then EllesmereUI._applyCrosshair() end
+        end)
     end
 
     C_Timer.After(1, function()
-        if EllesmereUIDB and EllesmereUIDB.crosshairSize and EllesmereUIDB.crosshairSize ~= "None" then
-            EllesmereUI._applyCrosshair()
-        end
+        if EllesmereUI._applyCrosshair then EllesmereUI._applyCrosshair() end
     end)
 
     ---------------------------------------------------------------------------
@@ -1884,3 +2078,231 @@ do
         end
     end
 end
+
+-------------------------------------------------------------------------------
+--  Hide Error Messages
+--  Swallows the red UIErrorsFrame spam (e.g. "Not enough rage", "Ability is
+--  not ready yet") while keeping a short whitelist of genuinely useful errors
+--  visible. The OnEvent override is only installed while the option is on, so
+--  it costs nothing for anyone who leaves it off.
+-------------------------------------------------------------------------------
+do
+    local origOnEvent
+    local installed = false
+
+    -- Errors worth keeping even while the rest are hidden. Built lazily so we
+    -- only touch the ERR_* globals when someone actually enables the feature.
+    local keep
+    local function BuildKeepList()
+        if keep then return end
+        keep = {}
+        for _, msg in ipairs({
+            ERR_INV_FULL, ERR_QUEST_LOG_FULL, ERR_RAID_GROUP_ONLY,
+            ERR_PARTY_LFG_BOOT_LIMIT, ERR_PARTY_LFG_BOOT_DUNGEON_COMPLETE,
+            ERR_PARTY_LFG_BOOT_IN_COMBAT, ERR_PARTY_LFG_BOOT_IN_PROGRESS,
+            ERR_PARTY_LFG_BOOT_LOOT_ROLLS, ERR_PARTY_LFG_TELEPORT_IN_COMBAT,
+            ERR_PET_SPELL_DEAD, ERR_PLAYER_DEAD,
+            SPELL_FAILED_TARGET_NO_POCKETS, ERR_ALREADY_PICKPOCKETED,
+        }) do
+            if msg then keep[msg] = true end
+        end
+    end
+
+    -- The group-kick "not eligible" line is a format string, so it needs a
+    -- pattern match rather than a plain equality check.
+    local function IsBootNotEligible(err)
+        if type(err) ~= "string" or not ERR_PARTY_LFG_BOOT_NOT_ELIGIBLE_S then return false end
+        local ok, found = pcall(function()
+            return err:find(string.format(ERR_PARTY_LFG_BOOT_NOT_ELIGIBLE_S, ".+"))
+        end)
+        return (ok and found) and true or false
+    end
+
+    local function FilteredOnEvent(self, event, id, err, ...)
+        if event == "UI_ERROR_MESSAGE" then
+            if keep[err] or IsBootNotEligible(err) then
+                return origOnEvent(self, event, id, err, ...)
+            end
+            return
+        end
+        return origOnEvent(self, event, id, err, ...)
+    end
+
+    local function ApplyHideErrorMessages()
+        local on = EllesmereUIDB and EllesmereUIDB.hideErrorMessages
+        if on and not installed then
+            BuildKeepList()
+            origOnEvent = UIErrorsFrame:GetScript("OnEvent")
+            UIErrorsFrame:SetScript("OnEvent", FilteredOnEvent)
+            UIParent:UnregisterEvent("PING_SYSTEM_ERROR")
+            installed = true
+        elseif not on and installed then
+            UIErrorsFrame:SetScript("OnEvent", origOnEvent)
+            origOnEvent = nil
+            UIParent:RegisterEvent("PING_SYSTEM_ERROR")
+            installed = false
+        end
+    end
+    EllesmereUI._applyHideErrorMessages = ApplyHideErrorMessages
+
+    local f = CreateFrame("Frame")
+    f:RegisterEvent("PLAYER_LOGIN")
+    f:SetScript("OnEvent", function(self)
+        self:UnregisterAllEvents()
+        if EllesmereUIDB and EllesmereUIDB.hideErrorMessages then
+            ApplyHideErrorMessages()
+        end
+    end)
+end
+
+-------------------------------------------------------------------------------
+--  Hide Tutorial Pop-ups
+-------------------------------------------------------------------------------
+do
+    local function Enabled()
+        return EllesmereUIDB and EllesmereUIDB.hideTutorials
+    end
+
+    -- "i" circles are MainHelpPlateButtons, matched by a method copied from the
+    -- Blizzard mixin. Blizzard_HelpPlate is load-on-demand; resolve lazily and
+    -- only cache once it exists.
+    local fingerprint
+    local function GetFingerprint()
+        if not fingerprint and MainHelpPlateButtonMixin then
+            fingerprint = MainHelpPlateButtonMixin.ShowTooltip
+        end
+        return fingerprint
+    end
+
+    local hiddenByUs = setmetatable({}, { __mode = "k" })
+    local function HideButton(btn)
+        btn:SetAlpha(0)
+        btn:EnableMouse(false)
+        hiddenByUs[btn] = true
+    end
+
+    -- Hoisted out of the pcall so we reuse one function instead of allocating a
+    -- closure on every call (this runs on each panel open + each HelpTip show).
+    local function DoHideOpenTips()
+        for tip in HelpTip.framePool:EnumerateActive() do
+            if tip:IsShown() then
+                local info = tip.info
+                if info and info.cvarBitfield and info.bitfieldFlag then
+                    SetCVarBitfield(info.cvarBitfield, info.bitfieldFlag, true)
+                end
+                tip:Hide()
+            end
+        end
+    end
+    local function HideOpenTips()
+        if not (HelpTip and HelpTip.framePool and HelpTip.framePool.EnumerateActive) then return end
+        pcall(DoHideOpenTips)
+    end
+
+    local HideButtonsUnder
+    local function ScanChildren(...)
+        for i = 1, select("#", ...) do
+            HideButtonsUnder((select(i, ...)))
+        end
+    end
+    function HideButtonsUnder(root)
+        if not root then return end
+        local fp = GetFingerprint()
+        if not fp then return end
+        if root.ShowTooltip == fp then HideButton(root) end
+        if root.GetChildren then ScanChildren(root:GetChildren()) end
+    end
+
+    -- One-time full walk (no allocation, never on a timer) to catch panels that
+    -- are already open the moment the feature is switched on.
+    local function SweepAll()
+        local fp = GetFingerprint()
+        if not fp then return end
+        local frame = EnumerateFrames()
+        while frame do
+            if frame.ShowTooltip == fp then HideButton(frame) end
+            frame = EnumerateFrames(frame)
+        end
+    end
+
+    local function RestoreButtons()
+        for btn in pairs(hiddenByUs) do
+            btn:SetAlpha(1)
+            btn:EnableMouse(true)
+            hiddenByUs[btn] = nil
+        end
+    end
+
+    -- Core hooks (HelpTip + ShowUIPanel) install once, only via ApplyHideTutorials
+    -- when the feature is enabled. Each body also gates on Enabled().
+    local coreHooked = false
+    local function InstallCoreHooks()
+        if coreHooked then return end
+        coreHooked = true
+        if HelpTip and HelpTip.Show then
+            hooksecurefunc(HelpTip, "Show", function()
+                if Enabled() then HideOpenTips() end
+            end)
+        end
+        if ShowUIPanel then
+            hooksecurefunc("ShowUIPanel", function(frame)
+                if Enabled() and frame then
+                    HideButtonsUnder(frame)
+                    HideOpenTips()
+                end
+            end)
+        end
+    end
+
+    local tooltipHooked = false
+    local function InstallTooltipHook()
+        if tooltipHooked or not HelpPlateTooltip then return end
+        tooltipHooked = true
+        if HelpPlate and HelpPlate.ShowTutorialTooltip then
+            hooksecurefunc(HelpPlate, "ShowTutorialTooltip", function()
+                if Enabled() and HelpPlateTooltip then HelpPlateTooltip:Hide() end
+            end)
+        end
+        if HelpPlateTooltip.Init then
+            hooksecurefunc(HelpPlateTooltip, "Init", function(self)
+                if Enabled() then self:Hide() end
+            end)
+        end
+    end
+
+    local weSetCVar = false
+    local function ApplyHideTutorials()
+        if Enabled() then
+            InstallCoreHooks()
+            InstallTooltipHook()
+            pcall(SetCVar, "hideHelptips", "1")
+            pcall(SetCVar, "showTutorials", "0")
+            weSetCVar = true
+            SweepAll()
+            HideOpenTips()
+        else
+            if weSetCVar then
+                pcall(SetCVar, "hideHelptips", "0")
+                pcall(SetCVar, "showTutorials", "1")
+                weSetCVar = false
+            end
+            RestoreButtons()
+        end
+    end
+    EllesmereUI._applyHideTutorials = ApplyHideTutorials
+
+    local f = CreateFrame("Frame")
+    f:RegisterEvent("PLAYER_LOGIN")
+    f:RegisterEvent("ADDON_LOADED")
+    f:SetScript("OnEvent", function(_, event, addon)
+        if event == "ADDON_LOADED" then
+            -- Gated: nothing is hooked while the feature is off.
+            if addon == "Blizzard_HelpPlate" and Enabled() then
+                InstallTooltipHook()
+            end
+            return
+        end
+        ApplyHideTutorials()  -- PLAYER_LOGIN
+    end)
+end
+
