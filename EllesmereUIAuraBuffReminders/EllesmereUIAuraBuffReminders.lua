@@ -2726,8 +2726,10 @@ local function Refresh()
             end
             -- Pet on Passive: warn when an active pet is set to Passive stance.
             -- Combat-safe: pet command state is not part of the secret system.
+            -- Skip while mounted: the pet is forced to Passive automatically.
             if not suppress and co.enabled.pet_passive ~= false
-               and UnitExists("pet") and not UnitIsDead("pet") then
+               and UnitExists("pet") and not UnitIsDead("pet")
+               and not IsMounted() then
                 local passiveActive, passiveTex, passiveIsToken
                 for i = 1, (NUM_PET_ACTION_SLOTS or 10) do
                     local nm, tx, tok, active = GetPetActionInfo(i)
