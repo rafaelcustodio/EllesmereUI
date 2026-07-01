@@ -116,7 +116,7 @@ end
 local BAR_POOL_SIZE     = 40
 local RANK_STRINGS      = {}
 for i = 1, 40 do RANK_STRINGS[i] = i .. "." end
-local MIN_W, MIN_H      = 150, 80
+local MIN_W, MIN_H      = 150, 50
 local TICK_COMBAT       = 1
 local PEAK_BUDGET       = 1.5
 local BAR_TEX           = "Interface\\Buttons\\WHITE8X8"
@@ -743,7 +743,7 @@ local DM_BAR_TEXTURES = {
     ["gradient-tb"]   = DM_TEX_BASE .. "gradient-tb.tga",
     ["matte"]         = DM_TEX_BASE .. "matte.tga",
     ["sheer"]         = DM_TEX_BASE .. "sheer.tga",
-    ["kringel-diamonds"] = DM_TEX_BASE .. "kringel-diamonds.tga",
+    ["blinkii-diamonds"] = DM_TEX_BASE .. "blinkii-diamonds.tga",
     ["kringel-window"]   = DM_TEX_BASE .. "kringel-window.tga",
 }
 local DM_BAR_TEXTURE_ORDER = {
@@ -753,7 +753,7 @@ local DM_BAR_TEXTURE_ORDER = {
     "divide", "glass",
     "gradient-lr", "gradient-rl", "gradient-bt", "gradient-tb",
     "matte", "sheer",
-    "kringel-diamonds", "kringel-window",
+    "blinkii-diamonds", "kringel-window",
 }
 local DM_BAR_TEXTURE_NAMES = {
     ["none"]        = "None",
@@ -773,7 +773,7 @@ local DM_BAR_TEXTURE_NAMES = {
     ["gradient-tb"] = "Gradient Down",
     ["matte"]       = "Matte",
     ["sheer"]       = "Sheer",
-    ["kringel-diamonds"] = "Kringel Diamonds",
+    ["blinkii-diamonds"] = "Blinkii Diamonds",
     ["kringel-window"]   = "Kringel Window",
 }
 _G._EDM_BarTextures     = DM_BAR_TEXTURES
@@ -899,6 +899,7 @@ local _abbreviateCfg
 local CJK = ({
     zhCN = { thousand = "千", wan = "万", yi = "亿" },
     zhTW = { thousand = "千", wan = "萬", yi = "億" },
+    koKR = { thousand = "천", wan = "만", yi = "억" },
 })[GetLocale()]
 do
     local opts

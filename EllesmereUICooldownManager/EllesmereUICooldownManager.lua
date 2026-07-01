@@ -783,6 +783,31 @@ function ns.RescanBuffSoundFlag()
     end
 end
 
+-- Resolve the configured buff gain/loss sound key for a spell id in the CURRENT
+-- spec by SEARCHING the saved bar spellSettings -- independent of any per-frame
+-- decoration state (_ecmeFC). The first buff gain after login fires its aura alert
+-- BEFORE DecorateFrame populates that state, so the sound path must resolve purely
+-- from the id (GetCanonicalSpellIDForFrame reads cooldownInfo, so it works while the
+-- aura is active). O(bars): spellSettings is keyed by id, so each bar is one index.
+-- Mirrors Ayije, which matches alert-time id candidates against its buff registry
+-- rather than any frame-decoration state.
+function ns.FindBuffSoundKey(sid, field)
+    if not sid then return nil end
+    local specKey = ns.GetActiveSpecKey and ns.GetActiveSpecKey()
+    if not specKey or specKey == "0" then return nil end
+    local sp = SpellStore and SpellStore.GetSpecProfiles and SpellStore.GetSpecProfiles()
+    local prof = sp and sp[specKey]
+    local barSpells = prof and prof.barSpells
+    if not barSpells then return nil end
+    for _, bs in pairs(barSpells) do
+        local ssAll = bs and bs.spellSettings
+        local ss = ssAll and ssAll[sid]
+        local key = ss and ss[field]
+        if key and key ~= "none" then return key end
+    end
+    return nil
+end
+
 -- Audio Effect on CD Ready gate: set ns._cdmAnyCdReadySound once if any saved
 -- cd/utility icon (any spec) has a CD-ready sound chosen. The per-frame
 -- SetDesaturated edge hook then no-ops entirely for anyone who never uses it.
@@ -862,6 +887,49 @@ function ns.RescanCustomItemFlag()
                         end
                     end
                 end
+            end
+        end
+    end
+end
+
+-- Reverse Swipe gate: set ns._cdmAnyReverseSwipe once if any saved spell (any
+-- spec) has the per-spell reverseSwipe toggle on. The reverse-apply in
+-- RefreshCDMIconAppearance is skipped entirely for anyone who never enables it,
+-- so the cooldown keeps its default swipe direction at 0 cost. Monotonic,
+-- scanned-once contract identical to the flags above (the options toggle flips
+-- the flag live on enable).
+-- Also gates hideCDSwipe (Hide CD Swipe): both are monotonic per-spell swipe
+-- flags, scanned together in one pass so neither costs anything until used.
+function ns.RescanReverseSwipeFlag()
+    if ns._reverseSwipeFlagScanned then return end
+    if ns._cdmAnyReverseSwipe and ns._cdmAnyHideCDSwipe then return end
+    local sp = SpellStore and SpellStore.GetSpecProfiles and SpellStore.GetSpecProfiles()
+    if not sp then return end
+    ns._reverseSwipeFlagScanned = true
+    -- Regular per-spell settings (per-bar spellSettings, every spec).
+    for _, prof in pairs(sp) do
+        local barSpells = prof and prof.barSpells
+        if barSpells then
+            for _, bs in pairs(barSpells) do
+                local ssAll = bs and bs.spellSettings
+                if ssAll then
+                    for _, ss in pairs(ssAll) do
+                        if ss then
+                            if ss.reverseSwipe then ns._cdmAnyReverseSwipe = true end
+                            if ss.hideCDSwipe then ns._cdmAnyHideCDSwipe = true end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Preset / custom cd-utility spells (profile-level customActiveStates).
+    local cas = ns.GetCustomActiveStates and ns.GetCustomActiveStates()
+    if cas then
+        for _, e in pairs(cas) do
+            if e then
+                if e.reverseSwipe then ns._cdmAnyReverseSwipe = true end
+                if e.hideCDSwipe then ns._cdmAnyHideCDSwipe = true end
             end
         end
     end
@@ -2524,32 +2592,102 @@ end
 -------------------------------------------------------------------------------
 --  CDM Bar Position Helpers
 -------------------------------------------------------------------------------
-local function ApplyBarPositionCentered(frame, pos, barKey)
-    if not pos or not pos.point then return end
-    local px, py = pos.x or 0, pos.y or 0
-    local anchor = pos.point
 
-    -- Runtime conversion: if a non-CENTER-grow bar still has a CENTER position
-    -- (legacy data, Blizzard import, or dev migration gap), convert to edge
-    -- format for SetPoint so the bar grows from the correct edge.
-    -- No persistence: positions are only saved by unlock mode's Save & Exit.
-    if anchor == "CENTER" and barKey then
-        local bd = barDataByKey[barKey]
-        local grow = bd and bd.growDirection or "CENTER"
-        if grow ~= "CENTER" then
-            local fw = frame:GetWidth() or 0
-            local fh = frame:GetHeight() or 0
-            if grow == "RIGHT" and fw > 0 then
-                anchor = "LEFT"; px = px - fw / 2
-            elseif grow == "LEFT" and fw > 0 then
-                anchor = "RIGHT"; px = px + fw / 2
-            elseif grow == "DOWN" and fh > 0 then
-                anchor = "TOP"; py = py + fh / 2
-            elseif grow == "UP" and fh > 0 then
-                anchor = "BOTTOM"; py = py - fh / 2
-            end
+-- Resolve the frame anchor point for a bar from its growth direction and the
+-- optional "anchor first row" pin.
+--
+-- Without anchorFirstRow this returns the single growth edge (legacy behavior:
+-- RIGHT -> LEFT, DOWN -> TOP, ...) so the fixed edge stays put as the bar
+-- resizes along its growth axis. The perpendicular axis is left unpinned, i.e.
+-- centered -- which is why a horizontal bar re-centers vertically when it grows
+-- a second row.
+--
+-- With anchorFirstRow set, the leading edge on the PERPENDICULAR axis is pinned
+-- too, yielding a corner/edge anchor (e.g. TOPLEFT). Icons lay out from the
+-- frame's TOPLEFT, so the first row sits at the top (horizontal bars) or the
+-- first column at the left (vertical bars); pinning that edge makes extra rows
+-- grow away from the first row instead of re-centering the whole bar.
+-- Defined as ns.* fields (not file-scope locals) to stay under Lua 5.1's
+-- 200-local main-chunk ceiling.
+function ns.ResolveGrowAnchorPoint(barData)
+    local grow = (barData and barData.growDirection) or "CENTER"
+    local horiz, vert  -- "LEFT"/"RIGHT" and "TOP"/"BOTTOM" components
+    if grow == "RIGHT" then
+        horiz = "LEFT"
+    elseif grow == "LEFT" then
+        horiz = "RIGHT"
+    elseif grow == "DOWN" then
+        vert = "TOP"
+    elseif grow == "UP" then
+        vert = "BOTTOM"
+    end
+    if barData and barData.anchorFirstRow then
+        if barData.verticalOrientation then
+            -- Vertical bar: rows stack along the width axis -> pin LEFT.
+            horiz = horiz or "LEFT"
+        else
+            -- Horizontal bar: rows stack along the height axis -> pin TOP.
+            vert = vert or "TOP"
         end
     end
+    local pt = (vert or "") .. (horiz or "")
+    if pt == "" then
+        return "CENTER"
+    end
+    return pt
+end
+
+-- Convert a frame CENTER coord to the coord for anchor point `pt`. An axis with
+-- no LEFT/RIGHT (or TOP/BOTTOM) component keeps the center; a zero-extent frame
+-- yields a zero offset, so this is safe for empty bars.
+function ns.CenterToAnchorCoord(pt, x, y, fw, fh)
+    local sx, sy = x, y
+    if pt:find("LEFT", 1, true) then
+        sx = x - fw / 2
+    elseif pt:find("RIGHT", 1, true) then
+        sx = x + fw / 2
+    end
+    if pt:find("TOP", 1, true) then
+        sy = y + fh / 2
+    elseif pt:find("BOTTOM", 1, true) then
+        sy = y - fh / 2
+    end
+    return sx, sy
+end
+
+-- Inverse of CenterToAnchorCoord: recover the frame CENTER coord from a stored
+-- anchor-point coord. Round-trips losslessly for edges, corners, and CENTER.
+function ns.AnchorCoordToCenter(pt, sx, sy, fw, fh)
+    local x, y = sx, sy
+    if pt:find("LEFT", 1, true) then
+        x = sx + fw / 2
+    elseif pt:find("RIGHT", 1, true) then
+        x = sx - fw / 2
+    end
+    if pt:find("TOP", 1, true) then
+        y = sy - fh / 2
+    elseif pt:find("BOTTOM", 1, true) then
+        y = sy + fh / 2
+    end
+    return x, y
+end
+
+local function ApplyBarPositionCentered(frame, pos, barKey)
+    if not pos or not pos.point then return end
+    local fw = frame:GetWidth() or 0
+    local fh = frame:GetHeight() or 0
+
+    -- Re-derive the anchor from the bar's CURRENT growth + first-row settings.
+    -- Recover the frame center from the stored anchor coord, then re-project it
+    -- onto the resolved anchor point. This keeps the growth edge fixed across
+    -- size changes (edge preservation), transparently upgrades legacy CENTER /
+    -- edge positions (Blizzard import, dev migration gap), and lets the "anchor
+    -- first row" toggle take effect without re-dragging -- all as a lossless
+    -- coordinate round-trip. No persistence: positions are only saved by unlock
+    -- mode's Save & Exit.
+    local cx, cy = ns.AnchorCoordToCenter(pos.point, pos.x or 0, pos.y or 0, fw, fh)
+    local anchor = barKey and ns.ResolveGrowAnchorPoint(barDataByKey[barKey]) or "CENTER"
+    local px, py = ns.CenterToAnchorCoord(anchor, cx, cy, fw, fh)
 
     -- Snap to physical pixel grid. For CENTER anchor, use SnapCenterForDim
     -- to preserve the +0.5 offset that odd-pixel-dim frames need so their
@@ -2559,8 +2697,6 @@ local function ApplyBarPositionCentered(frame, pos, barKey)
     if PPa then
         local es = frame:GetEffectiveScale()
         if anchor == "CENTER" and PPa.SnapCenterForDim then
-            local fw = frame:GetWidth() or 0
-            local fh = frame:GetHeight() or 0
             px = PPa.SnapCenterForDim(px, fw, es)
             py = PPa.SnapCenterForDim(py, fh, es)
         elseif PPa.SnapForES then
@@ -2582,52 +2718,36 @@ local function SaveCDMBarPosition(barKey, frame)
     local uiW, uiH = UIParent:GetSize()
     local ratio = fScale / uiScale
 
-    -- Determine anchor point from grow direction so the bar's fixed edge
-    -- stays put when icon count changes (spec swaps, combat buff churn).
+    -- Determine anchor point from grow direction (and the "anchor first row"
+    -- pin) so the bar's fixed edge/corner stays put when icon count changes
+    -- (spec swaps, combat buff churn, a row spilling in/out).
     local bd = barDataByKey[barKey]
-    local grow = bd and bd.growDirection or "CENTER"
-    local pt
-    if grow == "RIGHT" then pt = "LEFT"
-    elseif grow == "LEFT"  then pt = "RIGHT"
-    elseif grow == "DOWN"  then pt = "TOP"
-    elseif grow == "UP"    then pt = "BOTTOM"
-    elseif grow == "CENTER" then pt = "CENTER"
-    else                        pt = "CENTER"
-    end
+    local pt = ns.ResolveGrowAnchorPoint(bd)
 
+    -- Read each axis from the matching frame edge (corner points pin both).
+    local cx, cy = frame:GetCenter()
+    if not cx or not cy then return end
     local ax, ay
-    if pt == "LEFT" then
+    if pt:find("LEFT", 1, true) then
         local lx = frame:GetLeft()
         if not lx then return end
-        local cy = select(2, frame:GetCenter())
-        if not cy then return end
         ax = lx * ratio
-        ay = cy * ratio
-    elseif pt == "RIGHT" then
+    elseif pt:find("RIGHT", 1, true) then
         local rx = frame:GetRight()
         if not rx then return end
-        local cy = select(2, frame:GetCenter())
-        if not cy then return end
         ax = rx * ratio
-        ay = cy * ratio
-    elseif pt == "TOP" then
-        local cx = frame:GetCenter()
-        if not cx then return end
+    else
+        ax = cx * ratio
+    end
+    if pt:find("TOP", 1, true) then
         local ty = frame:GetTop()
         if not ty then return end
-        ax = cx * ratio
         ay = ty * ratio
-    elseif pt == "BOTTOM" then
-        local cx = frame:GetCenter()
-        if not cx then return end
+    elseif pt:find("BOTTOM", 1, true) then
         local by = frame:GetBottom()
         if not by then return end
-        ax = cx * ratio
         ay = by * ratio
-    elseif pt == "CENTER" then
-        local cx, cy = frame:GetCenter()
-        if not cx or not cy then return end
-        ax = cx * ratio
+    else
         ay = cy * ratio
     end
 
@@ -2637,6 +2757,20 @@ local function SaveCDMBarPosition(barKey, frame)
         x = (ax - uiW / 2) / scale,
         y = (ay - uiH / 2) / scale,
     }
+end
+
+-- Re-persist a bar's saved position in its CURRENT anchor format from live
+-- geometry. Needed when the "anchor first row" toggle flips: a stored center /
+-- single-edge position can't pin the first-row edge across row changes -- only
+-- a stored corner can -- so we recapture the corner from where the bar sits
+-- right now. Guarded to free-standing bars (snapped bars are owned by the unlock
+-- anchor system, which reads unlockAnchors, not cdmBarPositions).
+function ns.RecaptureBarAnchor(barKey)
+    local frame = cdmBarFrames[barKey]
+    if not frame then return end
+    if EllesmereUI.IsUnlockAnchored and EllesmereUI.IsUnlockAnchored("CDM_" .. barKey) then return end
+    if not frame:GetLeft() then return end
+    SaveCDMBarPosition(barKey, frame)
 end
 
 -------------------------------------------------------------------------------
@@ -3045,21 +3179,34 @@ BuildCDMBar = function(barIndex)
     frame:Show()
 end
 
--- Compute stride respecting topRowCount override (only for numRows == 2)
+-- Compute stride respecting the custom row-count override (only for numRows == 2).
+-- Two MUTUALLY EXCLUSIVE overrides both resolve to an effective TOP-row count:
+--   * Custom Top Row Count    -> topRowCount icons on the top row.
+--   * Custom Bottom Row Count -> bottomRowCount icons on the bottom row; the top
+--     row gets the remainder (the flipped form of the top override).
+-- Mutual exclusivity is enforced in options; if both somehow set, top wins.
 local function ComputeTopRowStride(barData, count)
     local numRows = barData.numRows or 1
     if numRows < 1 then numRows = 1 end
-    if numRows == 2 and barData.customTopRowEnabled and barData.topRowCount and barData.topRowCount > 0 then
-        local topCount = math.min(barData.topRowCount, count)
-        local bottomCount = count - topCount
-        -- Custom top-row mode only spills into a second row once the icon count
-        -- actually exceeds the top-row count. Until then, report ONE effective
-        -- row so the bar doesn't reserve space for (or lay out) an empty second
-        -- row. The second row appears the moment a bottom-row icon exists.
-        if bottomCount <= 0 then
-            return topCount, 1, topCount
+    if numRows == 2 then
+        local topCount
+        if barData.customTopRowEnabled and barData.topRowCount and barData.topRowCount > 0 then
+            topCount = math.min(barData.topRowCount, count)
+        elseif barData.customBottomRowEnabled and barData.bottomRowCount and barData.bottomRowCount > 0 then
+            topCount = count - math.min(barData.bottomRowCount, count)
         end
-        return math.max(topCount, bottomCount), numRows, topCount
+        if topCount then
+            if topCount < 0 then topCount = 0 end
+            local bottomCount = count - topCount
+            -- Custom-row mode only uses a second row once BOTH rows are non-empty.
+            -- Until then, report ONE effective row so the bar doesn't reserve or
+            -- lay out an empty row. The second row appears the moment both rows
+            -- hold at least one icon.
+            if bottomCount <= 0 or topCount <= 0 then
+                return count, 1, count
+            end
+            return math.max(topCount, bottomCount), numRows, topCount
+        end
     end
     local stride = math.ceil(count / numRows)
     local topCount = count - (numRows - 1) * stride
@@ -3727,8 +3874,19 @@ ApplyShapeToCDMIcon = function(icon, shape, barData, ssb)
                 extraCrop = (1 - 2 * zoom) / (2 * (baseW + 1))
             end
             if shape == "cropped" then
+                -- Cropped applies a heavy vertical TexCoord crop. With default
+                -- pixel/texel snapping the cropped image edge can round to a
+                -- different physical pixel than the (unsnapped) cooldown swipe,
+                -- producing a 1px swipe/icon split on fractional frame positions
+                -- at certain effective scales. Disable snapping so the image
+                -- renders to its exact rect, matching the swipe. No size change.
+                if tex.SetSnapToPixelGrid then tex:SetSnapToPixelGrid(false) end
+                if tex.SetTexelSnappingBias then tex:SetTexelSnappingBias(0) end
                 tex:SetTexCoord(zoom, 1 - zoom, zoom + 0.10 + extraCrop, 1 - zoom - 0.10 - extraCrop)
             else
+                -- Restore default grid snapping for non-cropped shapes so an
+                -- icon previously set to cropped stays crisp after switching.
+                if tex.SetSnapToPixelGrid then tex:SetSnapToPixelGrid(true) end
                 tex:SetTexCoord(zoom, 1 - zoom, zoom + extraCrop, 1 - zoom - extraCrop)
             end
         end
@@ -4006,10 +4164,10 @@ local function RefreshCDMIconAppearance(barKey)
         if ns._cdmAnyChargeHideCdText and not isBuffFamilyBar and ns.WatchChargeCdTextIfEnabled then
             ns.WatchChargeCdTextIfEnabled(icon)
         end
-        -- Same login/refresh coverage for "Audio Effect on CD Ready" on CHARGE spells:
-        -- they fire at max charges, which the SetDesaturated edge never signals, so
-        -- register them on the SPELL_UPDATE_CHARGES watcher here. Gated on the feature
-        -- flag; non-charge spells self-skip inside WatchCdReadySoundIfEnabled.
+        -- Login/refresh coverage for "Audio Effect on CD Ready": register every
+        -- cd/utility icon with the sound onto the event-driven watcher
+        -- (SPELL_UPDATE_COOLDOWN + SPELL_UPDATE_CHARGES). Both charge and non-charge
+        -- spells are handled there; icons without the sound self-skip inside.
         if ns._cdmAnyCdReadySound and not isBuffFamilyBar and ns.WatchCdReadySoundIfEnabled then
             ns.WatchCdReadySoundIfEnabled(icon)
         end
@@ -4082,6 +4240,65 @@ local function RefreshCDMIconAppearance(barKey)
             local showCD = barData.showCooldownText
             if ssb and ssb.showCooldownText ~= nil then showCD = ssb.showCooldownText end
             cd:SetSwipeColor(0, 0, 0, barData.swipeAlpha or 0.7)
+            -- Per-spell Reverse Swipe: flips this icon's swipe direction away from
+            -- the bar default (buffs fill up, cooldowns deplete). Entire block is
+            -- gated by the session flag, so it is ZERO cost / ZERO behavior change
+            -- unless at least one spell has the toggle on -- the cooldown then keeps
+            -- DecorateFrame's default. Resolves the frame's CURRENT spell each pass
+            -- (so pool reuse + talent overrides stay correct) and re-asserts on every
+            -- refresh, so toggling off restores the default. Not a per-tick path.
+            if ns._cdmAnyReverseSwipe then
+                local rfBuff = (barData.barType == "buffs" or barKey == "buffs" or barData.barType == "custom_buff")
+                local rfReverse = rfBuff
+                local rfFc = _ecmeFC[icon]
+                local rfSid = rfFc and rfFc.spellID
+                if rfSid then
+                    -- Regular per-spell setting (per-bar spellSettings).
+                    local rev
+                    if ns.ResolveSpellSettings then
+                        local rfSs = ns.ResolveSpellSettings(icon, rfSid, ns.GetBarSpellData(barKey))
+                        rev = rfSs and rfSs.reverseSwipe
+                    end
+                    -- Preset / custom cd-utility spell setting (profile customActiveStates).
+                    if not rev and ns.GetCustomActiveState then
+                        local casKey = (ns.ResolveCustomActiveKey and ns.ResolveCustomActiveKey(rfSid)) or rfSid
+                        local cas = ns.GetCustomActiveState(casKey)
+                        rev = cas and cas.reverseSwipe
+                    end
+                    if rev then rfReverse = not rfBuff end
+                end
+                cd:SetReverse(rfReverse)
+            end
+            -- Per-spell Hide CD Swipe: removes the cooldown swipe entirely for
+            -- cd/utility spells (non-charge -- charge spells use "Hide Swipe (Charges)").
+            -- Gated by the session flag, so zero cost unless someone enables it. Applied
+            -- here for immediate feedback; the SetDrawSwipe hook keeps it off against
+            -- Blizzard's re-pushes. Re-asserts (not hide) each pass so toggling off
+            -- restores the default swipe -- matching the hook's non-charge force-true.
+            if ns._cdmAnyHideCDSwipe and cd.SetDrawSwipe then
+                local isCharge = type(icon.HasVisualDataSource_Charges) == "function"
+                    and icon:HasVisualDataSource_Charges()
+                if not isCharge then
+                    local hsFc = _ecmeFC[icon]
+                    local hsSid = hsFc and hsFc.spellID
+                    local hideSw
+                    if hsSid then
+                        if ns.ResolveSpellSettings then
+                            local hsSs = ns.ResolveSpellSettings(icon, hsSid, ns.GetBarSpellData(barKey))
+                            hideSw = hsSs and hsSs.hideCDSwipe
+                        end
+                        if not hideSw and ns.GetCustomActiveState then
+                            local casKey = (ns.ResolveCustomActiveKey and ns.ResolveCustomActiveKey(hsSid)) or hsSid
+                            local casH = ns.GetCustomActiveState(casKey)
+                            hideSw = casH and casH.hideCDSwipe
+                        end
+                    end
+                    local fd = ns._hookFrameData and ns._hookFrameData[icon]
+                    if fd then fd._isProcessingOverride = true end
+                    cd:SetDrawSwipe(not hideSw)
+                    if fd then fd._isProcessingOverride = false end
+                end
+            end
             -- Per-spell "Hide CD Text (Charges)" can additionally hide the recharge
             -- numbers while a charge is in hand; the font block below still styles
             -- the text (using the bar's showCD) so it is ready when numbers return.
@@ -4302,6 +4519,12 @@ local function RefreshCDMIconAppearance(barKey)
                     local hide = (cse == "hiddenOnCD") == onCD
                     icon:SetAlpha(hide and 0 or (barData.barOpacity or 1))
                     if fc then fc._cdStateHidden = hide or false end
+                elseif cse == "lowerAlphaOnCD" then
+                    -- Identical to hiddenOnCD but with a customizable opacity instead
+                    -- of 0. Reuse the _cdStateHidden flag as "cd-state owns this alpha"
+                    -- so the opacity appliers leave the lowered value alone.
+                    icon:SetAlpha(onCD and (csSs.cdStateLowerAlpha or 0.5) or (barData.barOpacity or 1))
+                    if fc then fc._cdStateHidden = onCD or false end
                 else
                     -- Clear stale hidden state when switching to a glow effect
                     if fc and fc._cdStateHidden then
@@ -4688,16 +4911,27 @@ do
     -- the spell-setting key ("buffActiveSoundKey" gain / "buffLostSoundKey" loss);
     -- `throttle` is the matching dedupe table. Identical resolution for both edges.
     local function PlayBuffEdgeSound(f, field, throttle)
-        local fc = _ecmeFC[f]
-        local barKey = fc and fc.barKey
-        if not barKey then return end
-        local sd = ns.GetBarSpellData and ns.GetBarSpellData(barKey)
-        if not sd or not sd.spellSettings then return end
+        -- Loading screen / login settle: buffs re-apply and viewer frames re-show
+        -- across a zone/login, firing phantom apply/remove alerts. Drop them.
+        if ns._cdmSoundSuppressed and ns._cdmSoundSuppressed() then return end
         local sid = ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(f)
         if not sid then return end
-        local ss = (ns.ResolveSpellSettings and ns.ResolveSpellSettings(f, sid, sd))
-            or sd.spellSettings[sid]
-        local key = ss and ss[field]
+        -- Preferred: the frame's decorated context (fast; ResolveSpellSettings also
+        -- handles variant/override spells). Falls back to an id-only lookup for the
+        -- FIRST gain after login, whose alert fires before DecorateFrame populates
+        -- _ecmeFC -- keying off that context dropped the very first cue.
+        local key
+        local fc = _ecmeFC[f]
+        local barKey = fc and fc.barKey
+        if barKey then
+            local sd = ns.GetBarSpellData and ns.GetBarSpellData(barKey)
+            if sd and sd.spellSettings then
+                local ss = (ns.ResolveSpellSettings and ns.ResolveSpellSettings(f, sid, sd))
+                    or sd.spellSettings[sid]
+                key = ss and ss[field]
+            end
+        end
+        if not key then key = ns.FindBuffSoundKey and ns.FindBuffSoundKey(sid, field) end
         if not key or key == "none" then return end
         local now = GetTime()
         local last = throttle[sid]
@@ -5520,6 +5754,7 @@ BuildAllCDMBars = function()
     ns.RescanBuffSoundFlag()      -- set the Audio on Buff Gain/Loss gate (once) before refresh
     ns.RescanCdReadySoundFlag()   -- set the Audio Effect on CD Ready gate (once) before refresh
     ns.RescanCustomItemFlag()     -- set the custom-item buff-injection gate (once)
+    ns.RescanReverseSwipeFlag()   -- set the Reverse Swipe gate (once) before refresh
 
     local p = ECME.db.profile
 
@@ -5952,18 +6187,42 @@ function ns.ReseedAssignedSpellsFromLiveIcons()
                 for _, existing in ipairs(sd.assignedSpells) do
                     seen[existing] = true
                 end
+                -- Insert each missing spell right after its left neighbour in the
+                -- live icon order (which CollectAndReanchor has already placed in
+                -- Blizzard-layout order), instead of appending at the end. This keeps
+                -- the seeded list matching what the player sees so re-talenting a
+                -- cooldown restores it to its Blizzard-CDM slot rather than the tail.
+                local insertAfterSid = nil
                 for _, icon in ipairs(icons) do
                     local fc = ns._ecmeFC and ns._ecmeFC[icon]
                     local sid = fc and fc.spellID
-                    if type(sid) == "number" and sid > 0 and not seen[sid] then
-                        -- Never materialize a hidden (ghosted) spell, or a spell a
-                        -- DIFFERENT bar already owns (variant-aware).
-                        local owner = ownerOf and ns.ResolveVariantValue
-                                      and ns.ResolveVariantValue(ownerOf, sid)
-                        local ghosted = ghostList and FindVar and FindVar(ghostList, sid)
-                        if not ghosted and not (owner and owner ~= barData.key) then
-                            sd.assignedSpells[#sd.assignedSpells + 1] = sid
-                            seen[sid] = true
+                    if type(sid) == "number" and sid ~= 0 then
+                        if seen[sid] then
+                            -- Already has a slot (Blizzard spell OR a custom trinket/
+                            -- item marker): advance the cursor so the next NEW spell
+                            -- lands after it, matching the on-screen order.
+                            insertAfterSid = sid
+                        elseif sid > 0 then
+                            -- Never materialize a hidden (ghosted) spell, or a spell a
+                            -- DIFFERENT bar already owns (variant-aware).
+                            local owner = ownerOf and ns.ResolveVariantValue
+                                          and ns.ResolveVariantValue(ownerOf, sid)
+                            local ghosted = ghostList and FindVar and FindVar(ghostList, sid)
+                            if not ghosted and not (owner and owner ~= barData.key) then
+                                local pos
+                                if insertAfterSid then
+                                    for i = 1, #sd.assignedSpells do
+                                        if sd.assignedSpells[i] == insertAfterSid then pos = i; break end
+                                    end
+                                end
+                                if pos then
+                                    table.insert(sd.assignedSpells, pos + 1, sid)
+                                else
+                                    table.insert(sd.assignedSpells, 1, sid)
+                                end
+                                seen[sid] = true
+                                insertAfterSid = sid
+                            end
                         end
                     end
                 end
@@ -6178,21 +6437,20 @@ RegisterCDMUnlockElements = function()
                     local bd2 = barDataByKey[key]
                     local grow = bd2 and bd2.growDirection
                     local frame = cdmBarFrames[key]
-                    if grow and grow ~= "CENTER" and frame then
+                    -- Store at the growth edge (and, when "anchor first row" is
+                    -- on, the first-row corner) so SetSize grows naturally from
+                    -- the fixed edge/corner. Unlock mode always provides CENTER
+                    -- coords; convert to the resolved anchor. Skip a conversion
+                    -- on any axis with no extent yet (empty bar).
+                    local resolved = ns.ResolveGrowAnchorPoint(bd2)
+                    if resolved ~= "CENTER" and frame then
                         local fw = frame:GetWidth() or 0
                         local fh = frame:GetHeight() or 0
-                        if grow == "RIGHT" and fw > 0 then
-                            storePoint = "LEFT"
-                            storeX = x - fw / 2
-                        elseif grow == "LEFT" and fw > 0 then
-                            storePoint = "RIGHT"
-                            storeX = x + fw / 2
-                        elseif grow == "DOWN" and fh > 0 then
-                            storePoint = "TOP"
-                            storeY = y + fh / 2
-                        elseif grow == "UP" and fh > 0 then
-                            storePoint = "BOTTOM"
-                            storeY = y - fh / 2
+                        local needW = resolved:find("LEFT", 1, true) or resolved:find("RIGHT", 1, true)
+                        local needH = resolved:find("TOP", 1, true) or resolved:find("BOTTOM", 1, true)
+                        if (not needW or fw > 0) and (not needH or fh > 0) then
+                            storePoint = resolved
+                            storeX, storeY = ns.CenterToAnchorCoord(resolved, x, y, fw, fh)
                         end
                     end
                     -- Phase 2 follow baseline: capture the anchor target's center
@@ -6225,24 +6483,15 @@ RegisterCDMUnlockElements = function()
                 loadPos = function()
                     local pos = ECME.db.profile.cdmBarPositions[key]
                     if not pos or not pos.point then return pos end
-                    -- Convert edge-stored positions back to CENTER for the
+                    -- Convert edge/corner-stored positions back to CENTER for the
                     -- unlock mode system (it always works with CENTER coords).
                     local pt = pos.point
-                    if pt == "LEFT" or pt == "RIGHT" or pt == "TOP" or pt == "BOTTOM" then
+                    if pt ~= "CENTER" and pt ~= "" then
                         local frame = cdmBarFrames[key]
                         if frame then
                             local fw = frame:GetWidth() or 0
                             local fh = frame:GetHeight() or 0
-                            local cx, cy = pos.x or 0, pos.y or 0
-                            if pt == "LEFT" then
-                                cx = cx + fw / 2
-                            elseif pt == "RIGHT" then
-                                cx = cx - fw / 2
-                            elseif pt == "TOP" then
-                                cy = cy - fh / 2
-                            elseif pt == "BOTTOM" then
-                                cy = cy + fh / 2
-                            end
+                            local cx, cy = ns.AnchorCoordToCenter(pt, pos.x or 0, pos.y or 0, fw, fh)
                             return { point = "CENTER", relPoint = pos.relPoint, x = cx, y = cy }
                         end
                     end
@@ -7322,6 +7571,49 @@ SlashCmdList.CDMDBG = function()
     end
 
     P("=== END SNAPSHOT ===")
+end
+
+-------------------------------------------------------------------------------
+-- /euiorder -- focused talent-swap order probe (TEMP DEBUG). For each CD/util
+-- bar, dumps the stored assignedSpells order and the rendered order with each
+-- icon's sortOrder. sortOrder 99999 (= [end]) means the spell wasn't found in
+-- assignedSpells and got sorted to the end (spillover). Run before/after a
+-- talent swap to see whether a re-talented spell keeps its slot.
+-------------------------------------------------------------------------------
+SLASH_EUIORDER1 = "/euiorder"
+SlashCmdList.EUIORDER = function()
+    local ACCENT = "|cff0cd29f"; local DIM = "|cff7f7f7f"; local BAD = "|cffff5555"; local OFF = "|r"
+    local function P(s) print(ACCENT .. "[Order]" .. OFF .. " " .. s) end
+    local function NM(sid)
+        if type(sid) ~= "number" or sid <= 0 then return tostring(sid) end
+        local n = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(sid)
+        return sid .. ":" .. tostring(n or "?")
+    end
+    local p = ECME.db and ECME.db.profile
+    if not p or not p.cdmBars then P("no profile") return end
+    for _, bd in ipairs(p.cdmBars.bars) do
+        if bd.enabled and not bd.isGhostBar
+           and bd.barType ~= "buffs" and bd.barType ~= "custom_buff" and bd.key ~= "buffs" then
+            local sd = ns.GetBarSpellData(bd.key)
+            local list = sd and sd.assignedSpells
+            local parts = {}
+            if list then for i, sid in ipairs(list) do parts[i] = i .. ")" .. NM(sid) end end
+            P(ACCENT .. bd.key .. OFF .. " assigned(" .. (list and #list or 0) .. "): "
+                .. (next(parts) and table.concat(parts, "  ") or (DIM .. "(empty)" .. OFF)))
+            local icons = ns.cdmBarIcons and ns.cdmBarIcons[bd.key]
+            local rparts = {}
+            if icons then
+                for i = 1, #icons do
+                    local fc = ns._ecmeFC and ns._ecmeFC[icons[i]]
+                    local sid = fc and fc.spellID
+                    local so = fc and fc.sortOrder
+                    rparts[i] = i .. ")" .. NM(sid) .. ":so=" .. tostring(so) .. ((so == 99999) and (BAD .. "[end]" .. OFF) or "")
+                end
+            end
+            P("   rendered(" .. (icons and #icons or 0) .. "): "
+                .. (next(rparts) and table.concat(rparts, "  ") or (DIM .. "(none)" .. OFF)))
+        end
+    end
 end
 
 -------------------------------------------------------------------------------

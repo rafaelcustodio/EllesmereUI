@@ -2388,48 +2388,137 @@ do
     end
     EllesmereUI.GetCrosshairValue = CrosshairGet
 
-    -- Melee-range detection, use a per-spec melee-range spell
-    local SPEC_SPELLS = {
-        [65]   = 853,    [66]   = 96231,  [70]   = 96231,             -- Paladin (Holy: Hammer of Justice 10yd; Ret/Prot: Rebuke)
-        [250]  = 316239, [251]  = 316239, [252]  = 316239,            -- Death Knight
-        [577]  = 162794, [581]  = 344859, [1480] = 473662,            -- Demon Hunter
-        [255]  = 186270,                                              -- Hunter (Survival)
-        [102]  = 5221,   [103]  = 5221,   [104]  = 5221, [105] = 5221,-- Druid (gated by form)
-        [268]  = 205523, [269]  = 205523, [270]  = 205523,            -- Monk
-        [71]   = 1464,   [72]   = 1464,   [73]   = 23922,             -- Warrior
-        [263]  = 17364,                                               -- Shaman (Enhancement)
-        [259]  = 1752,   [260]  = 1752,   [261]  = 1752,              -- Rogue
-        [1467] = 362969, [1468] = 362969, [1473] = 362969,            -- Evoker
+    -- Item-based range detection for all specs
+    local rangedSpecIDs = {
+        [102] = true, [105] = true, -- Druid: Balance, Resto
+        [1467] = true, [1468] = true, [1470] = true, -- Evoker: Devastation, Preservation, Augmentation
+        [253] = true, [254] = true, -- Hunter: Beast Mastery, Marksmanship
+        [62] = true, [63] = true, [64] = true, -- Mage: Arcane, Fire, Frost
+        [270] = true, -- Monk: Mistweaver
+        [65] = true, -- Paladin: Holy
+        [256] = true, [257] = true, [258] = true, -- Priest: Discipline, Holy, Shadow
+        [262] = true, [264] = true, -- Shaman: Elemental, Restoration
+        [265] = true, [266] = true, [267] = true, -- Warlock: Affliction, Demonology, Destruction
     }
+
+    local checkItems = {
+        { range = 5,   id = 37727 }, -- Ruby Acorn
+        { range = 8,   id = 34368 }, -- Attuned Crystal Cores
+        { range = 10,  id = 10699 }, -- Handful of Snowflakes
+        { range = 15,  id = 31129 }, -- Blackwhelp Net
+        { range = 20,  id = 21519 }, -- Mistletoe
+        { range = 25,  id = 13289 }, -- Egan's Blaster
+        { range = 30,  id = 17202 }, -- Snowball
+        { range = 35,  id = 18904 }, -- Zorbin's Ultra-Shrinker
+        { range = 40,  id = 18640 }, -- Happy Fun Rock
+        { range = 45,  id = 32698 }, -- Wrangling Rope
+        { range = 60,  id = 32825 }, -- Soul Cannon
+        { range = 80,  id = 35278 }, -- Reinforced Net
+    }
+
     local DRUID_MELEE_FORMS = { [1] = true, [2] = true }  -- Bear, Cat
 
     local _, _chPlayerClass = UnitClass("player")
-    local _meleeSpell  -- cached melee spell for the current spec (nil = ranged spec)
+    local _crosshairCutoffRange = 5
 
-    local function RefreshCrosshairMeleeSpell()
-        local specID
-        if PlayerUtil and PlayerUtil.GetCurrentSpecID then
-            specID = PlayerUtil.GetCurrentSpecID()
-        elseif GetSpecialization then
-            local idx = GetSpecialization()
-            if idx then specID = (GetSpecializationInfo(idx)) end
+    local function RefreshCrosshairCutoffRange()
+        local _, classFile = UnitClass("player")
+        local specIndex = GetSpecialization()
+        if not specIndex then
+            _crosshairCutoffRange = 5
+            return
         end
-        _meleeSpell = (specID and SPEC_SPELLS[specID]) or nil
+        
+        local specID = GetSpecializationInfo(specIndex)
+        if not specID then
+            _crosshairCutoffRange = 5
+            return
+        end
+        
+        if classFile == "DRUID" then
+            if specID == 102 or specID == 105 then -- Balance, Restoration
+                if IsPlayerSpell(197488) then -- Astral Influence
+                    _crosshairCutoffRange = 45
+                else
+                    _crosshairCutoffRange = 40
+                end
+            else
+                _crosshairCutoffRange = 5
+            end
+        elseif classFile == "DEMONHUNTER" then
+            if specIndex == 3 or (specID ~= 577 and specID ~= 581) then
+                _crosshairCutoffRange = 25 -- Devourer
+            else
+                _crosshairCutoffRange = 5
+            end
+        elseif classFile == "EVOKER" then
+            if specID == 1467 or specID == 1470 then -- Devastation, Augmentation
+                _crosshairCutoffRange = 25
+            elseif specID == 1468 then -- Preservation
+                _crosshairCutoffRange = 30
+            else
+                _crosshairCutoffRange = 25
+            end
+        elseif classFile == "HUNTER" then
+            if specID == 253 or specID == 254 then -- Beast Mastery, Marksmanship
+                _crosshairCutoffRange = 40
+            else
+                _crosshairCutoffRange = 5
+            end
+        elseif classFile == "PALADIN" then
+            if specID == 65 then -- Holy
+                _crosshairCutoffRange = 40
+            else
+                _crosshairCutoffRange = 5
+            end
+        elseif classFile == "SHAMAN" then
+            if specID == 263 then -- Enhancement
+                _crosshairCutoffRange = 5
+            else
+                _crosshairCutoffRange = 40
+            end
+        elseif classFile == "MONK" then
+            if specID == 270 then -- Mistweaver
+                _crosshairCutoffRange = 40
+            else
+                _crosshairCutoffRange = 5
+            end
+        elseif classFile == "PRIEST" or classFile == "MAGE" or classFile == "WARLOCK" then
+            _crosshairCutoffRange = 40
+        else -- WARRIOR, ROGUE, DEATHKNIGHT
+            _crosshairCutoffRange = 5
+        end
     end
-    RefreshCrosshairMeleeSpell()
+    RefreshCrosshairCutoffRange()
 
-    -- True only when there is an attackable, living target out of melee range.
-    -- Druids count only while in a melee form (Cat/Bear).
-    local function TargetOutOfMelee()
-        if not _meleeSpell then return false end
-        if _chPlayerClass == "DRUID" and not DRUID_MELEE_FORMS[GetShapeshiftForm()] then
-            return false
+    EllesmereUI._getCrosshairCutoffRange = function()
+        if _chPlayerClass == "DRUID" and DRUID_MELEE_FORMS[GetShapeshiftForm()] then
+            return 5
         end
+        return _crosshairCutoffRange
+    end
+
+    -- True only when there is an attackable, living target out of range.
+    local function TargetOutOfRange()
         if not (UnitExists("target") and UnitCanAttack("player", "target")
                 and not UnitIsDead("target")) then
             return false
         end
-        return C_Spell.IsSpellInRange(_meleeSpell, "target") == false
+        local cutoff = EllesmereUI._getCrosshairCutoffRange()
+        
+        local maxRange = nil
+        for _, item in ipairs(checkItems) do
+            local inRange = C_Item.IsItemInRange(item.id, "target")
+            if inRange == true then
+                maxRange = item.range
+                break
+            end
+            if item.range >= cutoff then
+                break
+            end
+        end
+        
+        return (maxRange == nil) or (maxRange > cutoff)
     end
 
     local function CreateCrosshair()
@@ -2481,7 +2570,7 @@ do
                 end
                 return
             end
-            local outOfRange = TargetOutOfMelee()
+            local outOfRange = TargetOutOfRange()
             if outOfRange ~= self._meleeActive then
                 self._meleeActive = outOfRange
                 -- Recolor the arms only when the colour feature is on; otherwise
@@ -2621,9 +2710,10 @@ do
         visWatch:RegisterEvent("PLAYER_REGEN_ENABLED")
         visWatch:RegisterEvent("PLAYER_ENTERING_WORLD")
         visWatch:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+        visWatch:RegisterEvent("TRAIT_CONFIG_UPDATED")
         visWatch:SetScript("OnEvent", function(_, event)
-            if event == "PLAYER_SPECIALIZATION_CHANGED" or event == "PLAYER_ENTERING_WORLD" then
-                RefreshCrosshairMeleeSpell()
+            if event == "PLAYER_SPECIALIZATION_CHANGED" or event == "PLAYER_ENTERING_WORLD" or event == "TRAIT_CONFIG_UPDATED" then
+                RefreshCrosshairCutoffRange()
             end
             -- _applyCrosshair self-guards: nil DB -> returns, "None" -> hides,
             -- and runs the one-time migration once the profile DB is ready.
@@ -3114,10 +3204,12 @@ do
     local GROUP_DEATH_SOUND_ORDER = {
         "none", "airhorn", "banana", "bikehorn", "boxing", "water",
     }
-    if EllesmereUI.AppendSharedMediaSounds then
-        EllesmereUI.AppendSharedMediaSounds(
-            GROUP_DEATH_SOUND_PATHS, GROUP_DEATH_SOUND_NAMES, GROUP_DEATH_SOUND_ORDER)
-    end
+    -- SharedMedia sounds are appended at PLAYER_LOGIN (see the boot frame at the
+    -- end of this block), NOT here: this do-block runs at addon load, before
+    -- other addons have registered their LibSharedMedia sounds, so an append now
+    -- would miss them. (Chat's whisper-sound append runs from its PLAYER_LOGIN
+    -- init for the same reason.) The tables are exposed now by reference, so the
+    -- login append fills the same tables the options dropdown reads.
     EllesmereUI._groupDeathSoundPaths = GROUP_DEATH_SOUND_PATHS
     EllesmereUI._groupDeathSoundNames = GROUP_DEATH_SOUND_NAMES
     EllesmereUI._groupDeathSoundOrder = GROUP_DEATH_SOUND_ORDER
@@ -3143,9 +3235,29 @@ do
         end
     end
 
+    -- Minimum gap between death sounds. On a group wipe many members die within
+    -- the same poll (and across consecutive polls), which would otherwise fire
+    -- the sound once per corpse and turn into a spammy overlapping mess. The
+    -- cooldown collapses a burst of deaths into a single sound. It is only
+    -- applied in larger groups (raids, > 5 players); in a party of 5 or fewer
+    -- deaths are sparse enough that no throttling is needed.
+    local SOUND_COOLDOWN = 3.0
+    local COOLDOWN_MIN_GROUP = 5
+    local lastSoundTime = 0
+
+    local function TryPlayDeathSound()
+        if GetNumGroupMembers() > COOLDOWN_MIN_GROUP then
+            local now = GetTime()
+            if now - lastSoundTime < SOUND_COOLDOWN then return end
+            lastSoundTime = now
+        end
+        PlayDeathSound()
+    end
+
     local function Poll()
         if not (EllesmereUIDB and EllesmereUIDB.announceGroupDeaths) then return end
         local seen = {}
+        local newlyDeadName, newlyDeadClass, newlyDeadCount
         ForEachGroupUnit(function(u)
             local guid = UnitGUID(u)
             if not guid then return end
@@ -3157,13 +3269,21 @@ do
             -- never announce someone who was already dead when we started.
             if deadState[guid] == false and dead then
                 local _, classToken = UnitClass(u)
-                ShowAlert(UnitName(u), classToken)
-                PlayDeathSound()
+                newlyDeadName = UnitName(u)
+                newlyDeadClass = classToken
+                newlyDeadCount = (newlyDeadCount or 0) + 1
             end
             deadState[guid] = dead
         end)
         for guid in pairs(deadState) do
             if not seen[guid] then deadState[guid] = nil end
+        end
+        -- Show a single alert per poll (the overlay is one frame, so multiple
+        -- ShowAlert calls would just clobber each other anyway) and play at most
+        -- one sound, throttled by the cooldown, no matter how many died.
+        if newlyDeadCount then
+            ShowAlert(newlyDeadName, newlyDeadClass)
+            TryPlayDeathSound()
         end
     end
 
@@ -3281,6 +3401,15 @@ do
     boot:RegisterEvent("PLAYER_LOGIN")
     boot:SetScript("OnEvent", function(self)
         self:UnregisterAllEvents()
+        -- Append SharedMedia sounds now, at login, once other addons have
+        -- registered theirs -- this is the same timing Chat's whisper-sound
+        -- dropdown uses. Idempotent: AppendSharedMediaSounds skips keys that
+        -- are already present, and the tables are the very ones the options
+        -- dropdown (and PlayDeathSound) read, so both pick up the SM sounds.
+        if EllesmereUI.AppendSharedMediaSounds then
+            EllesmereUI.AppendSharedMediaSounds(
+                GROUP_DEATH_SOUND_PATHS, GROUP_DEATH_SOUND_NAMES, GROUP_DEATH_SOUND_ORDER)
+        end
         if EllesmereUIDB and EllesmereUIDB.announceGroupDeaths then
             ApplyAnnounceGroupDeaths()
         end

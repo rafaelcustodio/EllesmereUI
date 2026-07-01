@@ -1665,6 +1665,21 @@ function EllesmereUI.GetTooltipBg()
     local a = (db and db.tooltipBgOpacity) or R.TT_ALPHA
     return r, g, b, a
 end
+-- Tooltip border: size + colour/opacity for the Blizzard tooltip reskin.
+-- Customizable in Blizz UI Enhanced > Blizzard Tooltip > Border. Defaults to the
+-- historical hardcoded look (white @ BRD_ALPHA, 1px) so unset = current look.
+-- Returns r, g, b, a, size. (0 is a valid size/component/opacity -- relies on
+-- Lua treating 0 as truthy, so the `or` fallbacks only fire on nil.)
+function EllesmereUI.GetTooltipBorder()
+    local db = EllesmereUIDB
+    local c = db and db.tooltipBorderColor
+    local r = (c and c.r) or 1
+    local g = (c and c.g) or 1
+    local b = (c and c.b) or 1
+    local a = (db and db.tooltipBorderOpacity) or EllesmereUI.RESKIN.BRD_ALPHA
+    local size = (db and db.tooltipBorderSize) or 1
+    return r, g, b, a, size
+end
 -- Layout
 EllesmereUI.DUAL_ITEM_W  = DUAL_ITEM_W
 EllesmereUI.DUAL_GAP     = DUAL_GAP
@@ -2149,6 +2164,17 @@ do
         if not container.GetEffectiveScale then return end
         local ok, es = pcall(container.GetEffectiveScale, container)
         if not ok or not es then return end
+        -- Degenerate effective scale guard -- OPT-IN, only for borders that set
+        -- container._scaleGuard (nameplate frames; see PP.CreateBorder). onePixel
+        -- below is perfect/es, so a near-zero es makes onePixel (and the edge-strip
+        -- thickness) explode -- a 1px border becomes a frame-spanning black box that
+        -- then STICKS until the next valid re-snap. Nameplate frames are WorldFrame
+        -- children that transiently hit near-zero scale during recycle/hide/
+        -- PLAYER_ENTERING_WORLD (e.g. the SetScale(0.001) hide path); UIParent-based
+        -- borders never do, so they leave this unset and are completely unaffected.
+        -- Skip the snap so the strips keep their last-good size; the next valid snap
+        -- restores 1px.
+        if container._scaleGuard and es < 0.1 then return end
         local onePixel = es > 0 and (PP.perfect / es) or PP.mult
         local bs = borderSize or 1
         local edgeSize = bs > 0 and math.max(onePixel, math.floor(bs + 0.5) * onePixel) or 0
@@ -2161,21 +2187,38 @@ do
             return
         end
 
-        t:ClearAllPoints()
-        t:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
-        t:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, 0)
-        t:SetHeight(edgeSize); t:Show()
-        b:ClearAllPoints()
-        b:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, 0)
-        b:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
-        b:SetHeight(edgeSize); b:Show()
+        -- Seam suppression for the cast-bar wrap border: a container can flag its
+        -- TOP or BOTTOM edge to stay hidden AND have the side strips run all the way
+        -- to that corner (no inset), so two stacked borders fuse into one outline
+        -- with no edge line and no corner notch. The flags live on the container, so
+        -- they survive every re-snap (the 2-tick OnUpdate, PP.SetBorderSize,
+        -- ResnapAllBorders) -- a one-shot :Hide() gets clobbered by the next snap.
+        local topInset, botInset = -edgeSize, edgeSize
+        if container._hideTop then topInset = 0 end
+        if container._hideBottom then botInset = 0 end
+        if container._hideTop then
+            t:Hide()
+        else
+            t:ClearAllPoints()
+            t:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
+            t:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, 0)
+            t:SetHeight(edgeSize); t:Show()
+        end
+        if container._hideBottom then
+            b:Hide()
+        else
+            b:ClearAllPoints()
+            b:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, 0)
+            b:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
+            b:SetHeight(edgeSize); b:Show()
+        end
         l:ClearAllPoints()
-        l:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, -edgeSize)
-        l:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, edgeSize)
+        l:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, topInset)
+        l:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, botInset)
         l:SetWidth(edgeSize); l:Show()
         r:ClearAllPoints()
-        r:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, -edgeSize)
-        r:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, edgeSize)
+        r:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, topInset)
+        r:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, botInset)
         r:SetWidth(edgeSize); r:Show()
 
         local bc = container._bdColor
@@ -2246,9 +2289,18 @@ do
         end
     end
 
-    function PP.CreateBorder(frame, r, g, b, a, borderSize, drawLayer, subLevel)
+    -- scaleGuard (opt-in): when true, SnapBorderTextures skips this border's snap
+    -- while the frame's effective scale is degenerately small (< 0.1). Only
+    -- nameplate frames pass it -- they are WorldFrame children that transiently hit
+    -- near-zero scale and would otherwise explode a 1px strip into a black box.
+    -- Every other caller leaves it nil and is unaffected.
+    function PP.CreateBorder(frame, r, g, b, a, borderSize, drawLayer, subLevel, scaleGuard)
         local bd = _ppBorderData[frame]
-        if bd then return bd.container end
+        if bd then
+            -- Let a later call opt an already-created border into the guard.
+            if scaleGuard then bd.container._scaleGuard = true end
+            return bd.container
+        end
         r = r or 0; g = g or 0; b = b or 0; a = a or 1
         borderSize = borderSize or 1
         drawLayer = drawLayer or "OVERLAY"
@@ -2264,6 +2316,12 @@ do
         local function MakeTex()
             local tx = container:CreateTexture(nil, drawLayer, nil, subLevel)
             tx:SetTexture(WHITE)
+            -- Disable pixel-grid snapping so a 1px edge strip never rounds to 0 and
+            -- VANISHES at fractional scales / positions (e.g. a nameplate sliding with
+            -- the camera). Without this it snaps to the grid and drops out per-side at
+            -- certain angles. Same treatment every other EUI 1px element gets; the
+            -- strips are our own textures, so it is taint-safe.
+            PP.DisablePixelSnap(tx)
             return tx
         end
         container._top    = MakeTex()
@@ -2272,6 +2330,7 @@ do
         container._right  = MakeTex()
 
         container._bdColor = { r, g, b, a }
+        container._scaleGuard = scaleGuard or nil
         bd = { container = container, borderSize = borderSize, borderColor = { r, g, b, a } }
         _ppBorderData[frame] = bd
 
@@ -3391,6 +3450,78 @@ function EllesmereUI.ApplyGlobalFontToGameText()
             local _, size, flags = obj:GetFont()
             if size and size > 0 then obj:SetFont(path, size, flags) end
         end
+    end
+end
+
+-- Module-scoped font failsafe (always on, independent of "Apply to All Game
+-- Text"). Three enhanced areas style their text per-frame -- Chat, the Quest
+-- Tracker, and the Blizzard-UI-Enhanced tooltips -- but some sub-elements draw
+-- their font from Blizzard's SHARED font OBJECTS rather than a fontstring we
+-- explicitly touch, so per-frame styling leaves those stragglers on the default
+-- face. Swapping the area's font objects to the module's resolved font at login
+-- catches them. Each area is gated on its module being loaded/enabled and uses
+-- that module's own font key, so a per-module font override is honoured (a
+-- missing override falls back to the global font). Only the typeface + outline
+-- change; native size is preserved (tooltips also honour their font-scale).
+-- Same taint-safe basis as ApplyGlobalFontToGameText: SetFont on font objects
+-- only, never a write onto a Blizzard frame table. Runs after the global pass
+-- so the module-specific face wins in these three areas.
+function EllesmereUI.ApplyModuleFontFailsafe()
+    local IsLoaded = C_AddOns and C_AddOns.IsAddOnLoaded
+    local GetPath = EllesmereUI.GetFontPath
+    local GetOutline = EllesmereUI.GetFontOutlineFlag
+    if not IsLoaded or not GetPath then return end
+
+    -- Face + outline swap: change the typeface AND apply the module's resolved
+    -- outline, preserving each object's native SIZE (per-frame styling owns size,
+    -- and tooltips honour their own font-scale). The outline matches what each
+    -- area's per-frame styling already applies (chat "chat", tracker
+    -- "questTracker", tooltips "blizzardSkin"), so straggler text that only these
+    -- shared objects reach stops looking un-styled beside it. Passing the outline
+    -- is safe for the chat input box: SkinEditBox styles it explicitly with its
+    -- own SetFont(GetOutlineFlag()), so its face/outline never inherit from
+    -- ChatFontNormal. `outline` may be "" (the user's Drop Shadow / None modes),
+    -- which correctly clears a native outline rather than imposing one; pass nil
+    -- to keep the object's native flags. Guards a nil/non-object, a missing size,
+    -- and a SetFont that rejects the args, so an absent/renamed object is a no-op.
+    local function swap(obj, path, outline)
+        if not obj or type(obj) ~= "table" or not obj.GetFont or not obj.SetFont then return end
+        local _, size, flags = obj:GetFont()
+        if not size or size <= 0 then return end
+        if outline ~= nil then flags = outline end
+        pcall(obj.SetFont, obj, path or _G.STANDARD_TEXT_FONT, size, flags)
+    end
+
+    -- Chat: the module fonts the frames + edit boxes directly; ChatFontNormal
+    -- backstops the rest (menus, copy/URL windows, channel buttons, etc.).
+    if IsLoaded("EllesmereUIChat") then
+        swap(_G.ChatFontNormal, GetPath("chat"), GetOutline and GetOutline("chat"))
+    end
+
+    -- Quest Tracker: the skin region-walks the live blocks; these shared
+    -- objects catch fontstrings Blizzard (re)templates after the walk. ONLY the
+    -- ObjectiveTracker*-prefixed objects, so the world-map quest log (QuestFont*)
+    -- stays untouched -- the tracker, not the map sidebar.
+    if IsLoaded("EllesmereUIQuestTracker") then
+        local p = GetPath("questTracker")
+        local po = GetOutline and GetOutline("questTracker")
+        swap(_G.ObjectiveTrackerHeaderFont, p, po)
+        swap(_G.ObjectiveTrackerLineFont, p, po)
+        for i = 12, 22 do
+            swap(_G["ObjectiveTrackerFont" .. i], p, po)
+        end
+    end
+
+    -- Tooltips (Blizzard UI Enhanced): only when the tooltip skin is on
+    -- (customTooltips). _ttFonts already styles each visible line (size +
+    -- outline + scale) on show; these objects only backstop the typeface for
+    -- tooltips/lines it never reaches.
+    if IsLoaded("EllesmereUIBlizzardSkin") and (not EllesmereUIDB or EllesmereUIDB.customTooltips ~= false) then
+        local p = GetPath("blizzardSkin")
+        local po = GetOutline and GetOutline("blizzardSkin")
+        swap(_G.GameTooltipText, p, po)
+        swap(_G.GameTooltipHeaderText, p, po)
+        swap(_G.GameTooltipTextSmall, p, po)
     end
 end
 
@@ -9344,7 +9475,7 @@ end
 -------------------------------------------------------------------------------
 --  Slash commands
 -------------------------------------------------------------------------------
-EllesmereUI.VERSION = "8.3.4"
+EllesmereUI.VERSION = "8.3.6"
 
 -- Register this addon's version into a shared global table (taint-free at load time)
 if not _G._EUI_AddonVersions then _G._EUI_AddonVersions = {} end
@@ -10144,6 +10275,11 @@ initFrame:SetScript("OnEvent", function(self, event)
     -- Apply the global font to Blizzard's default game text (opt-in, reload-gated).
     -- Done here at login, out of combat, so it runs once before the UI renders.
     EllesmereUI.ApplyGlobalFontToGameText()
+    -- Always-on failsafe: swap the shared font objects behind Chat, the Quest
+    -- Tracker, and Blizzard-UI-Enhanced tooltips to each module's font, so the
+    -- sub-elements our per-frame styling misses pick up the right face. Runs
+    -- after the global pass so the per-module face wins in those three areas.
+    EllesmereUI.ApplyModuleFontFailsafe()
 
     ---------------------------------------------------------------------------
     --  Escape proxy: single UISpecialFrames entry for all EUI frames.

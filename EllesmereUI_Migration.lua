@@ -933,6 +933,32 @@ EllesmereUI.RegisterMigration({
 })
 
 EllesmereUI.RegisterMigration({
+    id          = "uf_power_border_size_zero_v1",
+    scope       = "profile",
+    description = "Zero out Unit Frames per-unit powerBorderSize. The detached power bar border size only became functional this build; older non-zero values were set while the control did nothing, so clear them so each UI stays visually identical. Users can re-enable a border afterward.",
+    body = function(ctx)
+        -- Self-gating: once a unit's powerBorderSize is 0 (or absent) it is
+        -- skipped, so the body is naturally idempotent on top of the runner's
+        -- per-profile flag. Runs once per profile ever; any border the user
+        -- sets AFTER the flag is stamped is never touched.
+        --
+        -- Scoped STRICTLY to EllesmereUIUnitFrames. The RaidFrames addon has its
+        -- own, unrelated powerBorderSize (its power border already worked) which
+        -- lives at ctx.profile.addons.EllesmereUIRaidFrames and must NOT be
+        -- zeroed here.
+        local uf = ctx.profile.addons and ctx.profile.addons.EllesmereUIUnitFrames
+        if type(uf) ~= "table" then return end
+        local UNIT_KEYS = { "player", "target", "focus", "targettarget", "focustarget", "pet", "boss" }
+        for _, unitKey in ipairs(UNIT_KEYS) do
+            local u = uf[unitKey]
+            if type(u) == "table" and type(u.powerBorderSize) == "number" and u.powerBorderSize ~= 0 then
+                u.powerBorderSize = 0
+            end
+        end
+    end,
+})
+
+EllesmereUI.RegisterMigration({
     id          = "basics_minimap_round_to_circle",
     scope       = "profile",
     description = "Rename minimap.shape value 'round' to 'circle'.",
@@ -2819,6 +2845,42 @@ EllesmereUI.RegisterMigration({
         if db.reskinGreatVault  == nil then db.reskinGreatVault  = master end
         if db.reskinGameMenu    == nil then db.reskinGameMenu    = master and queueNotFalse end
         if db.reskinLFGMenu     == nil then db.reskinLFGMenu     = master and queueNotFalse end
+    end,
+})
+
+EllesmereUI.RegisterMigration({
+    id          = "texture_kringel_diamonds_to_blinkii_v1",
+    scope       = "profile",
+    description = "Rename the saved 'kringel-diamonds' bar texture value to its replacement 'blinkii-diamonds' across Unit Frames, Raid Frames, Nameplates, Resource Bars, and Damage Meters.",
+    body = function(ctx)
+        -- The kringel-diamonds texture was replaced by blinkii-diamonds (same slot,
+        -- new art). The dropdown value is the texture KEY string, stored under
+        -- different fields per module (healthBarTexture, general.barTexture,
+        -- castBar.texture, per-unit overrides, dm.barTexture). "kringel-diamonds"
+        -- only ever appears as a texture-selection value, so a recursive value swap
+        -- over each module's saved data catches every storage location and is
+        -- idempotent (nothing left to match on a second pass).
+        local addons = ctx.profile.addons
+        if type(addons) ~= "table" then return end
+
+        local function swap(t, depth)
+            if type(t) ~= "table" or depth > 8 then return end
+            for k, v in pairs(t) do
+                if v == "kringel-diamonds" then
+                    t[k] = "blinkii-diamonds"
+                elseif type(v) == "table" then
+                    swap(v, depth + 1)
+                end
+            end
+        end
+
+        local MODULES = {
+            "EllesmereUIUnitFrames", "EllesmereUIRaidFrames", "EllesmereUINameplates",
+            "EllesmereUIResourceBars", "EllesmereUIDamageMeters",
+        }
+        for _, name in ipairs(MODULES) do
+            swap(addons[name], 1)
+        end
     end,
 })
 
