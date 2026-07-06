@@ -38,7 +38,7 @@ local THUMB_MIN_H = 20
 
 -- Runtime state
 local _selectedView = 0   -- 0 = All Bank Tabs, -1 = OneBank, -2 = All Warbank, -3 = OneWarbank, >0 = tab index
-local _allTabs = {}        -- populated on bank open: { bagID, name, isWarband, numSlots, icon }
+local _allTabs = {}        -- populated on bank open: { bagID, name, isWarband, numSlots, icon, depositFlags }
 local _warbandOnly = false -- true when opened via portable warbank (AccountBanker interaction)
 
 local function GetBankSidebarWidth()
@@ -46,8 +46,12 @@ local function GetBankSidebarWidth()
     return collapsed and SIDEBAR_W_COLLAPSED or SIDEBAR_W
 end
 
-local BANK_FONT = (EUI.GetFontPath and EUI.GetFontPath("bags")) or "Fonts\\FRIZQT__.TTF"
-local function SetBankFont(fs, size) fs:SetFont(BANK_FONT, size, "") end
+local function GetFont() return (EUI.GetFontPath and EUI.GetFontPath("bags")) or "Fonts\\FRIZQT__.TTF" end
+local function GetOutline() return (EUI.GetFontOutlineFlag and EUI.GetFontOutlineFlag("bags")) or "" end
+local function SetBankFont(fs, size)
+    if EllesmereUI and EllesmereUI.PrimeFontShadow then EllesmereUI.PrimeFontShadow(fs, true) end
+    fs:SetFont(GetFont(), size, GetOutline())
+end
 local GetUpgradeTrack = EUI.GetUpgradeTrack
 local ITEM_CLASS_WEAPON = Enum.ItemClass.Weapon
 local ITEM_CLASS_ARMOR  = Enum.ItemClass.Armor
@@ -141,7 +145,7 @@ local function GetCharacterBankTabs()
                 if numSlots > 0 then
                     local icon = td.icon
                     if not icon or icon == 134400 then icon = GetFallbackIcon(bagID) end
-                    tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = td.name or ("Bank Tab " .. i), icon = icon }
+                    tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = td.name or ("Bank Tab " .. i), icon = icon, depositFlags = td.depositFlags or 0 }
                 end
             end
         end
@@ -149,7 +153,7 @@ local function GetCharacterBankTabs()
         for i, bagID in ipairs(CHARACTER_BANK_BAGS) do
             local numSlots = C_Container.GetContainerNumSlots(bagID)
             if numSlots > 0 then
-                tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Bank Tab " .. #tabs + 1, icon = GetFallbackIcon(bagID) }
+                tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Bank Tab " .. #tabs + 1, icon = GetFallbackIcon(bagID), depositFlags = 0 }
             end
         end
     end
@@ -177,7 +181,7 @@ local function GetWarbandBankTabs()
                     local name = td.name or ("Tab " .. i)
                     local icon = td.icon
                     if not icon or icon == 134400 then icon = GetFallbackIcon(bagID) end
-                    tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Warbank " .. name, icon = icon }
+                    tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Warbank " .. name, icon = icon, depositFlags = td.depositFlags or 0 }
                 end
             end
         end
@@ -185,7 +189,7 @@ local function GetWarbandBankTabs()
         for i, bagID in ipairs(WARBAND_BANK_BAGS) do
             local numSlots = C_Container.GetContainerNumSlots(bagID)
             if numSlots > 0 then
-                tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Warbank Tab " .. #tabs + 1, icon = GetFallbackIcon(bagID) }
+                tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Warbank Tab " .. #tabs + 1, icon = GetFallbackIcon(bagID), depositFlags = 0 }
             end
         end
     end
@@ -238,7 +242,7 @@ EUI_Bank._headerItemCount = itemCount
 local bankSearch = CreateFrame("EditBox", "EUI_BankSearchBox", header)
 bankSearch:SetSize(160, 22)
 bankSearch:SetPoint("RIGHT", header, "RIGHT", -35, 0)
-bankSearch:SetFont(BANK_FONT, 12, "")
+bankSearch:SetFont(GetFont(), 12, "")
 bankSearch:SetAutoFocus(false)
 bankSearch:SetTextInsets(5, 26, 0, 0)
 local searchBg = bankSearch:CreateTexture(nil, "BACKGROUND")
@@ -566,6 +570,293 @@ EUI_Bank:SetScript("OnMouseUp", function(self, button)
         end
     end
 end)
+
+-------------------------------------------------------------------------------
+-- Bank Tab Settings Dialog
+-------------------------------------------------------------------------------
+local EUI_BankTabConfigFrame = CreateFrame("Frame", "EUI_BankFrame_TabSettingsMenu", EUI_Bank)
+EUI_BankTabConfigFrame:SetWidth(240) -- Height is automatically determined by content
+EUI_BankTabConfigFrame:SetFrameStrata("DIALOG")
+EUI_BankTabConfigFrame:Hide()
+
+-- Built lazily on the first right-click of a bank tab.
+local function EnsureBankTabConfigFrame()
+    if EUI_BankTabConfigFrame.OpenBankTabSettings then return end
+    local bgAtlasBTC = EUI_BankTabConfigFrame:CreateTexture(nil, "BACKGROUND")
+    bgAtlasBTC:SetAllPoints()
+    bgAtlasBTC:SetTexture("Interface\\AddOns\\EllesmereUI\\media\\modern_blizz.png")
+    local bgOverlayBTC = EUI_BankTabConfigFrame:CreateTexture(nil, "BACKGROUND", nil, 1)
+    bgOverlayBTC:SetAllPoints()
+    bgOverlayBTC:SetColorTexture(0, 0, 0, 0.25)
+    if EUI.MakeBorder then EUI.MakeBorder(EUI_BankTabConfigFrame, 1, 1, 1, 0.15, EUI.PP) end
+
+    -- Header
+    local headerBTC = CreateFrame("Frame", nil, EUI_BankTabConfigFrame)
+    headerBTC:SetPoint("TOPLEFT", EUI_BankTabConfigFrame, "TOPLEFT", 0, 0)
+    headerBTC:SetPoint("TOPRIGHT", EUI_BankTabConfigFrame, "TOPRIGHT", 0, 0)
+    headerBTC:SetHeight(HEADER_H)
+    local hdrBgBTC = headerBTC:CreateTexture(nil, "BACKGROUND", nil, 1)
+    hdrBgBTC:SetAllPoints(); hdrBgBTC:SetColorTexture(0, 0, 0, 0.5)
+
+    local titleBTC = headerBTC:CreateFontString(nil, "OVERLAY")
+    SetBankFont(titleBTC, 13)
+    titleBTC:SetPoint("LEFT", headerBTC, "LEFT", 8, 0)
+    titleBTC:SetTextColor(1, 1, 1)
+    titleBTC:SetText(EllesmereUI.L("Edit Tab Settings"))
+
+    -- Footer
+    local footerBTC = CreateFrame("Frame", nil, EUI_BankTabConfigFrame)
+    footerBTC:SetPoint("BOTTOMLEFT", EUI_BankTabConfigFrame, "BOTTOMLEFT", 0, 0)
+    footerBTC:SetPoint("BOTTOMRIGHT", EUI_BankTabConfigFrame, "BOTTOMRIGHT", 0, 0)
+    footerBTC:SetHeight(FOOTER_H)
+    local ftrBgBTC = footerBTC:CreateTexture(nil, "BACKGROUND", nil, 1)
+    ftrBgBTC:SetAllPoints(); ftrBgBTC:SetColorTexture(0, 0, 0, 0.35)
+
+    -- Top-edge separator
+    local PP = EUI and EUI.PP
+    local px = (PP and PP.mult) or 1
+    local ftrSepBTC = footerBTC:CreateTexture(nil, "ARTWORK")
+    ftrSepBTC:SetHeight(px)
+    ftrSepBTC:SetPoint("TOPLEFT", footerBTC, "TOPLEFT", 0, 0)
+    ftrSepBTC:SetPoint("TOPRIGHT", footerBTC, "TOPRIGHT", 0, 0)
+    ftrSepBTC:SetColorTexture(0.15, 0.15, 0.15, 1)
+
+    -------------------------------------------------------------------------------
+    -- Content for Bank Tab Settings Frame
+    -------------------------------------------------------------------------------
+    local WIDGET_HEIGHT = 22
+    local PADDING_X = 8
+    local PADDING_Y = 8
+    local ar, ag, ab = GetAccentRGB()
+
+    local contentHeight = 0
+
+    local bodyBTC = CreateFrame("Frame", nil, EUI_BankTabConfigFrame)
+    bodyBTC:SetPoint("TOPLEFT", headerBTC, "BOTTOMLEFT", 0, 0)
+    bodyBTC:SetPoint("BOTTOMRIGHT", footerBTC, "TOPRIGHT", 0, 0)
+    bodyBTC:SetWidth(EUI_BankTabConfigFrame:GetWidth())  -- Height is automatically determined by content
+
+    -- Bank Tab Name Label
+    local bankTabNameLabel = bodyBTC:CreateFontString(nil, "OVERLAY")
+    SetBankFont(bankTabNameLabel, 10)
+    bankTabNameLabel:SetPoint("TOPLEFT", bodyBTC, "TOPLEFT", PADDING_X, -PADDING_Y)
+    bankTabNameLabel:SetTextColor(1, 1, 1, 1)
+    bankTabNameLabel:SetText(CHARACTER_BANK_TAB_NAME_PROMPT)
+    contentHeight = contentHeight + bankTabNameLabel:GetStringHeight() + PADDING_Y
+
+    -- Bank Tab Name EditBox
+    local bankTabNameEditBox = CreateFrame("EditBox", "EUI_BankFrame_TabSettingsMenu_NameBox", bodyBTC)
+    bankTabNameEditBox:SetSize(170, WIDGET_HEIGHT)
+    bankTabNameEditBox:SetPoint("TOPLEFT", bankTabNameLabel, "BOTTOMLEFT", 0, -PADDING_Y / 2)
+    SetBankFont(bankTabNameEditBox, 10)
+    bankTabNameEditBox:SetAutoFocus(false)
+    bankTabNameEditBox:SetTextInsets(5, 5, 0, 0)
+    local bankTabNameBg = bankTabNameEditBox:CreateTexture(nil, "BACKGROUND")
+    bankTabNameBg:SetAllPoints()
+    bankTabNameBg:SetColorTexture(0.02, 0.02, 0.02, 1)
+    if EUI and EUI.PanelPP then EUI.PanelPP.CreateBorder(bankTabNameEditBox, 0.25, 0.25, 0.25, 1, 1, "OVERLAY", 7) end
+    contentHeight = contentHeight + bankTabNameEditBox:GetHeight() + (PADDING_Y / 2)
+
+    -- Tab Icon Preview Visual
+    local iconBTCTexture = bodyBTC:CreateTexture(nil, "ARTWORK")
+    iconBTCTexture:SetSize(32, 32)
+    iconBTCTexture:SetPoint("TOPRIGHT", bodyBTC, "TOPRIGHT", -PADDING_X, select(5, bankTabNameLabel:GetPoint(1)) + select(5, bankTabNameEditBox:GetPoint(1))) -- Align with the edit box
+
+    -- Assign To Tab Label
+    local assignToTabLabel = bodyBTC:CreateFontString(nil, "OVERLAY")
+    SetBankFont(assignToTabLabel, 10)
+    assignToTabLabel:SetPoint("TOPLEFT", bankTabNameEditBox, "BOTTOMLEFT", 0, -PADDING_Y / 2)
+    assignToTabLabel:SetTextColor(1, 1, 1, 1)
+    assignToTabLabel:SetText(BAG_FILTER_ASSIGN_TO)
+    contentHeight = contentHeight + assignToTabLabel:GetStringHeight() + (PADDING_Y / 2)
+
+    -- Assign To Tab Checkboxes (2 columns, 3 rows)
+    local ASSIGN_TO_TAB_COLUMNS = 2
+    local ASSIGN_TO_TAB_ROWS = 3
+    local assignToTabCheckboxesCfg = {
+        { text = BAG_FILTER_EQUIPMENT, value = Enum.BagSlotFlags.ClassEquipment, row = 1, column = 1 },
+        { text = BAG_FILTER_CONSUMABLES, value = Enum.BagSlotFlags.ClassConsumables, row = 2, column = 1 },
+        { text = BAG_FILTER_PROFESSION_GOODS, value = Enum.BagSlotFlags.ClassProfessionGoods, row = 3, column = 1 },
+        { text = BAG_FILTER_REAGENTS, value = Enum.BagSlotFlags.ClassReagents, row = 1, column = 2 },
+        { text = BAG_FILTER_JUNK, value = Enum.BagSlotFlags.ClassJunk, row = 2, column = 2 },
+    }
+
+    local assignToTabFrame = CreateFrame("Frame", nil, bodyBTC) -- Switched to standard Frame context
+    assignToTabFrame:SetSize(bodyBTC:GetWidth(), WIDGET_HEIGHT * ASSIGN_TO_TAB_ROWS)
+    assignToTabFrame:SetPoint("TOPLEFT", assignToTabLabel, "BOTTOMLEFT", 0, -PADDING_Y / 2)
+    contentHeight = contentHeight + assignToTabFrame:GetHeight() + (PADDING_Y / 2)
+
+    local function makeAssignToTabBtn(option)
+        local btn = CreateFrame("Button", nil, assignToTabFrame)
+        btn:SetSize(assignToTabFrame:GetWidth() / ASSIGN_TO_TAB_COLUMNS, WIDGET_HEIGHT)
+
+        local xOffset = (option.column - 1) * (assignToTabFrame:GetWidth() / ASSIGN_TO_TAB_COLUMNS)
+        local yOffset = -(option.row - 1) * WIDGET_HEIGHT
+        btn:SetPoint("TOPLEFT", assignToTabFrame, "TOPLEFT", xOffset, yOffset)
+        btn:SetFrameLevel(assignToTabFrame:GetFrameLevel() + 2)
+
+        local box, _, _, cbApply = EUI.BuildCheckboxControl(btn, assignToTabFrame:GetFrameLevel() + 2)
+        PP.Point(box, "LEFT", btn, "LEFT", 0, 0)
+
+        local label = EUI.MakeFont(btn, 14, nil, EUI.TEXT_WHITE.r, EUI.TEXT_WHITE.g, EUI.TEXT_WHITE.b)
+        SetBankFont(label, 10)
+        label:SetPoint("LEFT", box, "RIGHT", 8, 0)
+        label:SetText(option.text)
+
+        local isHovering = false
+
+        local getValue = function()
+            if not EUI_BankTabConfigFrame.depositFlags then return false end
+            return bit.band(EUI_BankTabConfigFrame.depositFlags, option.value) ~= 0
+        end
+        local setValue = function(v)
+            EUI_BankTabConfigFrame.depositFlags = EUI_BankTabConfigFrame.depositFlags or 0
+            if v then
+                EUI_BankTabConfigFrame.depositFlags = bit.bor(EUI_BankTabConfigFrame.depositFlags, option.value)
+            else
+                EUI_BankTabConfigFrame.depositFlags = bit.band(EUI_BankTabConfigFrame.depositFlags, bit.bnot(option.value))
+            end
+        end
+
+        local function ApplyVisual()
+            local on = getValue()
+            cbApply(on, isHovering)
+            if on then
+                label:SetTextColor(EUI.TEXT_WHITE.r, EUI.TEXT_WHITE.g, EUI.TEXT_WHITE.b, 1)
+            else
+                local a = isHovering and 1 or 0.8
+                label:SetTextColor(EUI.TEXT_WHITE.r * a, EUI.TEXT_WHITE.g * a, EUI.TEXT_WHITE.b * a, a)
+            end
+        end
+        ApplyVisual()
+
+        btn:SetScript("OnClick", function()
+            local v = not getValue()
+            setValue(v)
+            ApplyVisual()
+        end)
+        btn:SetScript("OnEnter", function()
+            isHovering = true
+            ApplyVisual()
+        end)
+        btn:SetScript("OnLeave", function()
+            isHovering = false
+            ApplyVisual()
+        end)
+
+        btn.Refresh = function()
+            ApplyVisual()
+        end
+
+        return btn
+    end
+
+    local assignToTabCheckboxesFrames = {}
+    for _, option in ipairs(assignToTabCheckboxesCfg) do
+        table.insert(assignToTabCheckboxesFrames, makeAssignToTabBtn(option))
+    end
+
+    bodyBTC:SetHeight(contentHeight + (PADDING_Y / 2)) -- Adjusted height to accommodate three rows with padding
+
+    -- Save Button
+    local saveBTCBtn = CreateFrame("Button", nil, footerBTC)
+    saveBTCBtn:SetSize(100, WIDGET_HEIGHT)
+    saveBTCBtn:SetPoint("RIGHT", footerBTC, "RIGHT", -10, 0)
+    saveBTCBtn:EnableMouse(true)
+
+    local saveBtnLabel = saveBTCBtn:CreateFontString(nil, "OVERLAY")
+    SetBankFont(saveBtnLabel, 10)
+    saveBtnLabel:SetPoint("CENTER", saveBTCBtn, "CENTER", 0, 0)
+    saveBtnLabel:SetTextColor(ar, ag, ab, 0.9)
+    saveBTCBtn._label = saveBtnLabel
+
+    saveBTCBtn:SetScript("OnEnter", function(self)
+        local r, g, b = GetAccentRGB()
+        self._label:SetTextColor(r, g, b, 1)
+        self._border:SetColor(r, g, b, 1)
+    end)
+    saveBTCBtn:SetScript("OnLeave", function(self)
+        local r, g, b = GetAccentRGB()
+        self._label:SetTextColor(r, g, b, 0.9)
+        self._border:SetColor(r, g, b, 0.9)
+    end)
+    saveBTCBtn._label:SetText(EllesmereUI.L("Save"))
+    if EUI.MakeBorder then saveBTCBtn._border = EUI.MakeBorder(saveBTCBtn, ar, ag, ab, 0.9, EUI.PP) end
+
+    saveBTCBtn:SetScript("OnClick", function()
+        local parent = EUI_BankTabConfigFrame
+        if parent.bankType and parent.tabId then
+            local newName = bankTabNameEditBox:GetText()
+            if not newName or newName == "" then
+                newName = parent.fallbackName or ("Tab " .. tostring(parent.tabId))
+            end
+
+            C_Bank.UpdateBankTabSettings(parent.bankType, parent.tabId, newName, parent.icon, parent.depositFlags or 0)
+        end
+        EUI_BankTabConfigFrame:Hide()
+    end)
+
+    -- Cancel Button
+    local cancelBTCBtn = CreateFrame("Button", nil, footerBTC)
+    cancelBTCBtn:SetSize(100, WIDGET_HEIGHT)
+    cancelBTCBtn:SetPoint("LEFT", footerBTC, "LEFT", 10, 0)
+    cancelBTCBtn:EnableMouse(true)
+
+    local cancelBtnLabel = cancelBTCBtn:CreateFontString(nil, "OVERLAY")
+    SetBankFont(cancelBtnLabel, 10)
+    cancelBtnLabel:SetPoint("CENTER", cancelBTCBtn, "CENTER", 0, 0)
+    cancelBtnLabel:SetTextColor(1, 1, 1, 0.7)
+    cancelBTCBtn._label = cancelBtnLabel
+
+    cancelBTCBtn:SetScript("OnEnter", function(self)
+        self._label:SetTextColor(1, 1, 1, 0.9)
+        self._border:SetColor(1, 1, 1, 0.6)
+    end)
+    cancelBTCBtn:SetScript("OnLeave", function(self)
+        self._label:SetTextColor(1, 1, 1, 0.7)
+        self._border:SetColor(1, 1, 1, 0.5)
+    end)
+    cancelBTCBtn._label:SetText(EllesmereUI.L("Cancel"))
+    cancelBTCBtn:SetScript("OnClick", function() EUI_BankTabConfigFrame:Hide() end)
+    if EUI.MakeBorder then cancelBTCBtn._border = EUI.MakeBorder(cancelBTCBtn, 1, 1, 1, 0.5, EUI.PP) end
+
+    function EUI_BankTabConfigFrame:OpenBankTabSettings(tabData, tabId)
+        self:Hide()
+        self:ClearAllPoints()
+        self:SetPoint("TOPLEFT", EUI_Bank, "TOPRIGHT", PADDING_X, 0)
+
+        -- Save datas for use in Save button logic
+        self.bankType = tabData.isWarband and Enum.BankType.Account or Enum.BankType.Character
+        self.tabId = tabId
+        self.icon = tabData.icon
+        self.depositFlags = tabData.depositFlags or 0
+
+        -- Setup widgets
+        local displayName = tabData.name
+        if self.bankType == Enum.BankType.Account then
+            -- Remove "Warbank " prefix as this is a prefix added by EUI and not the real tab name. This is necessary to edit the tab
+            local prefix = "Warbank "
+            local prefix_len = #prefix
+            if strsub(tabData.name, 1, prefix_len) == prefix then
+                displayName = strsub(tabData.name, prefix_len + 1)
+            end
+        end
+        self.fallbackName = displayName
+        bankTabNameEditBox:SetText(displayName or "")
+        iconBTCTexture:SetTexture(tabData.icon)
+        if assignToTabCheckboxesFrames then
+            for _, btn in ipairs(assignToTabCheckboxesFrames) do
+                if btn.Refresh then
+                    btn:Refresh()
+                end
+            end
+        end
+
+        self:Show()
+    end
+
+    EUI_BankTabConfigFrame:SetHeight(headerBTC:GetHeight() + bodyBTC:GetHeight() + footerBTC:GetHeight())
+end
 
 -------------------------------------------------------------------------------
 --  Sidebar
@@ -1102,7 +1393,7 @@ local function GetOrCreateBankSlot(idx)
     local countFS = btn.Count
     if countFS then
         countFS:SetParent(textOverlay)
-        EllesmereUI.ApplyIconTextFont(countFS, BANK_FONT, countSize, "bags")
+        EllesmereUI.ApplyIconTextFont(countFS, GetFont(), countSize, "bags")
         countFS:ClearAllPoints()
         countFS:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -2, 2)
     end
@@ -1114,8 +1405,18 @@ local function GetOrCreateBankSlot(idx)
         btn.ItemLevelText:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
         btn.ItemLevelText:SetTextColor(1, 1, 1, 1)
     end
-    btn.ItemLevelText:SetFont(BANK_FONT, ilvlSize, (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE, SLUG")
+    btn.ItemLevelText:SetFont(GetFont(), ilvlSize, (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE, SLUG")
     btn.ItemLevelText:SetText("")
+
+    -- Bind Type text (bottom-left)
+    if not btn.BindTypeText then
+        btn.BindTypeText = textOverlay:CreateFontString(nil, "OVERLAY", nil, 7)
+        btn.BindTypeText:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 1, 2)
+        btn.BindTypeText:SetTextColor(1, 1, 1, 1)
+    end
+    local bindTypeFontSize = BP().bagBindTypeFontSize or 11
+    btn.BindTypeText:SetFont(GetFont(), bindTypeFontSize, (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE, SLUG")
+    btn.BindTypeText:SetText("")
 
     -- Empty bg
     btn._emptyBg = btn:CreateTexture(nil, "BACKGROUND", nil, 1)
@@ -1172,9 +1473,11 @@ end
 local function RefreshBankTextSizes()
     local countSize = BP().bagCountFontSize or 11
     local ilvlSize = BP().itemlevelFontSize or 12
+    local bindTypeSize = BP().bagBindTypeFontSize or 11
     for _, btn in pairs(_bankSlots) do
-        if btn.Count then EllesmereUI.ApplyIconTextFont(btn.Count, BANK_FONT, countSize, "bags") end
-        if btn.ItemLevelText then btn.ItemLevelText:SetFont(BANK_FONT, ilvlSize, (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE, SLUG") end
+        if btn.Count then EllesmereUI.ApplyIconTextFont(btn.Count, GetFont(), countSize, "bags") end
+        if btn.ItemLevelText then btn.ItemLevelText:SetFont(GetFont(), ilvlSize, (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE, SLUG") end
+        if btn.BindTypeText then btn.BindTypeText:SetFont(GetFont(), bindTypeSize, (EllesmereUI and EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG")) or "OUTLINE, SLUG") end
     end
 end
 EUI_Bank.RefreshTextSizes = RefreshBankTextSizes
@@ -1452,6 +1755,7 @@ function EUI_Bank:RefreshBank()
             SetInsetBorderColor(btn, 0, 0, 0, 0.3)
             if btn.Cooldown then btn.Cooldown:Clear() end
             if btn.ItemLevelText then btn.ItemLevelText:SetText("") end
+            if btn.BindTypeText then btn.BindTypeText:SetText("") end
             if btn.IconBorder then btn.IconBorder:Hide() end
             if btn.NormalTexture then btn.NormalTexture:SetAlpha(0) end
         else
@@ -1518,29 +1822,49 @@ function EUI_Bank:RefreshBank()
             local c = ITEM_QUALITY_COLORS[quality]
             if c then SetInsetBorderColor(btn, c.r, c.g, c.b, 1)
             else SetInsetBorderColor(btn, 0.25, 0.25, 0.25, 1) end
+
+            -- One gear check + one GetItemInfo fetch shared by the bind-type
+            -- and item-level texts
+            local isGear = itemLink and IsGearItem(itemLink)
+            local showBindType = isGear and not info.isBound and BP().bagDisplayBindType
+            local showIlvl = isGear and BP().showItemlevelInBags ~= false
+            local giIlvl, giBindType
+            if showBindType or showIlvl then
+                local _, _, _, i4, _, _, _, _, _, _, _, _, _, b14 = GetItemInfo(itemLink)
+                giIlvl, giBindType = i4, b14
+            end
+
+            -- Bind Type : BoE / WuE bottom-left (gear only)
+            if btn.BindTypeText then
+                if showBindType then
+                    local isWuE = false
+                    local loc = ItemLocation:CreateFromBagAndSlot(bagID, slot)
+                    if loc and C_Item.DoesItemExist(loc) then
+                        isWuE = C_Item.IsBoundToAccountUntilEquip(loc)
+                    end
+                    EUI_Bags.SetBindTypeText(btn.BindTypeText, isWuE, giBindType, quality)
+                else
+                    btn.BindTypeText:SetText("")
+                end
+            end
+
             -- Item level (gear only)
             if btn.ItemLevelText then
-                if itemLink and IsGearItem(itemLink) then
-                    local showIlvl = BP().showItemlevelInBags ~= false
-                    if showIlvl then
-                        local _, _, _, ilvl = GetItemInfo(itemLink)
-                        btn.ItemLevelText:SetText(ilvl or "")
-                        local r, g, b
-                        if GetUpgradeTrack then
-                            local rankText, trackColor = GetUpgradeTrack(itemLink)
-                            if BP().itemlevelUseCustomColor and BP().itemlevelCustomColor then
-                                r, g, b = BP().itemlevelCustomColor.r, BP().itemlevelCustomColor.g, BP().itemlevelCustomColor.b
-                            elseif rankText and rankText ~= "" and trackColor then
-                                r, g, b = trackColor.r, trackColor.g, trackColor.b
-                            end
+                if showIlvl then
+                    btn.ItemLevelText:SetText(giIlvl or "")
+                    local r, g, b
+                    if GetUpgradeTrack then
+                        local rankText, trackColor = GetUpgradeTrack(itemLink)
+                        if BP().itemlevelUseCustomColor and BP().itemlevelCustomColor then
+                            r, g, b = BP().itemlevelCustomColor.r, BP().itemlevelCustomColor.g, BP().itemlevelCustomColor.b
+                        elseif rankText and rankText ~= "" and trackColor then
+                            r, g, b = trackColor.r, trackColor.g, trackColor.b
                         end
-                        if not r then
-                            r, g, b = GetItemQualityColor(quality)
-                        end
-                        btn.ItemLevelText:SetTextColor(r, g, b, 1)
-                    else
-                        btn.ItemLevelText:SetText("")
                     end
+                    if not r then
+                        r, g, b = GetItemQualityColor(quality)
+                    end
+                    btn.ItemLevelText:SetTextColor(r, g, b, 1)
                 else
                     btn.ItemLevelText:SetText("")
                 end
@@ -1662,23 +1986,43 @@ function BuildBankSidebar()
         btn._count:SetTextColor(0.5, 0.5, 0.5)
         btn._count:SetPoint("RIGHT", btn, "RIGHT", -6, 0)
         btn:SetScript("OnEnter", function(self)
+            local showEditableTabTooltip = EUI.ShowWidgetTooltip and not self._isPurchaseTab and self._viewIdx and self._viewIdx > 0
+
             if not self._isSelected then self._bg:SetColorTexture(1, 1, 1, 0.06) end
             if (BP().bankSidebarCollapsed) and EUI.ShowWidgetTooltip then
-                EUI.ShowWidgetTooltip(self, (self._entryName or "?") .. " (" .. (self._entryCount or 0) .. ")")
+                EUI.ShowWidgetTooltip(self, (self._entryName or "?") .. " (" .. (self._entryCount or 0) .. ")" .. (showEditableTabTooltip and ("\n|cffdab842" .. BANK_TAB_TOOLTIP_CLICK_INSTRUCTION .. "|r") or ""))
+            end
+            if not (BP().bankSidebarCollapsed) and showEditableTabTooltip then
+                if EUI.ShowWidgetTooltip then EUI.ShowWidgetTooltip(self, "|cffdab842" .. BANK_TAB_TOOLTIP_CLICK_INSTRUCTION .. "|r") end
             end
         end)
         btn:SetScript("OnLeave", function(self)
             if not self._isSelected then self._bg:SetColorTexture(1, 1, 1, 0) end
             if EUI.HideWidgetTooltip then EUI.HideWidgetTooltip() end
         end)
-        btn:SetScript("OnClick", function(self)
+        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        btn:SetScript("OnClick", function(self, button)
             if self._isPurchaseTab then return end
-            _selectedView = self._viewIdx
-            if EUI_Bank._scrollFrame then EUI_Bank._scrollFrame:SetVerticalScroll(0) end
-            EUI_Bank:RefreshBank()
-            -- Refresh bags so warbank dim overlay updates immediately
-            if _G.EUI_Bags and _G.EUI_Bags:IsVisible() and _G.EUI_Bags.RefreshInventory then
-                _G.EUI_Bags:RefreshInventory()
+
+            if button == "RightButton" and self._viewIdx and self._viewIdx > 0 then
+                local tabData = _allTabs[self._viewIdx]
+                if tabData then
+                    -- The bagID is the tab ID UpdateBankTabSettings expects:
+                    -- Enum.BagIndex.CharacterBankTab_1..6 / AccountBankTab_1..5
+                    EnsureBankTabConfigFrame()
+                    EUI_BankTabConfigFrame:OpenBankTabSettings(tabData, tabData.bagID)
+                    return
+                end
+            end
+
+            if button == "LeftButton" then
+                _selectedView = self._viewIdx
+                if EUI_Bank._scrollFrame then EUI_Bank._scrollFrame:SetVerticalScroll(0) end
+                EUI_Bank:RefreshBank()
+                -- Refresh bags so warbank dim overlay updates immediately
+                if _G.EUI_Bags and _G.EUI_Bags:IsVisible() and _G.EUI_Bags.RefreshInventory then
+                    _G.EUI_Bags:RefreshInventory()
+                end
             end
         end)
         _sidebarBtns[idx] = btn
@@ -2052,6 +2396,9 @@ end
 
 -- Close bank when pressing Escape
 EUI_Bank:SetScript("OnHide", function()
+    if EUI_BankTabConfigFrame then
+        EUI_BankTabConfigFrame:Hide()
+    end
     if C_Bank then C_Bank.CloseBankFrame() end
     -- Clear warbank dim overlays on bags
     if _G.EUI_Bags and _G.EUI_Bags:IsVisible() and _G.EUI_Bags.RefreshInventory then
@@ -2095,4 +2442,5 @@ loader:SetScript("OnEvent", function(self)
             if dressUp:IsVisible() then ShiftDressUp() end
         end)
     end
+
 end)

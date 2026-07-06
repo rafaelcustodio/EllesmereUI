@@ -235,7 +235,7 @@ function EllesmereUI.BuildMacroFactory(parent, startY, PP)
     local DK_BLOOD = {
         { name="EUI_DnDCursor", icon="Interface\\Icons\\spell_shadow_deathanddecay", label="Death and Decay\n(Cursor)", fixedBody="/cast [@cursor] Death and Decay", fixedTooltip="Death and Decay" },
         { name="EUI_GorefiendCursor", icon="Interface\\Icons\\ability_deathknight_aoedeathgrip", label="Gorefiend's Grasp\n(Cursor)", fixedBody="/cast [@cursor] Gorefiend's Grasp", fixedTooltip="Gorefiend's Grasp" },
-        { name="EUI_AbomLimb", icon="Interface\\Icons\\ability_deathknight_intovoidtentacles", label="Abomination Limb\n(Focus)", fixedBody="/cast [@focus,harm,nodead][] Abomination Limb", fixedTooltip="Abomination Limb" },
+        { name="EUI_AbomLimb", icon="Interface\\Icons\\ability_maldraxxus_deathknight", label="Abomination Limb\n(Focus)", fixedBody="/cast [@focus,harm,nodead][] Abomination Limb", fixedTooltip="Abomination Limb" },
     }
     local DK_FROST = {
         { name="EUI_PFObliterate", icon="Interface\\Icons\\spell_deathknight_pillaroffrost", label="PF Obliterate", fixedBody="/cast Pillar of Frost\n/cast Obliterate\n/cast Raise Dead" },
@@ -309,8 +309,7 @@ function EllesmereUI.BuildMacroFactory(parent, startY, PP)
         { name="EUI_DragonrageBurst", icon="Interface\\Icons\\ability_evoker_dragonrage2", label="Dragonrage\nBurst", fixedBody="/cast Dragonrage\n/use 13", fixedTooltip="Dragonrage" },
     }
     local EVOKER_PRES = {
-        { name="EUI_DreamBreath", icon="Interface\\Icons\\ability_evoker_dreambreath", label="Dream Breath\n(Cursor)", fixedBody="/cast [@cursor] Dream Breath", fixedTooltip="Dream Breath" },
-        { name="EUI_Spiritbloom", icon="Interface\\Icons\\ability_evoker_spiritbloom2", label="Spiritbloom\n(Cursor)", fixedBody="/cast [@cursor] Spiritbloom", fixedTooltip="Spiritbloom" },
+        { name="EUI_DreamFlight", icon="Interface\\Icons\\ability_evoker_dreamflight", label="Dream Flight\n(Cursor)", fixedBody="/cast [@cursor] Dream Flight", fixedTooltip="Dream Flight" },
     }
 
     -- Hunter (253=BeastMastery, 254=Marksmanship, 255=Survival)

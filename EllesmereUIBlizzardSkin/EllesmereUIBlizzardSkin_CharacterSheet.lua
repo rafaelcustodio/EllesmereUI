@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 --  Themed Character Sheet
 --------------------------------------------------------------------------------
-local ADDON_NAME = ...
+local ADDON_NAME, ns = ...
 local L = _G.EllesmereUI and _G.EllesmereUI.L or function(k) return k end
 local skinned = false
 local issecretvalue = issecretvalue or function() return false end
@@ -315,7 +315,7 @@ local function PreSkinCharacterSheet()
     GetFFD(frame).bg = bg
     bg:SetAlpha(1)
     GetFFD(frame).bgOverlay = frame:CreateTexture(nil, "BACKGROUND", nil, -7)
-    GetFFD(frame).bgOverlay:SetColorTexture(0, 0, 0, 0.55)
+    GetFFD(frame).bgOverlay:SetColorTexture(0, 0, 0, 0.62)
     GetFFD(frame).bgOverlay:SetAllPoints(frame)
 
     -- Recompute tex coords on resize to maintain aspect ratio (cover mode)
@@ -344,6 +344,11 @@ local function PreSkinCharacterSheet()
     UpdateBgTexCoords()
     if EllesmereUI and EllesmereUI.PanelPP then
         EllesmereUI.PanelPP.CreateBorder(frame, 0.2, 0.2, 0.2, 1, 1, "OVERLAY", 7)
+    end
+    -- Window-style system: lets the Modern flat backdrop live-swap in for the
+    -- atlas when the user picks Modern for the Character Sheet window.
+    if ns.WSkin and ns.WSkin.AdoptShell then
+        ns.WSkin.AdoptShell("charsheet", frame, bg, GetFFD(frame).bgOverlay)
     end
 
     -- PlayerModel widget. SetUnit("player") natively follows shapeshift forms
@@ -472,6 +477,11 @@ local function PreSkinCharacterSheet()
         refresh:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
         refresh:RegisterEvent("PLAYER_ENTERING_WORLD")
         refresh:SetScript("OnEvent", function(_, event, unit)
+            -- SetUnit("player") forces a full 3D model reload. UPDATE_SHAPESHIFT_FORM
+            -- alone fires constantly in combat (form/stance/aura swaps), so only pay
+            -- the reload while the sheet is actually visible. The OnShow hook below
+            -- re-binds the model on open, so a change made while closed still lands.
+            if not (frame and frame:IsShown()) then return end
             if event == "UNIT_MODEL_CHANGED" and unit and unit ~= "player" then return end
             _refreshPlayerModel()
         end)
@@ -720,33 +730,34 @@ local function SkinCharacterSheet()
 
         for i = 1, select("#", closeBtn:GetRegions()) do
             local region = select(i, closeBtn:GetRegions())
-            if region and region:IsObjectType("Texture") then
+            if region and region:IsObjectType("Texture") and region ~= GetFFD(closeBtn).x then
                 region:SetAlpha(0)
             end
         end
 
-        local fontPath = EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("blizzardSkin") or STANDARD_TEXT_FONT
-
-        GetFFD(closeBtn).x = closeBtn:CreateFontString(nil, "OVERLAY")
-        GetFFD(closeBtn).x:SetFont(fontPath, 16, "")
-        GetFFD(closeBtn).x:SetText("x")
-        GetFFD(closeBtn).x:SetTextColor(1, 1, 1, 0.75)
-        GetFFD(closeBtn).x:SetPoint("CENTER", -2, -3)
+        local closeX = closeBtn:CreateTexture(nil, "OVERLAY")
+        closeX:SetAtlas("uitools-icon-close")
+        closeX:SetSize(14, 14)
+        closeX:SetPoint("CENTER", -2, 0)
+        closeX:SetVertexColor(1, 1, 1, 0.75)
+        GetFFD(closeBtn).x = closeX
 
         closeBtn:HookScript("OnEnter", function()
-            if GetFFD(closeBtn).x then GetFFD(closeBtn).x:SetTextColor(1, 1, 1, 1) end
+            if GetFFD(closeBtn).x then GetFFD(closeBtn).x:SetVertexColor(1, 1, 1, 1) end
         end)
         closeBtn:HookScript("OnLeave", function()
-            if GetFFD(closeBtn).x then GetFFD(closeBtn).x:SetTextColor(1, 1, 1, 0.75) end
+            if GetFFD(closeBtn).x then GetFFD(closeBtn).x:SetVertexColor(1, 1, 1, 0.75) end
         end)
     end
 
     local fontPath = EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("blizzardSkin") or STANDARD_TEXT_FONT
     local EG = EllesmereUI.ELLESMERE_GREEN or { r = 0.51, g = 0.784, b = 1 }
 
+    local charTabs = {}
     for i = 1, 3 do
         local tab = _G["CharacterFrameTab" .. i]
         if tab then
+            charTabs[#charTabs + 1] = tab
             for j = 1, select("#", tab:GetRegions()) do
                 local region = select(j, tab:GetRegions())
                 if region and region:IsObjectType("Texture") then
@@ -815,6 +826,9 @@ local function SkinCharacterSheet()
             end
         end
     end
+    -- Uniform one-physical-pixel seam between the bottom tabs, matching every
+    -- other themed window (the raw CharacterFrameTab frames sit further apart).
+    if ns.WSkin and ns.WSkin.NormalizeTabRow then ns.WSkin.NormalizeTabRow(charTabs) end
 
     local function UpdateTabVisuals()
         for i = 1, 3 do
@@ -2160,6 +2174,9 @@ local function SkinCharacterSheet()
                 valueButton:EnableMouse(true)
 
                 valueButton:SetScript("OnEnter", function()
+                    local specIndex = GetSpecialization and GetSpecialization()
+                    local role = specIndex and GetSpecializationRole(specIndex) or nil
+
                     local statValue = stat.func()
                     if issecretvalue(statValue) then return end
                     GameTooltip:SetOwner(valueButton, "ANCHOR_RIGHT")
@@ -2197,7 +2214,7 @@ local function SkinCharacterSheet()
                         local rawValue = stat.rawFunc()
                         GameTooltip:AddLine(
                             string.format(L("%s %.2f%% (%d rating)"), L(stat.name), percentValue, rawValue),
-                            scR, scG, scB, 1  -- category color (live)
+                            scR, scG, scB, true  -- category color (live)
                         )
                         -- Description for secondary stats
                         local description = ""
@@ -2209,7 +2226,6 @@ local function SkinCharacterSheet()
                             -- Pull the actual spec mastery spell description (e.g.
                             -- "Mastery: Razor Claws") so the tooltip explains what
                             -- the mastery does, not just a generic line.
-                            local specIndex = GetSpecialization and GetSpecialization()
                             if specIndex and GetSpecializationMasterySpells and C_Spell and C_Spell.GetSpellDescription then
                                 local masterySpell, masterySpell2 = GetSpecializationMasterySpells(specIndex)
                                 if masterySpell then
@@ -2236,6 +2252,12 @@ local function SkinCharacterSheet()
                         end
                         GameTooltip:AddLine(description, 1, 1, 1, true)
 
+                        if stat.name == "Crit" and GetCritChanceProvidesParryEffect() then
+                            local critToParry = GetCombatRatingBonusForCombatRatingValue(CR_PARRY, GetCombatRating(CR_CRIT_MELEE))
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine(string.format(L("Increases parry chance by %.2f%%."), critToParry), 1, 1, 1, true)
+                        end
+
                         -- Diminishing returns breakdown (opt-in via Stat Display)
                         if EllesmereUIDB and EllesmereUIDB.showAdjustedStats
                            and not issecretvalue(rawValue) and EllesmereUI.GetStatDR then
@@ -2245,12 +2267,12 @@ local function SkinCharacterSheet()
                                 GameTooltip:AddLine(" ")
                                 GameTooltip:AddLine(string.format(L("Adjusted Rating: %s"),
                                     BreakUpLargeNumbers(math.floor(adjusted + 0.5))),
-                                    scR, scG, scB, 1)
+                                    scR, scG, scB, true)
                                 GameTooltip:AddLine(string.format(L("Wasted Rating: %s"),
                                     BreakUpLargeNumbers(math.floor(wasted + 0.5))),
-                                    scR, scG, scB, 1)
+                                    scR, scG, scB, true)
                                 GameTooltip:AddLine(string.format(L("Penalty Percentage: %d%%"), penalty),
-                                    scR, scG, scB, 1)
+                                    scR, scG, scB, true)
                                 if nextThreshold then
                                     local nextRating = math.floor(nextThreshold + 0.5)
                                     local needed = nextRating - math.floor(rawValue + 0.5)
@@ -2258,13 +2280,15 @@ local function SkinCharacterSheet()
                                     GameTooltip:AddLine(string.format(L("Next %d%% Penalty At: %s (+%s)"),
                                         nextPenalty, BreakUpLargeNumbers(nextRating),
                                         BreakUpLargeNumbers(needed)),
-                                        scR, scG, scB, 1)
+                                        scR, scG, scB, true)
                                 end
                             end
                         end
                     -- Attributes
                     elseif stat.statIndex then
                         local base, _, posBuff, negBuff = UnitStat("player", stat.statIndex)
+                        -- base from UnitStat is wrong, so calculate it like the default UI does
+                        base = base - posBuff - negBuff
                         local statLabel = stat.name
 
                         -- Map to Blizzard global names
@@ -2283,13 +2307,86 @@ local function SkinCharacterSheet()
                         if bonus ~= 0 then
                             statLine = statLine .. " (" .. base .. (bonus > 0 and "+" or "") .. bonus .. ")"
                         end
-                        GameTooltip:AddLine(statLine, scR, scG, scB, 1)
+                        GameTooltip:AddLine(statLine, scR, scG, scB, true)
                         GameTooltip:AddLine(L(stat.tooltip), 1, 1, 1, true)
+
+                        -- Tanks have an extra line for Strength and Agility with parry chance / dodge chance respectively
+                        if role == "TANK" then
+                            if stat.name == "Strength" then
+                                if GetParryChanceFromAttribute then
+                                    local parryFromStr = GetParryChanceFromAttribute()
+
+                                    if parryFromStr and parryFromStr > 0 then
+                                        GameTooltip:AddLine(" ")
+                                        GameTooltip:AddLine(string.format(L("Increases parry chance by %.2f%%."), parryFromStr), 1, 1, 1, true)
+                                        GameTooltip:AddLine(L("|cff888888(Before diminishing returns)|r"), 1, 1, 1, true)
+                                    end
+                                end
+                            elseif stat.name == "Agility" then
+                                if GetDodgeChanceFromAttribute then
+                                    local dodgeChanceStr = GetDodgeChanceFromAttribute()
+
+                                    if dodgeChanceStr and dodgeChanceStr > 0 then
+                                        GameTooltip:AddLine(" ")
+                                        GameTooltip:AddLine(string.format(L("Increases dodge chance by %.2f%%."), dodgeChanceStr), 1, 1, 1, true)
+                                        GameTooltip:AddLine(L("|cff888888(Before diminishing returns)|r"), 1, 1, 1, true)
+                                    end
+                                end
+                            end
+                        end
                     -- Generic stats (Attack, Defense, etc.)
                     else
-                        GameTooltip:AddLine(titleLine, scR, scG, scB, 1)
+                        GameTooltip:AddLine(titleLine, scR, scG, scB, true)
                         if stat.tooltip then
                             GameTooltip:AddLine(L(stat.tooltip), 1, 1, 1, true)
+                        end
+
+                        if stat.name == "Armor" then
+                            local _, effectiveArmor = UnitArmor("player")
+                            local armorReduction = 0
+
+                            -- Reduction against an evenly matched enemy
+                            if C_PaperDollInfo and C_PaperDollInfo.GetArmorEffectiveness then
+                                armorReduction = (C_PaperDollInfo.GetArmorEffectiveness(effectiveArmor, UnitLevel("player")) or 0) * 100
+                            end
+                            if armorReduction > 0 then
+                                GameTooltip:AddLine(" ")
+                                GameTooltip:AddLine(string.format(L("Physical damage reduction: %.2f%%"), armorReduction), 1, 1, 1, true)
+                                GameTooltip:AddLine(L("|cff888888(Against an evenly matched enemy)|r"), 1, 1, 1, true)
+                            end
+
+                            -- Reduction against target. The return can be a
+                            -- SECRET number when the target's combat data is
+                            -- secret (12.0) -- comparing it would throw, so
+                            -- check issecretvalue before any compare.
+                            if C_PaperDollInfo and C_PaperDollInfo.GetArmorEffectivenessAgainstTarget then
+                                local targetEff = C_PaperDollInfo.GetArmorEffectivenessAgainstTarget(effectiveArmor)
+                                if targetEff and not issecretvalue(targetEff) and targetEff > 0 then
+                                    GameTooltip:AddLine(string.format(L("(Against Current Target: %.2f%%)"), targetEff * 100), 1, 1, 1, true)
+                                end
+                            end
+                        elseif stat.name == "Block" then
+                            local shieldBlockArmor = GetShieldBlock();
+                            local armorReduction = 0
+
+                            -- Reduction against an evenly matched enemy
+                            if C_PaperDollInfo and C_PaperDollInfo.GetArmorEffectiveness then
+                                armorReduction = (C_PaperDollInfo.GetArmorEffectiveness(shieldBlockArmor, UnitLevel("player")) or 0) * 100
+                            end
+                            if armorReduction > 0 then
+                                GameTooltip:AddLine(" ")
+                                GameTooltip:AddLine(string.format(L("Physical damage reduction: %.2f%%"), armorReduction), 1, 1, 1, true)
+                                GameTooltip:AddLine(L("|cff888888(Against an evenly matched enemy)|r"), 1, 1, 1, true)
+                            end
+
+                            -- Reduction against target. Same SECRET-number
+                            -- guard as the Armor block above.
+                            if C_PaperDollInfo and C_PaperDollInfo.GetArmorEffectivenessAgainstTarget then
+                                local targetEff = C_PaperDollInfo.GetArmorEffectivenessAgainstTarget(shieldBlockArmor)
+                                if targetEff and not issecretvalue(targetEff) and targetEff > 0 then
+                                    GameTooltip:AddLine(string.format(L("(Against Current Target: %.2f%%)"), targetEff * 100), 1, 1, 1, true)
+                                end
+                            end
                         end
                     end
 

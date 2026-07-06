@@ -187,9 +187,14 @@ local DM_DEFAULTS = {
             barHeight       = 18,
             barSpacing      = 2,
             numberFormat    = 2,
+            forceEnglishUnits = false, -- force K/M/B units, ignoring CJK locale's 萬/億 (opt-in; default keeps localized units)
             iconStyle       = "spec",
             iconColorUseAccent = false,
             iconColor       = { r = 1, g = 1, b = 1 },
+            customIconBorder  = false,
+            iconBorderTexture = "solid",
+            iconBorderSize    = 0,
+            iconBorderR = 0, iconBorderG = 0, iconBorderB = 0, iconBorderA = 1,
             showClassColor  = true,
             showPinnedSelf  = false,
             showHoverTooltip = true,
@@ -244,6 +249,50 @@ do
         return t
     end
     EllesmereUI.RegisterBorderDefaults("damagemeters", {
+        ["glow"] = {
+            defaultSize = 1,
+            sizes = AllSizes(0, 0, 0, 0),
+        },
+        ["blizz"] = {
+            defaultSize = 3,
+            sizes = {
+                [0] = { offsetX = 0, offsetY = 0, shiftX = 0, shiftY = 0 },
+                [1] = { offsetX = 2, offsetY = 1, shiftX = 0, shiftY = 0 },
+                [2] = { offsetX = 3, offsetY = 2, shiftX = 1, shiftY = 0 },
+                [3] = { offsetX = 4, offsetY = 2, shiftX = 1, shiftY = 0 },
+                [4] = { offsetX = 4, offsetY = 2, shiftX = 1, shiftY = 0 },
+            },
+        },
+        ["dialog"] = {
+            defaultSize = 1,
+            sizes = {
+                [0] = { offsetX = 0, offsetY = 0, shiftX = 0, shiftY = 0 },
+                [1] = { offsetX = 3, offsetY = 3, shiftX = 0, shiftY = 0 },
+                [2] = { offsetX = 3, offsetY = 5, shiftX = 0, shiftY = 0 },
+                [3] = { offsetX = 3, offsetY = 5, shiftX = 0, shiftY = 0 },
+                [4] = { offsetX = 5, offsetY = 10, shiftX = 0, shiftY = 0 },
+            },
+        },
+        ["sm:Blizzard Achievement Wood"] = {
+            defaultSize = 1,
+            sizes = {
+                [0] = { offsetX = 0, offsetY = 0, shiftX = 0, shiftY = 0 },
+                [1] = { offsetX = 1, offsetY = 1, shiftX = 0, shiftY = 0 },
+                [2] = { offsetX = 1, offsetY = 1, shiftX = 0, shiftY = 0 },
+                [3] = { offsetX = 1, offsetY = 6, shiftX = 0, shiftY = 0 },
+                [4] = { offsetX = 1, offsetY = 8, shiftX = 0, shiftY = 0 },
+            },
+        },
+    })
+end
+
+do
+    local function AllSizes(ox, oy, sx, sy)
+        local t = {}
+        for k = 0, 4 do t[k] = { offsetX = ox, offsetY = oy, shiftX = sx, shiftY = sy } end
+        return t
+    end
+    EllesmereUI.RegisterBorderDefaults("damagemeters_icon", {
         ["glow"] = {
             defaultSize = 1,
             sizes = AllSizes(0, 0, 0, 0),
@@ -901,27 +950,43 @@ local CJK = ({
     zhTW = { thousand = "千", wan = "萬", yi = "億" },
     koKR = { thousand = "천", wan = "만", yi = "억" },
 })[GetLocale()]
-do
-    local opts
-    if CJK then
-        opts = {
+-- Choose the abbreviation breakpoint table. CJK clients normally group by
+-- 萬/억; when the user opts into forceEnglish we fall through to K/M/B even on
+-- a CJK locale. Non-CJK clients always get K/M/B (forceEnglish is a no-op).
+local function BuildAbbrevOpts(forceEnglish)
+    if CJK and not forceEnglish then
+        return {
             { breakpoint = 100000000, abbreviation = CJK.yi,       significandDivisor = 1000000, fractionDivisor = 100, abbreviationIsGlobal = false },
             { breakpoint = 10000,     abbreviation = CJK.wan,      significandDivisor = 100,      fractionDivisor = 100, abbreviationIsGlobal = false },
             { breakpoint = 1000,      abbreviation = CJK.thousand, significandDivisor = 100,      fractionDivisor = 10,  abbreviationIsGlobal = false },
             { breakpoint = 1,         abbreviation = "",           significandDivisor = 1,        fractionDivisor = 1,   abbreviationIsGlobal = false },
         }
     else
-        opts = {
+        return {
             { breakpoint = 1000000000, abbreviation = "B", significandDivisor = 10000000, fractionDivisor = 100, abbreviationIsGlobal = false },
             { breakpoint = 1000000,    abbreviation = "M", significandDivisor = 10000,    fractionDivisor = 100, abbreviationIsGlobal = false },
             { breakpoint = 1000,       abbreviation = "K", significandDivisor = 100,      fractionDivisor = 10,  abbreviationIsGlobal = false },
             { breakpoint = 1,          abbreviation = "",  significandDivisor = 1,         fractionDivisor = 1,   abbreviationIsGlobal = false },
         }
     end
+end
+
+-- Rebuild _abbreviateCfg from the current saved setting. Runs once at load
+-- (DB not yet ready -> reads false -> identical to the previous behavior), once
+-- after the DB is created, and again whenever the options toggle flips. Cheap:
+-- just rebuilds one config object, never touches per-bar/per-refresh work.
+local function RebuildAbbrevCfg()
+    local forceEnglish = false
+    if ns.EDM and ns.EDM.DB then
+        local db = ns.EDM.DB()
+        if db and db.forceEnglishUnits then forceEnglish = true end
+    end
     if CreateAbbreviateConfig then
-        _abbreviateCfg = { config = CreateAbbreviateConfig(opts) }
+        _abbreviateCfg = { config = CreateAbbreviateConfig(BuildAbbrevOpts(forceEnglish)) }
     end
 end
+RebuildAbbrevCfg()
+ns.RebuildNumberFormat = RebuildAbbrevCfg
 
 local function AbbrevNumber(n)
     if n == nil then return "0" end
@@ -1939,6 +2004,30 @@ local function CreateDMWindow(winIdx)
                 c.borderTextureShiftX, c.borderTextureShiftY, "damagemeters", sz)
         end
         bar.ApplyBorder()
+        function bar.ApplyIconBorder()
+            local c = DB()
+            local sz = c.iconBorderSize or 0
+            local showIcon = (c.iconStyle or "spec") ~= "none"
+            if not c.customIconBorder or sz <= 0 or not showIcon then
+                if bar._iconBorderFrame then bar._iconBorderFrame:Hide() end
+                return
+            end
+            if not bar._iconBorderFrame then
+                bar._iconBorderFrame = CreateFrame("Frame", nil, bar.row)
+                bar._iconBorderFrame:SetFrameLevel(bar.row:GetFrameLevel() + 6)
+                bar._iconBorderFrame:SetAllPoints(bar.classIcon) -- tracks icon size/position
+            end
+            -- Follow the icon's actual shown state: ResolveIcon hides the icon
+            -- for sources without a usable class (secret/NPC rows), and a frame
+            -- anchored to a hidden texture would still render a floating border.
+            bar._iconBorderFrame:SetShown(bar.classIcon:IsShown())
+            local tex = c.iconBorderTexture or "solid"
+            EllesmereUI.ApplyBorderStyle(bar._iconBorderFrame, sz,
+                c.iconBorderR or 0, c.iconBorderG or 0, c.iconBorderB or 0, c.iconBorderA or 1,
+                tex, c.iconBorderTextureOffset, c.iconBorderTextureOffsetY,
+                c.iconBorderTextureShiftX, c.iconBorderTextureShiftY, "damagemeters_icon", sz)
+        end
+        bar.ApplyIconBorder()
         -- Per-bar track background (behind the fill). Default alpha 0 = invisible.
         bar._bg = bar.row:CreateTexture(nil, "BACKGROUND", nil, -8)
         bar._bg:SetAllPoints(bar.row)
@@ -3128,6 +3217,7 @@ local function CreateDMWindow(winIdx)
             W._stickyClassCache = classFile
             local iconOffset = showIcon and ResolveIcon(src, bar.classIcon, barH) or 0
             if not showIcon then bar.classIcon:Hide() end
+            if bar._iconBorderFrame then bar._iconBorderFrame:SetShown(bar.classIcon:IsShown()) end
             bar.fill:SetPoint("TOPLEFT", bar.row, "TOPLEFT", iconOffset, 0)
             bar.fill:SetPoint("TOPRIGHT", bar.row, "TOPRIGHT", 0, 0)
             if showClassColor then
@@ -3279,6 +3369,7 @@ local function CreateDMWindow(winIdx)
                             bar._cachedClass = classFile
                             local iconOffset = showIcon and ResolveIcon(src, bar.classIcon, barH) or 0
                             if not showIcon then bar.classIcon:Hide() end
+                            if bar._iconBorderFrame then bar._iconBorderFrame:SetShown(bar.classIcon:IsShown()) end
                             bar.fill:SetPoint("TOPLEFT", bar.row, "TOPLEFT", iconOffset, 0)
                             bar.fill:SetPoint("TOPRIGHT", bar.row, "TOPRIGHT", 0, 0)
                             bar._cachedColorClass = nil
@@ -4211,6 +4302,19 @@ ns.ApplyIconColor = function()
     end
 end
 
+ns.ApplyIconBorder = function()
+    for _, w in ipairs(_windows) do
+        if w.rowPool then
+            for _, bar in ipairs(w.rowPool) do
+                if bar.ApplyIconBorder then bar.ApplyIconBorder() end
+            end
+        end
+        if w.stickyPlayer and w.stickyPlayer.ApplyIconBorder then
+            w.stickyPlayer.ApplyIconBorder()
+        end
+    end
+end
+
 ns.ApplyDMPosition = function()
     for _, w in ipairs(_windows) do
         local wdb = WinDB(w.idx)
@@ -4729,6 +4833,9 @@ initFrame:SetScript("OnEvent", function(self)
     end
 
     EnsureDB()
+    -- DB is now available; rebuild number format so a saved forceEnglishUnits
+    -- preference is applied at login (load-time build ran before the DB existed).
+    if ns.RebuildNumberFormat then ns.RebuildNumberFormat() end
     -- Disable Blizzard's built-in damage meter UI; C_DamageMeter API still works
     SetCVarSafe("damageMeterEnabled", 0)
     AppendDMSharedMedia()

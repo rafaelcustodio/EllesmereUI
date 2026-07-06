@@ -373,6 +373,20 @@ local IP = {
     nextScan = 0,
 }
 
+-- Pooled scratch for the Ignore Pain overlay layer list. It is rebuilt on every
+-- absorb tick, so reuse one array + sub-tables instead of allocating fresh ones
+-- each time. UpdateSecondaryResource is not re-entrant, so a shared counter is
+-- safe. Stored on the IP table (not new locals) -- this file is at Lua's
+-- 200-local cap.
+IP.layers = {}
+IP.layerN = 0
+function IP.push(step, r, g, b, a)
+    IP.layerN = IP.layerN + 1
+    local t = IP.layers[IP.layerN]
+    if not t then t = {}; IP.layers[IP.layerN] = t end
+    t.step, t.r, t.g, t.b, t.a = step, r, g, b, a
+end
+
 local function GetIcicleCount()
     local _, classFile = UnitClass("player")
     local spec = GetSpecialization()
@@ -442,13 +456,13 @@ local function GetSecondaryResource()
     elseif classFile == "ROGUE" then
         local mx = UnitPowerMax("player", PT.COMBO)
         return { power = PT.COMBO, max = (not issecretvalue or not issecretvalue(mx)) and mx or 5, type = "points" }
-    elseif classFile == "DRUID" and spec == 3
+    elseif classFile == "DRUID" and spec == 3 and form == 5
            and ERB.db and ERB.db.profile and ERB.db.profile.secondary
            and ERB.db.profile.secondary.guardianIronfurBar then
-        -- Guardian Ironfur duration bar (moving hash lines). Checked BEFORE the
-        -- cat-form combo-points branch so entering Cat Form never swaps a
-        -- Guardian's bar to Feral combo points -- the Ironfur bar persists in
-        -- every form. max is a normalized fraction (0..1).
+        -- Guardian Ironfur duration bar (moving hash lines). Shown only in Bear
+        -- Form. Every other form falls through to the default
+        -- resource for that form (combo points in Cat Form, nothing in
+        -- caster/moonkin/travel). max is a normalized fraction (0..1).
         ironfurBaseDur = IronfurBaseDuration()
         return { power = "IRONFUR_BAR", max = 1, type = "bar" }
     elseif classFile == "DRUID" and form == 1 then
@@ -625,32 +639,181 @@ end
 
 -- Resolve the active threshold spec entry for the current player spec.
 -- Returns the matching entry from thresholdSpecs, or nil.
--- Priority: specific specID match > All Specs (specID 0) > nil.
-local function ResolveThresholdSpecEntry(sp)
+-- Priority (highest first):
+--   1. spec match + talent gate active
+--   2. spec match, no talent gate
+--   3. All Specs (specID 0) + talent gate active
+--   4. All Specs, no talent gate
+-- Entries carrying a talent gate that is not active are skipped.
+-- Druid "form specific" power-bar threshold mode: entries are keyed by the
+-- form's power type (advanced mode only). Maps the resolved primary power type
+-- to the entry's formKey.
+-- Threshold resolution is wrapped in a do-block so its cache state and helpers
+-- free their main-chunk local slots (this file sits at Lua's 200-local cap).
+-- Only ResolveThresholdSpecEntry stays a main-chunk local; the invalidator and
+-- spec resolver are reached via ns.InvalidateThresholdCaches / _G._ERB_ResolveSpecIDCached.
+local ResolveThresholdSpecEntry
+do
+local FORM_THRESHOLD_KEY = { [PT.MANA] = "mana", [PT.RAGE] = "rage", [PT.ENERGY] = "energy" }
+
+-- Spec ID and talent-gate state only change on spec/talent events, but
+-- ResolveThresholdSpecEntry runs on hot paths (up to ~60fps via the Ironfur
+-- bar). Cache both so the frame-loop doesn't re-query GetSpecialization or
+-- IsPlayerSpell/IsSpellKnown every tick. Invalidated by InvalidateThresholdCaches
+-- on the spec/talent events (see the event handler). The entry list itself is
+-- still re-scanned live each call, so options edits are reflected immediately.
+local _thrSpecID              -- nil = unknown, false = resolved-to-none, number = specID
+local _talentGateCache = {}   -- gate spellID -> bool
+local function InvalidateThresholdCaches()
+    _thrSpecID = nil
+    wipe(_talentGateCache)
+end
+ns.InvalidateThresholdCaches = InvalidateThresholdCaches
+
+local function ResolveSpecIDCached()
+    if _thrSpecID ~= nil then return _thrSpecID or nil end
+    local idx = GetSpecialization and GetSpecialization()
+    local sid = idx and C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfo(idx) or nil
+    _thrSpecID = sid or false
+    return sid
+end
+_G._ERB_ResolveSpecIDCached = ResolveSpecIDCached
+
+local function IsTalentGateActive(gate)
+    local v = _talentGateCache[gate]
+    if v == nil then
+        v = ((IsPlayerSpell and IsPlayerSpell(gate))
+            or (IsSpellKnown and IsSpellKnown(gate))) and true or false
+        _talentGateCache[gate] = v
+    end
+    return v
+end
+
+ResolveThresholdSpecEntry = function(sp)
     local entries = sp.thresholdSpecs
     if not entries or #entries == 0 then return nil end
 
-    local specIdx = GetSpecialization()
-    if not specIdx then return nil end
-    local specID = specIdx and C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfo(specIdx)
+    -- Form-specific mode (druid power bar): pick the entry matching the current
+    if sp.thresholdFormMode then
+        local key = FORM_THRESHOLD_KEY[GetPrimaryPowerType()]
+        if not key then return nil end
+        for _, entry in ipairs(entries) do
+            if entry.formKey == key then return entry end
+        end
+        return nil
+    end
+
+    local specID = ResolveSpecIDCached()
     if not specID then return nil end
 
-    local allSpecsEntry = nil
+    local specPlain, allTalent, allPlain
     for _, entry in ipairs(entries) do
         if entry.specIDs then
+            local matchSpec, matchAll = false, false
             for _, sid in ipairs(entry.specIDs) do
-                if sid == specID then return entry end
-                if sid == 0 then allSpecsEntry = entry end
+                if sid == specID then matchSpec = true end
+                if sid == 0 then matchAll = true end
+            end
+            if matchSpec or matchAll then
+                local gate = entry.talentSpellID
+                if gate then
+                    if IsTalentGateActive(gate) then
+                        -- spec + active talent gate is the top tier: nothing can
+                        -- outrank it, so return as soon as it is found.
+                        if matchSpec then return entry end
+                        allTalent = allTalent or entry
+                    end
+                    -- gated but inactive: skip
+                else
+                    if matchSpec then specPlain = specPlain or entry
+                    else allPlain = allPlain or entry end
+                end
             end
         end
     end
-    return allSpecsEntry
+
+    return specPlain or allTalent or allPlain
 end
+end  -- do (threshold resolution)
 
 -- Expose for options panel
 _G._ERB_BAR_TYPE_SPECS = BAR_TYPE_SPECS
 _G._ERB_BuildBarTypeSpecMap = BuildBarTypeSpecMap
 _G._ERB_ResolveThresholdSpecEntry = ResolveThresholdSpecEntry
+
+-- Resolve the effective health config table for the player's current spec:
+-- an Advanced per-spec override (copy-on-unsync, stored as advancedSpecs[i].health)
+-- when one exists for the current spec, otherwise the global health config.
+_G._ERB_ResolveHealthCfg = function(profile)
+    local p = profile or (ERB and ERB.db and ERB.db.profile)
+    if not p then return nil end
+    local specs = p.advancedSpecs
+    if specs and #specs > 0 then
+        local cur = _G._ERB_ResolveSpecIDCached()
+        if cur then
+            for i = 1, #specs do
+                local e = specs[i]
+                -- e.enabled == false => spec's Advanced config is toggled off,
+                -- fall back to the global Simple config (overrides preserved).
+                if e.specID == cur and e.enabled ~= false and e.health then return e.health end
+            end
+        end
+    end
+    return p.health
+end
+
+-- power equivalent of _ERB_ResolveHealthCfg
+_G._ERB_ResolvePowerCfg = function(profile)
+    local p = profile or (ERB and ERB.db and ERB.db.profile)
+    if not p then return nil end
+    local specs = p.advancedSpecs
+    if specs and #specs > 0 then
+        local cur = _G._ERB_ResolveSpecIDCached()
+        if cur then
+            for i = 1, #specs do
+                local e = specs[i]
+                if e.specID == cur and e.enabled ~= false and e.primary then return e.primary end
+            end
+        end
+    end
+    return p.primary
+end
+
+-- class resource equivalent of _ERB_ResolveHealthCfg
+_G._ERB_ResolveSecondaryCfg = function(profile)
+    local p = profile or (ERB and ERB.db and ERB.db.profile)
+    if not p then return nil end
+    local specs = p.advancedSpecs
+    if specs and #specs > 0 then
+        local cur = _G._ERB_ResolveSpecIDCached()
+        if cur then
+            for i = 1, #specs do
+                local e = specs[i]
+                if e.specID == cur and e.enabled ~= false and e.secondary then return e.secondary end
+            end
+        end
+    end
+    return p.secondary
+end
+
+-- True when the player's current spec has an active Advanced override for the
+-- given section ("health" | "primary" | "secondary") - the Simple config
+-- for that section is being ignored right now. The options page uses this to
+-- overlay the overridden Simple sections, so editing them doesn't silently do
+-- nothing. Same match rule as the resolvers above.
+_G._ERB_CurSpecOverridesSection = function(sectionKey, profile)
+    local p = profile or (ERB and ERB.db and ERB.db.profile)
+    if not p then return false end
+    local specs = p.advancedSpecs
+    if not specs or #specs == 0 then return false end
+    local cur = _G._ERB_ResolveSpecIDCached()
+    if not cur then return false end
+    for i = 1, #specs do
+        local e = specs[i]
+        if e.specID == cur and e.enabled ~= false and e[sectionKey] then return true end
+    end
+    return false
+end
 
 -------------------------------------------------------------------------------
 --  ColorCurve helper for secret-value-safe bar threshold coloring
@@ -688,6 +851,158 @@ local function GetBarThresholdCurve(baseR, baseG, baseB, threshR, threshG, thres
 
     _barColorCurve = curve
     _barColorCurveHash = hash
+    return curve
+end
+
+-------------------------------------------------------------------------------
+--  Multi-band threshold coloring. Values outside the last band
+--  fall back to fill color.
+--  last band = up to 80: 81-100 fill color
+--  first band = from 20: 0-19 fill color
+-------------------------------------------------------------------------------
+-- sp: base bar table
+-- entry: resolved per-spec threshold entry (may be nil)
+-- Returns: enabled(bool), bands(array), mode("percent"|"value"), reverse(bool)
+-- reverse: false => "up to" (less than or equal)
+--          true  => "from"  (greater than or equal)
+local function ResolveBandConfig(sp, entry)
+    local enabled, bands, mode, reverse
+    if entry then
+        enabled = entry.multiBandEnabled
+        if enabled == nil then enabled = sp.multiBandEnabled end
+        bands = (entry.bands and #entry.bands > 0) and entry.bands or sp.bands
+        mode = entry.bandMode or sp.bandMode or "percent"
+        reverse = entry.bandReverse
+        if reverse == nil then reverse = sp.bandReverse end
+    else
+        enabled = sp.multiBandEnabled
+        bands = sp.bands
+        mode = sp.bandMode or "percent"
+        reverse = sp.bandReverse
+    end
+    if not enabled or not bands or #bands == 0 then return false end
+    return true, bands, mode, reverse and true or false
+end
+
+-- Find the band whose count range contains `count` (pip resources)
+local function FindCountBand(bands, count, reverse)
+    if not bands or #bands == 0 then return nil end
+    if reverse then
+        for i = #bands, 1, -1 do
+            if count >= (bands[i].to or 0) then return bands[i] end
+        end
+        return nil
+    end
+    for i = 1, #bands do
+        if count <= (bands[i].to or 0) then return bands[i] end
+    end
+    return nil
+end
+
+-- Multi-stop step ColorCurve built from band fractions. `stops` is an ordered
+-- list of { frac=<0..1 upper boundary>, r, g, b, a }. Secret-safe: the curve is
+-- evaluated C-side by UnitPowerPercent/UnitHealthPercent against the (secret)
+-- current value, only the boundaries (derived from the clean max) live in Lua.
+-- Per-bar band-curve cache: cacheKey -> { hash, curve }. Keyed per bar so
+-- multiple multi-band bars (health + power, etc.) don't evict each other, and
+-- the change-signature is checked BEFORE building stops / the curve / its
+-- CreateColor points -- so on the common unchanged tick nothing heavy allocates.
+local _bandCurveCache = {}
+
+-- Build the ordered `stops` (frac space) for a bar-type resource from `bands`.
+-- `mode` "percent" -> frac = to/100; "value" -> frac = to/max (max clean for player).
+-- Returns a stops array, or nil if no usable bands.
+local function BuildBandStops(bands, mode, maxVal)
+    if not bands or #bands == 0 then return nil end
+    local stops = {}
+    for i = 1, #bands do
+        local b = bands[i]
+        local frac
+        if mode == "value" then
+            if not maxVal or maxVal <= 0 then return nil end
+            frac = (b.to or 0) / maxVal
+        else
+            frac = (b.to or 0) / 100
+        end
+        stops[i] = { frac = frac, r = b.r or 1, g = b.g or 1, b = b.b or 1, a = b.a or 1 }
+    end
+    return stops
+end
+
+-- cacheKey is a stable per-bar id ("health"/"primary"/"secondary"/"healthpoll").
+-- baseR/G/B is the bar's normal fill color. reverse=false (up to) / true (from).
+local function GetBarBandCurve(cacheKey, bands, mode, maxVal, baseR, baseG, baseB, reverse)
+    if not C_CurveUtil or not C_CurveUtil.CreateColorCurve then return nil end
+    if not bands or #bands == 0 then return nil end
+
+    -- Cheap change signature from the raw inputs, computed before any stops/curve
+    -- allocation. If unchanged since last build for this bar, return the cache.
+    local parts = {}
+    for i = 1, #bands do
+        local b = bands[i]
+        parts[i] = format("%.3f:%.3f,%.3f,%.3f,%.3f", b.to or 0, b.r or 1, b.g or 1, b.b or 1, b.a or 1)
+    end
+    parts[#parts + 1] = format("|%s|%.3f|%.3f,%.3f,%.3f|%s",
+        mode or "", maxVal or -1, baseR or -1, baseG or -1, baseB or -1, reverse and "r" or "")
+    local hash = table.concat(parts, "|")
+
+    local slot = _bandCurveCache[cacheKey]
+    if slot and slot.hash == hash then return slot.curve end
+    if not slot then slot = {}; _bandCurveCache[cacheKey] = slot end
+
+    local stops = BuildBandStops(bands, mode, maxVal)
+    if not stops then
+        slot.hash, slot.curve = hash, nil
+        return nil
+    end
+
+    local curve = C_CurveUtil.CreateColorCurve()
+    local EPSILON = 0.0001
+
+    if reverse then
+        -- "From" semantics: base fill holds from 0 up to the first boundary, then
+        -- each band's color steps in AT its boundary (inclusive) and holds upward.
+        local br, bg, bb = baseR or 1, baseG or 1, baseB or 1
+        curve:AddPoint(0.0, CreateColor(br, bg, bb, 1))
+        local pr, pg, pb, pa = br, bg, bb, 1
+        for i = 1, #stops do
+            local s = stops[i]
+            local f = math.max(0, math.min(1, s.frac or 0))
+            -- hold the previous region's color up to just before the boundary,
+            -- then switch to this band exactly at the boundary.
+            if f > 0.0 then
+                curve:AddPoint(math.max(0.0, f - EPSILON), CreateColor(pr, pg, pb, pa))
+            end
+            curve:AddPoint(f, CreateColor(s.r or 1, s.g or 1, s.b or 1, s.a or 1))
+            pr, pg, pb, pa = s.r or 1, s.g or 1, s.b or 1, s.a or 1
+        end
+        -- Top band holds to the end.
+        curve:AddPoint(1.0, CreateColor(pr, pg, pb, pa))
+    else
+        -- Hold the first band's color from 0 up to its boundary.
+        local first = stops[1]
+        curve:AddPoint(0.0, CreateColor(first.r or 1, first.g or 1, first.b or 1, first.a or 1))
+        for i = 1, #stops do
+            local s = stops[i]
+            local f = math.max(0, math.min(1, s.frac or 0))
+            curve:AddPoint(f, CreateColor(s.r or 1, s.g or 1, s.b or 1, s.a or 1))
+            local nxt = stops[i + 1]
+            if nxt and f < 1.0 then
+                curve:AddPoint(math.min(1.0, f + EPSILON), CreateColor(nxt.r or 1, nxt.g or 1, nxt.b or 1, nxt.a or 1))
+            end
+        end
+        -- Above the top band: revert to the base fill color
+        local last = stops[#stops]
+        local lastF = math.max(0, math.min(1, last.frac or 0))
+        if baseR and lastF < 1.0 then
+            curve:AddPoint(math.min(1.0, lastF + EPSILON), CreateColor(baseR, baseG, baseB, 1))
+            curve:AddPoint(1.0, CreateColor(baseR, baseG, baseB, 1))
+        else
+            curve:AddPoint(1.0, CreateColor(last.r or 1, last.g or 1, last.b or 1, last.a or 1))
+        end
+    end
+
+    slot.hash, slot.curve = hash, curve
     return curve
 end
 
@@ -739,6 +1054,11 @@ local DEFAULTS = {
             thresholdPct     = 30,
             thresholdR = 1.0, thresholdG = 0.2, thresholdB = 0.2, thresholdA = 1,
             thresholdSpecs = {},
+            -- Multi-band coloring
+            multiBandEnabled = false,
+            bandMode = "percent",  -- "percent" | "value" (bar/health/power only)
+            bandReverse = false,
+            bands = {},            -- ordered ascending by `to`: { { to=N, r,g,b,a }, ... }
         },
         primary = {
             enabled     = true,
@@ -777,6 +1097,11 @@ local DEFAULTS = {
             thresholdPartialOnly = false,
             thresholdR = 1.0, thresholdG = 0.2, thresholdB = 0.2, thresholdA = 1,
             thresholdSpecs = {},
+            -- Multi-band coloring
+            multiBandEnabled = false,
+            bandMode = "percent",
+            bandReverse = false,
+            bands = {},
             expandIfNoResource = false,
             -- Shift elements anchored to the power bar when the spec has no
             -- primary power (e.g. BM/MM Hunter, whose Focus shows as the class
@@ -799,6 +1124,7 @@ local DEFAULTS = {
             fillR       = 0.95, fillG = 0.90, fillB = 0.60, fillA = 1,
             bgR         = 1, bgG = 1, bgB = 1, bgA = 0.1,
             showText    = true,
+            showTextOnlyIfNoPower = false,  -- only show the resource text while the power bar is hidden (see IsPowerBarHidden)
             showPercent = true,
             showMaxStacks = true,
             textSize    = 11,
@@ -819,6 +1145,11 @@ local DEFAULTS = {
             thresholdR = 0x0c/255, thresholdG = 0xd2/255, thresholdB = 0x9d/255, thresholdA = 1,
             tickValues  = "",   -- comma-separated absolute resource values for tick marks (bar-type only)
             thresholdSpecs = {},  -- per-spec threshold/hash entries: { specIDs={0}, hashValues="", thresholdCount=3, thresholdPartialOnly=false }
+            -- Multi-band coloring
+            multiBandEnabled = false,
+            bandMode = "percent",
+            bandReverse = false,
+            bands = {},
             guardianIronfurBar = true,     -- Guardian Druid: show Ironfur duration bar (moving hash lines). New-user default; existing profiles pinned off via migration "resourcebars_guardian_ironfur_existing_off_v1".
             guardianShowHashLines = true,  -- Guardian Ironfur: draw the moving per-cast hash lines
             protIgnorePainBar = true,      -- Prot Warrior: show Ignore Pain bar (total absorbs vs the IP cap = 30% max health; aura stacks are secret). New-user default; existing profiles pinned off via migration "resourcebars_protwar_ignorepain_existing_off_v1".
@@ -1401,6 +1732,27 @@ local function IsSpecDisabled(barCfg)
 end
 
 -------------------------------------------------------------------------------
+--  Is the power bar effectively hidden right now?
+--  True when the power bar leaves no visible slot: globally disabled, filtered
+--  off for the current spec via the spec picker, the spec has no primary power,
+--  or hidden by "Hide Power Bar if Resource". Mirrors the conditions
+--  ResolveShiftDirPower reacts to, plus the hidePowerIfResource toggle. Used to
+--  gate features that should appear only in the power bar's absence (e.g. the
+--  class resource "Resource Text" shown only when the power bar is hidden).
+-------------------------------------------------------------------------------
+local function IsPowerBarHidden()
+    local p = ERB and ERB.db and ERB.db.profile
+    if not p then return false end
+    local pp = p.primary
+    if not pp then return true end
+    if pp.enabled == false then return true end
+    if IsSpecDisabled(pp) then return true end
+    if not GetPrimaryPowerType() then return true end
+    if p.secondary and p.secondary.hidePowerIfResource and GetSecondaryResource() then return true end
+    return false
+end
+
+-------------------------------------------------------------------------------
 --  Unlock mode: register with shared EllesmereUI unlock system
 -------------------------------------------------------------------------------
 local function RegisterUnlockElements()
@@ -1478,16 +1830,20 @@ local function RegisterUnlockElements()
     -- Health Bar
     do
         local function S() return ERB.db.profile.health end
+		-- Size callbacks use the spec-resolved power table (per-spec Advanced
+        -- override or global) so dimension matching lands where the bar renders
+        -- Position always stays on S() (global)
+        local function SS() return _G._ERB_ResolveHealthCfg() or S() end
         local save, load, clear, apply = MakePosHelpers(S, function() return healthBar end, 0, -65)
         elements[#elements + 1] = MK({
             key = "ERB_Health", label = "Health Bar", group = "Resource Bars", order = 500,
             getFrame = function() return healthBar end,
             isHidden = function() local s = S(); return not s.enabled or IsSpecDisabled(s) end,
             getSize  = function()
-                local s = S(); return s.width, s.height
+                local s = SS(); return s.width, s.height
             end,
-            setWidth = function(_, w) S().width = PP.Snap(w); Rebuild() end,
-            setHeight = function(_, h) S().height = PP.Snap(h); Rebuild() end,
+            setWidth = function(_, w) SS().width = PP.Snap(w); Rebuild() end,
+            setHeight = function(_, h) SS().height = PP.Snap(h); Rebuild() end,
             isAnchored = function() local s = S(); return s.anchorTo and s.anchorTo ~= "none" end,
             onLiveMove = LiveMove,
             savePos = save, loadPos = load, clearPos = clear, applyPos = apply,
@@ -1497,16 +1853,17 @@ local function RegisterUnlockElements()
     -- Power Bar
     do
         local function S() return ERB.db.profile.primary end
+        local function SS() return _G._ERB_ResolvePowerCfg() or S() end
         local save, load, clear, apply = MakePosHelpers(S, function() return primaryBar end, 0, -74)
         elements[#elements + 1] = MK({
             key = "ERB_Power", label = "Power Bar", group = "Resource Bars", order = 501,
             getFrame = function() return primaryBar end,
             isHidden = function() local s = S(); return s.enabled == false or IsSpecDisabled(s) end,
             getSize  = function()
-                local s = S(); return s.width or 214, s.height or 14
+                local s = SS(); return s.width or 214, s.height or 14
             end,
-            setWidth = function(_, w) S().width = PP.Snap(w); Rebuild() end,
-            setHeight = function(_, h) S().height = PP.Snap(h); Rebuild() end,
+            setWidth = function(_, w) SS().width = PP.Snap(w); Rebuild() end,
+            setHeight = function(_, h) SS().height = PP.Snap(h); Rebuild() end,
             isAnchored = function() local s = S(); return s.anchorTo and s.anchorTo ~= "none" end,
             onLiveMove = LiveMove,
             savePos = save, loadPos = load, clearPos = clear, applyPos = apply,
@@ -1516,20 +1873,21 @@ local function RegisterUnlockElements()
     -- Class Resource (pips/runes)
     do
         local function S() return ERB.db.profile.secondary end
+        local function SS() return _G._ERB_ResolveSecondaryCfg() or S() end
         local save, load, clear, apply = MakePosHelpers(S, function() return secondaryFrame end, 0, -38)
         elements[#elements + 1] = MK({
             key = "ERB_ClassResource", label = "Class Resource", group = "Resource Bars", order = 502,
             getFrame = function() return secondaryFrame end,
             getSize  = function()
-                local s = S()
+                local s = SS()
                 return s.pipWidth, s.pipHeight
             end,
             setWidth = function(_, w)
-                local s = S()
+                local s = SS()
                 s.pipWidth = PP.Snap(w)
                 Rebuild()
             end,
-            setHeight = function(_, h) S().pipHeight = PP.Snap(h); Rebuild() end,
+            setHeight = function(_, h) SS().pipHeight = PP.Snap(h); Rebuild() end,
             isHidden = function() local s = S(); return s.enabled == false or IsSpecDisabled(s) end,
             isAnchored = function() local s = S(); return s.anchorTo and s.anchorTo ~= "none" end,
             onLiveMove = LiveMove,
@@ -2017,7 +2375,12 @@ end
 -- sb: the frame, maxVal: max resource value, tickStr: comma-separated values,
 -- tickCache: table to store tick textures,
 -- hashWidth: pixel width (default 1), hashR/G/B/A: color (default white)
-local function ApplyResourceBarTicks(sb, maxVal, tickStr, tickCache, hashWidth, hashR, hashG, hashB, hashA)
+-- hashIsPercent: if true, the tick numbers are read as 0-100 percentages of the
+--   bar (frac = v/100) instead of absolute resource values (frac = v/maxVal).
+--   Bar-type only; pip resources always use counts. Default false (legacy).
+-- maxRenderVal (optional): suppress any tick whose resource-value position exceeds
+-- it (e.g. Devourer in Void Meta caps at 39 so nothing renders at the 40 edge).
+local function ApplyResourceBarTicks(sb, maxVal, tickStr, tickCache, hashWidth, hashR, hashG, hashB, hashA, hashIsPercent, maxRenderVal)
     local vals = ParseTickValues(tickStr)
 
     for i = 1, #tickCache do tickCache[i]:Hide() end
@@ -2054,10 +2417,22 @@ local function ApplyResourceBarTicks(sb, maxVal, tickStr, tickCache, hashWidth, 
     local barW = sb:GetWidth()
     local barH = sb:GetHeight()
     for i, v in ipairs(vals) do
-        if v <= maxVal then
+        local frac, inRange
+        if hashIsPercent then
+            inRange = (v <= 100)
+            frac = v / 100
+        else
+            inRange = (v <= maxVal)
+            frac = v / maxVal
+        end
+        -- Optional value-position cap (e.g. Devourer in Void Meta: nothing > 39).
+        if maxRenderVal and inRange then
+            local valPos = hashIsPercent and (frac * maxVal) or v
+            if valPos > maxRenderVal then inRange = false end
+        end
+        if inRange then
             local t = tickCache[i]
             t:SetColorTexture(tR, tG, tB, tA)
-            local frac = v / maxVal
             t:ClearAllPoints()
             local off = PP and PP.Scale(barW * frac) or (barW * frac)
             t:SetSize(pxW, barH)
@@ -2113,7 +2488,7 @@ local function BuildBars()
     local FALLBACK = DEFAULTS.profile
 
     -- Health bar
-    local hp = p.health or FALLBACK.health
+    local hp = _G._ERB_ResolveHealthCfg(p) or FALLBACK.health
     -- Snap stored width/height to the physical pixel grid so the frame is
     -- always a whole number of physical pixels. Use SnapForES (round to
     -- nearest) rather than PP.Scale (truncate) -- see Power bar note below.
@@ -2243,7 +2618,7 @@ local function BuildBars()
 
     -- Power bar (primary resource)
     cachedPrimary = GetPrimaryPowerType()
-    local pp = p.primary or FALLBACK.primary
+    local pp = _G._ERB_ResolvePowerCfg(p) or FALLBACK.primary
     -- Expand height when spec has no class resource and the option is enabled.
     -- Suppress the expand when unlock mode or EUI options panel is open so
     -- the mover/getSize reflects the real stored height, not the expanded one.
@@ -2256,7 +2631,7 @@ local function BuildBars()
     -- or writes the saved setting -- see _ERB_SuppressExpand in OnInitialize.
     if pp.expandIfNoResource and not _heightMatched
        and not EllesmereUI._erbExpandSuppressed and not EllesmereUI._unlockActive then
-        local sp2 = p.secondary or FALLBACK.secondary
+        local sp2 = _G._ERB_ResolveSecondaryCfg(p) or FALLBACK.secondary
         -- The class resource bar leaves an empty slot to expand into when "Show
         -- Class Resource" is toggled off, when it is disabled for the current
         -- spec via the spec picker, or when the spec has no class resource at
@@ -2440,7 +2815,7 @@ local function BuildBars()
 
     -- Class resource (secondary: pips / runes)
     cachedSecondary = GetSecondaryResource()
-    local sp = p.secondary or FALLBACK.secondary
+    local sp = _G._ERB_ResolveSecondaryCfg(p) or FALLBACK.secondary
     -- Create the frame UNCONDITIONALLY (mirrors the power bar) so anchored
     -- elements always have a target and "Shift Elements if No Resource" works
     -- whether the bar is hidden via the spec picker OR the "Show Class Resource"
@@ -2641,6 +3016,11 @@ local function BuildBars()
                 -- per-cast hash lines are drawn live in UpdateIronfurBar.
                 for i = 1, #secondaryBarTicks do secondaryBarTicks[i]:Hide() end
                 EnsureIronfurOverlay(secondaryBar)
+            elseif cachedSecondary.power == "IGNOREPAIN_BAR" then
+                -- Prot Ignore Pain: no static threshold hash lines (the absorb value
+                -- is secret, so value-positioned hashes are meaningless; the moving
+                -- duration hash line is drawn separately via IP.UpdateHash).
+                for i = 1, #secondaryBarTicks do secondaryBarTicks[i]:Hide() end
             else
                 -- Resolve hash lines from thresholdSpecs entry (falls back to legacy tickValues)
                 local _buildTsEntry = ResolveThresholdSpecEntry(sp)
@@ -2650,7 +3030,12 @@ local function BuildBars()
                 local _buildHG = _buildTsEntry and _buildTsEntry.hashColorG or 1
                 local _buildHB = _buildTsEntry and _buildTsEntry.hashColorB or 1
                 local _buildHA = _buildTsEntry and _buildTsEntry.hashColorA or 0.7
-                ApplyResourceBarTicks(secondaryBar, maxPts, _buildTickStr, secondaryBarTicks, _buildHW, _buildHR, _buildHG, _buildHB, _buildHA)
+                local _buildHPct = _buildTsEntry and _buildTsEntry.hashMode == "percent"
+                -- Devourer in Void Meta (1217607): cap the bar at 40, so hide any
+                -- hash above 39 (nothing at/beyond the meta edge).
+                local _buildHashCap = (cachedSecondary.power == "SOUL_FRAGMENTS_DEVOURER"
+                    and C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID(1217607)) and 39 or nil
+                ApplyResourceBarTicks(secondaryBar, maxPts, _buildTickStr, secondaryBarTicks, _buildHW, _buildHR, _buildHG, _buildHB, _buildHA, _buildHPct, _buildHashCap)
             end
             secondaryBar:Show()
         elseif cachedSecondary.type == "runes" then
@@ -2852,7 +3237,15 @@ local function BuildBars()
             secondaryFrame._countText:SetParent(secondaryFrame._countTextOverlay)
             secondaryFrame._countText:SetPoint("CENTER", secondaryFrame, "CENTER", sp.textXOffset, sp.textYOffset)
             SetRBFont(secondaryFrame._countText, GetRBFont(), sp.textSize)
-            secondaryFrame._countText:Show()
+            -- "Only if Power Bar Hidden": keep the fontstring created + updated
+            -- (so text-value writes never hit a nil), but hide it while the power
+            -- bar is visible. Re-evaluated on every build (spec / power changes
+            -- trigger a rebuild, same as the shift feature).
+            if sp.showTextOnlyIfNoPower and not IsPowerBarHidden() then
+                secondaryFrame._countText:Hide()
+            else
+                secondaryFrame._countText:Show()
+            end
         elseif secondaryFrame._countText then
             secondaryFrame._countText:Hide()
         end
@@ -2893,11 +3286,23 @@ local function BuildBars()
         local sp = ERB.db and ERB.db.profile and ERB.db.profile.secondary
         local active = sp ~= nil and (sp.shiftElementsIfNoResource == "Up"
             or sp.shiftElementsIfNoResource == "Down")
-        if (active or ERB._shiftWasActive)
-           and not EllesmereUI._unlockActive
-           and EllesmereUI.PropagateAnchorChain then
-            ERB._shiftWasActive = active
-            EllesmereUI.PropagateAnchorChain("ERB_ClassResource")
+        -- Only re-cascade on an actual shift-state CHANGE (resource present<->
+        -- absent, or the feature toggled off). Firing it on EVERY BuildBars while
+        -- the setting is merely enabled drove a full anchor cascade on every
+        -- rebuild -- on a profile with a busy anchor chain that re-walks the whole
+        -- chain and is a large CPU drain. The present<->absent transition is the
+        -- only moment the frame size stays the same, so it is the only moment the
+        -- normal SetPoint/OnSizeChanged hooks miss and this explicit cascade is
+        -- actually needed. dir: 0 = present (no shift), +/-1 = absent (shifted).
+        if not EllesmereUI._unlockActive and EllesmereUI.PropagateAnchorChain then
+            local dir = 0
+            if active and EllesmereUI._GetAnchorTargetShiftDir then
+                dir = EllesmereUI._GetAnchorTargetShiftDir("ERB_ClassResource") or 0
+            end
+            if dir ~= (ERB._lastShiftDir or 0) then
+                ERB._lastShiftDir = dir
+                EllesmereUI.PropagateAnchorChain("ERB_ClassResource")
+            end
         end
     end
 
@@ -2910,11 +3315,18 @@ local function BuildBars()
         local pp = ERB.db and ERB.db.profile and ERB.db.profile.primary
         local active = pp ~= nil and (pp.shiftElementsIfNoPower == "Up"
             or pp.shiftElementsIfNoPower == "Down")
-        if (active or ERB._shiftWasActivePower)
-           and not EllesmereUI._unlockActive
-           and EllesmereUI.PropagateAnchorChain then
-            ERB._shiftWasActivePower = active
-            EllesmereUI.PropagateAnchorChain("ERB_Power")
+        -- Same transition-only guard as the class-resource block above: only
+        -- cascade when the power present<->absent shift state actually changes,
+        -- not on every BuildBars call while the setting is enabled.
+        if not EllesmereUI._unlockActive and EllesmereUI.PropagateAnchorChain then
+            local dir = 0
+            if active and EllesmereUI._GetAnchorTargetShiftDir then
+                dir = EllesmereUI._GetAnchorTargetShiftDir("ERB_Power") or 0
+            end
+            if dir ~= (ERB._lastShiftDirPower or 0) then
+                ERB._lastShiftDirPower = dir
+                EllesmereUI.PropagateAnchorChain("ERB_Power")
+            end
         end
     end
 end
@@ -2925,7 +3337,7 @@ end
 -------------------------------------------------------------------------------
 local function UpdateHealthBar()
     if not healthBar or not healthBar:IsShown() then return end
-    local hp = ERB.db.profile.health
+    local hp = _G._ERB_ResolveHealthCfg()
 
     local cur = UnitHealth("player")
     local mx = UnitHealthMax("player")
@@ -2950,9 +3362,11 @@ local function UpdateHealthBar()
     -- Resolve per-spec threshold entry for health bar
     local _hpTsEntry = ResolveThresholdSpecEntry(hp)
     local _hpTsEnabled = _hpTsEntry and (_hpTsEntry.thresholdEnabled ~= false) or false
+    local _hpBandOn, _hpBands, _hpBandMode, _hpBandRev = ResolveBandConfig(hp, _hpTsEntry)
     if not _hpTsEnabled then _hpTsEntry = nil end
     local ft = healthBar:GetStatusBarTexture()
-    if _hpTsEntry and ft and UnitHealthPercent then
+    if (_hpTsEntry or _hpBandOn) and ft and UnitHealthPercent then
+        local curve
         local baseR, baseG, baseB
         if hp.customColored then
             baseR, baseG, baseB = hp.fillR, hp.fillG, hp.fillB
@@ -2960,10 +3374,15 @@ local function UpdateHealthBar()
             local cc = CLASS_COLORS[cachedClass]
             if cc then baseR, baseG, baseB = cc[1], cc[2], cc[3] else baseR, baseG, baseB = 0.15, 0.75, 0.30 end
         end
-        local tR = _hpTsEntry.thresholdR or hp.thresholdR or 1
-        local tG = _hpTsEntry.thresholdG or hp.thresholdG or 0.2
-        local tB = _hpTsEntry.thresholdB or hp.thresholdB or 0.2
-        local curve = GetBarThresholdCurve(baseR, baseG, baseB, tR, tG, tB, _hpTsEntry.thresholdPct or hp.thresholdPct or 30)
+        local _bandOn, _bands, _bandMode, _bandRev = _hpBandOn, _hpBands, _hpBandMode, _hpBandRev
+        if _bandOn then
+            curve = GetBarBandCurve("health", _bands, _bandMode, mx, baseR, baseG, baseB, _bandRev)
+        else
+            local tR = _hpTsEntry.thresholdR or hp.thresholdR or 1
+            local tG = _hpTsEntry.thresholdG or hp.thresholdG or 0.2
+            local tB = _hpTsEntry.thresholdB or hp.thresholdB or 0.2
+            curve = GetBarThresholdCurve(baseR, baseG, baseB, tR, tG, tB, _hpTsEntry.thresholdPct or hp.thresholdPct or 30)
+        end
         if curve then
             local ok, colorResult = pcall(UnitHealthPercent, "player", false, curve)
             if ok and colorResult and colorResult.GetRGBA then
@@ -3018,7 +3437,7 @@ end
 
 local function UpdatePrimaryBar()
     if not primaryBar or not primaryBar:IsShown() then return end
-    local pp = ERB.db.profile.primary
+    local pp = _G._ERB_ResolvePowerCfg()
 
     cachedPrimary = GetPrimaryPowerType()
     if not cachedPrimary then return end
@@ -3079,9 +3498,11 @@ local function UpdatePrimaryBar()
     -- Resolve per-spec threshold entry for power bar
     local _ppTsEntry = ResolveThresholdSpecEntry(pp)
     local _ppTsEnabled = _ppTsEntry and (_ppTsEntry.thresholdEnabled ~= false) or false
+    local _ppBandOn, _ppBands, _ppBandMode, _ppBandRev = ResolveBandConfig(pp, _ppTsEntry)
     if not _ppTsEnabled then _ppTsEntry = nil end
     local ft = primaryBar:GetStatusBarTexture()
-    if _ppTsEntry and ft and UnitPowerPercent then
+    if (_ppTsEntry or _ppBandOn) and ft and UnitPowerPercent then
+        local curve
         local baseR, baseG, baseB
         if pp.customColored then
             baseR, baseG, baseB = pp.fillR, pp.fillG, pp.fillB
@@ -3089,23 +3510,21 @@ local function UpdatePrimaryBar()
             local pc = POWER_COLORS[cachedPrimary]
             if pc then baseR, baseG, baseB = pc[1], pc[2], pc[3] else baseR, baseG, baseB = 1, 1, 1 end
         end
-        local tR = _ppTsEntry.thresholdR or pp.thresholdR or 1
-        local tG = _ppTsEntry.thresholdG or pp.thresholdG or 0.2
-        local tB = _ppTsEntry.thresholdB or pp.thresholdB or 0.2
-        local tPct = _ppTsEntry.thresholdPct or pp.thresholdPct or 30
-        local _ppPartial = _ppTsEntry.thresholdPartialOnly
-        if _ppPartial == nil then _ppPartial = pp.thresholdPartialOnly end
-        local curve
-        -- Default for a power resource: fill color BELOW the threshold, threshold
-        -- color AT/ABOVE it -- matching the segmented-resource path (Holy Power,
-        -- combo points, runes), where reaching the threshold count turns the
-        -- resource the threshold color. The "Reverse Threshold Fill Color" toggle
-        -- (thresholdPartialOnly) flips it so the threshold color shows BELOW the
-        -- threshold instead.
-        if _ppPartial then
-            curve = GetBarThresholdCurve(baseR, baseG, baseB, tR, tG, tB, tPct)
+        local _bandOn, _bands, _bandMode, _bandRev = _ppBandOn, _ppBands, _ppBandMode, _ppBandRev
+        if _bandOn then
+            curve = GetBarBandCurve("primary", _bands, _bandMode, mx, baseR, baseG, baseB, _bandRev)
         else
-            curve = GetBarThresholdCurve(tR, tG, tB, baseR, baseG, baseB, tPct)
+            local tR = _ppTsEntry.thresholdR or pp.thresholdR or 1
+            local tG = _ppTsEntry.thresholdG or pp.thresholdG or 0.2
+            local tB = _ppTsEntry.thresholdB or pp.thresholdB or 0.2
+            local tPct = _ppTsEntry.thresholdPct or pp.thresholdPct or 30
+            local _ppPartial = _ppTsEntry.thresholdPartialOnly
+            if _ppPartial == nil then _ppPartial = pp.thresholdPartialOnly end
+            if _ppPartial then
+                curve = GetBarThresholdCurve(baseR, baseG, baseB, tR, tG, tB, tPct)
+            else
+                curve = GetBarThresholdCurve(tR, tG, tB, baseR, baseG, baseB, tPct)
+            end
         end
         if curve then
             local ok, colorResult = pcall(UnitPowerPercent, "player", cachedPrimary, false, curve)
@@ -3206,7 +3625,7 @@ end
 -- to the longest-remaining fraction.
 local function UpdateIronfurBar()
     if not (secondaryBar and secondaryBar:IsShown()) then return end
-    local sp = ERB.db.profile.secondary
+    local sp = _G._ERB_ResolveSecondaryCfg() or ERB.db.profile.secondary
     local now = GetTime()
 
     -- Prune expired casts
@@ -3268,7 +3687,21 @@ local function UpdateIronfurBar()
         r, g, b, a = sp.fillR, sp.fillG, sp.fillB, sp.fillA or 1
     end
     local tsEntry = ResolveThresholdSpecEntry(sp)
-    if tsEntry and tsEntry.thresholdEnabled ~= false then
+    -- Ironfur colors by active stack count (not the bar's duration fraction), so
+    -- both the single threshold and multi-band are matched against `count`. Multi
+    -- takes priority when enabled with bands; otherwise fall back to the single
+    -- stack-count threshold. Bands here are count boundaries (the editor treats
+    -- this entry as count-based), so pick the active band via FindCountBand.
+    local bandOn, bands, _bandMode, bandRev = ResolveBandConfig(sp, tsEntry)
+    if bandOn then
+        local band = FindCountBand(bands, count, bandRev)
+        if band then
+            r = band.r or r
+            g = band.g or g
+            b = band.b or b
+            a = band.a or a
+        end
+    elseif tsEntry and tsEntry.thresholdEnabled ~= false then
         local threshCount = tsEntry.thresholdCount or sp.thresholdCount or 3
         if count >= threshCount then
             r = tsEntry.thresholdR or sp.thresholdR or r
@@ -3485,11 +3918,13 @@ local function UpdateSecondaryResource()
         return
     end
 
-    local sp = ERB.db.profile.secondary
+    local sp = _G._ERB_ResolveSecondaryCfg()
+	if not sp then return end
     -- Resolve per-spec threshold entry once per update
     local _tsEntry = ResolveThresholdSpecEntry(sp)
     -- Per-entry thresholdEnabled (defaults to true for migrated entries without the field)
     local _tsEnabled = _tsEntry and (_tsEntry.thresholdEnabled ~= false) or false
+    local _tsBandOn, _tsBands, _tsBandMode, _tsBandReverse = ResolveBandConfig(sp, _tsEntry)
     if not _tsEnabled then _tsEntry = nil end
     local _tsThreshCount = _tsEntry and _tsEntry.thresholdCount or sp.thresholdCount
     -- Enhance Five Bar needs a threshold of at least 7 (the bar is 5 pips + overflow).
@@ -3569,6 +4004,16 @@ local function UpdateSecondaryResource()
         -- Threshold: color ready runes differently when enough are available
         local runeUseThresh = _tsEntry and readyN >= _tsThreshCount
         local tr, tg, tb = _tsR, _tsG, _tsB
+        -- Multi-band threshold
+        if _tsBandOn then
+            local band = FindCountBand(_tsBands, readyN, _tsBandReverse)
+            if band then
+                runeUseThresh = true
+                tr, tg, tb = band.r, band.g, band.b
+            else
+                runeUseThresh = false
+            end
+        end
 
         if sp.runesSimple then
             -- Simple mode: flat pips like Holy Power (active/inactive, no recharge animation)
@@ -3598,7 +4043,7 @@ local function UpdateSecondaryResource()
 
                     local active = (i <= readyN)
                     if active and runeUseThresh then
-                        if _tsPartialOnly and i < _tsThreshCount then
+                        if not _tsBandOn and _tsPartialOnly and i < _tsThreshCount then
                             rf:SetActive(true, r, g, b, a)
                         else
                             rf:SetActive(true, tr, tg, tb)
@@ -3672,7 +4117,7 @@ local function UpdateSecondaryResource()
                         -- Ready rune: full brightness + restore background, hide recharge overlay
                         rf._bg:SetAlpha(1)
                         if runeUseThresh then
-                            if _tsPartialOnly and pos < _tsThreshCount then
+                            if not _tsBandOn and _tsPartialOnly and pos < _tsThreshCount then
                                 rf:SetActive(true, r, g, b, a)
                             else
                                 rf:SetActive(true, tr, tg, tb)
@@ -3811,7 +4256,7 @@ local function UpdateSecondaryResource()
             -- Reapply hash line positions when max changes or on first valid layout
             -- (bar width may be 0 at BuildBars time before layout settles)
             local barW = secondaryBar:GetWidth()
-            if barW > 0 and (maxChanged or not secondaryBar._hashApplied) then
+            if barW > 0 and (maxChanged or not secondaryBar._hashApplied) and powerType ~= "IGNOREPAIN_BAR" then
                 secondaryBar._hashApplied = true
                 local _rtTsEntry = ResolveThresholdSpecEntry(sp)
                 local _rtTickStr = (_rtTsEntry and _rtTsEntry.hashValues ~= "") and _rtTsEntry.hashValues or sp.tickValues
@@ -3820,7 +4265,11 @@ local function UpdateSecondaryResource()
                 local _rtHG = _rtTsEntry and _rtTsEntry.hashColorG or 1
                 local _rtHB = _rtTsEntry and _rtTsEntry.hashColorB or 1
                 local _rtHA = _rtTsEntry and _rtTsEntry.hashColorA or 0.7
-                ApplyResourceBarTicks(secondaryBar, maxC, _rtTickStr, secondaryBarTicks, _rtHW, _rtHR, _rtHG, _rtHB, _rtHA)
+                local _rtHPct = _rtTsEntry and _rtTsEntry.hashMode == "percent"
+                -- Devourer in Void Meta: hide any hash above 39.
+                local _rtHashCap = (powerType == "SOUL_FRAGMENTS_DEVOURER"
+                    and C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID(1217607)) and 39 or nil
+                ApplyResourceBarTicks(secondaryBar, maxC, _rtTickStr, secondaryBarTicks, _rtHW, _rtHR, _rtHG, _rtHB, _rtHA, _rtHPct, _rtHashCap)
             end
             -- Apply fill color (dark theme / class colored / custom).
             -- Brewmaster stagger uses threshold colors unless darkTheme is active.
@@ -3829,12 +4278,18 @@ local function UpdateSecondaryResource()
             if powerType ~= "BREWMASTER_STAGGER" or sp.darkTheme then
                 local ft = secondaryBar:GetStatusBarTexture()
                 if ft then
+                    -- Hide the Ignore Pain band/threshold overlays by default; the
+                    -- IP branch below re-shows exactly the layers it needs. Any other
+                    -- path (or IP with no threshold) thus leaves them hidden.
+                    if secondaryBar._ipBandBars then
+                        for _i = 1, #secondaryBar._ipBandBars do secondaryBar._ipBandBars[_i]:Hide() end
+                    end
                     local pType = (powerType == "MAELSTROM_BAR") and PT.MAELSTROM
                                or (powerType == "INSANITY_BAR") and PT.INSANITY
                                or (powerType == "FOCUS_BAR") and PT.FOCUS
                                or (powerType == "LUNAR_POWER_BAR") and PT.LUNAR_POWER
                                or nil
-                    if _tsEntry and pType and UnitPowerPercent then
+                    if (_tsEntry or _tsBandOn) and pType and UnitPowerPercent then
                         -- Use ColorCurve + UnitPowerPercent: WoW evaluates the secret
                         -- value against the curve on the C side, returns a Color object.
                         -- Default: threshold color above the value, fill below it
@@ -3843,16 +4298,23 @@ local function UpdateSecondaryResource()
                         -- for spender resources like Hunter Focus where you
                         -- want to warn when low.
                         local curve
-                        if _tsReverse then
+                        local _bandOn, _bands, _bandMode, _bandRev = _tsBandOn, _tsBands, _tsBandMode, _tsBandReverse
+                        local _tsThreshPct = _tsThreshCount or 30
+                        if _tsEntry and _tsEntry.thresholdMode == "value" and maxC and maxC > 0 then
+                            _tsThreshPct = math.min(100, (_tsThreshCount or 30) / maxC * 100)
+                        end
+                        if _bandOn then
+                            curve = GetBarBandCurve("secondary", _bands, _bandMode, maxC, r, g, b, _bandRev)
+                        elseif _tsReverse then
                             curve = GetBarThresholdCurve(
                                 r, g, b,                                -- fill color (above)
                                 _tsR or 1, _tsG or 0.2, _tsB or 0.2,   -- threshold color (below)
-                                _tsThreshCount or 30)
+                                _tsThreshPct)
                         else
                             curve = GetBarThresholdCurve(
                                 _tsR or 1, _tsG or 0.2, _tsB or 0.2,   -- threshold color (above)
                                 r, g, b,                                -- fill color (below)
-                                _tsThreshCount or 30)
+                                _tsThreshPct)
                         end
                         if curve then
                             local ok, colorResult = pcall(UnitPowerPercent, "player", pType, false, curve)
@@ -3870,6 +4332,84 @@ local function UpdateSecondaryResource()
                             ft:SetVertexColor(_tsR or 1, _tsG or 0.2, _tsB or 0.2, _tsA or 1)
                         else
                             ft:SetVertexColor(r, g, b, a)
+                        end
+                    elseif powerType == "IGNOREPAIN_BAR" and (_tsEntry or _tsBandOn) and maxC and maxC > 0 then
+                        -- Ignore Pain is a bar but not a real power type, its
+						-- absorb value is secret in combat. Use the secret-safe
+						-- StatusBar-overlay technique (same as Vengeance pips)
+                        -- the bar's fill texture is the "cell",
+                        -- and each overlay repaints the whole visible fill
+                        local function _ipBound(to)
+                            return (_tsBandMode == "value") and (to or 0) or (maxC * (to or 0) / 100)
+                        end
+                        IP.layerN = 0
+                        if _tsBandOn and _tsBands and #_tsBands > 0 then
+                            if _tsBandReverse then
+                                -- "From"
+                                IP.push(0, r, g, b, a)
+                                for k = 1, #_tsBands do
+                                    local bd = _tsBands[k]
+                                    IP.push(_ipBound(bd.to), bd.r or 1, bd.g or 1, bd.b or 1, bd.a or a)
+                                end
+                            else
+                                -- "Up to"
+                                local b1 = _tsBands[1]
+                                IP.push(0, b1.r or 1, b1.g or 1, b1.b or 1, b1.a or a)
+                                for k = 1, #_tsBands - 1 do
+                                    local nb = _tsBands[k + 1]
+                                    IP.push(_ipBound(_tsBands[k].to), nb.r or 1, nb.g or 1, nb.b or 1, nb.a or a)
+                                end
+                                IP.push(_ipBound(_tsBands[#_tsBands].to), r, g, b, a)
+                            end
+                        elseif _tsEntry and _tsEntry.thresholdEnabled ~= false and _tsThreshCount then
+                            local tv = (_tsEntry.thresholdMode == "value") and _tsThreshCount or (maxC * _tsThreshCount / 100)
+                            if _tsReverse then
+                                -- threshold color below the value, base fill at/above.
+                                IP.push(0, _tsR or 1, _tsG or 0.2, _tsB or 0.2, _tsA or 1)
+                                IP.push(tv, r, g, b, a)
+                            else
+                                -- base fill below, threshold color at/above.
+                                IP.push(0, r, g, b, a)
+                                IP.push(tv, _tsR or 1, _tsG or 0.2, _tsB or 0.2, _tsA or 1)
+                            end
+                        else
+                            IP.push(0, r, g, b, a)
+                        end
+                        -- Base layer paints the bar's own fill.
+                        local _base = IP.layers[1]
+                        ft:SetVertexColor(_base.r, _base.g, _base.b, _base.a)
+                        local bars = secondaryBar._ipBandBars
+                        if not bars then bars = {}; secondaryBar._ipBandBars = bars end
+                        local host = secondaryBar._sb or secondaryBar
+                        local texKey = ERB.db and ERB.db.profile and ERB.db.profile.general and ERB.db.profile.general.barTexture or "none"
+                        local texPath = EllesmereUI.ResolveTexturePath(_G._ERB_BarTextures, texKey, "Interface\\Buttons\\WHITE8x8")
+                        local shown = 0
+                        for li = 2, IP.layerN do
+                            local L = IP.layers[li]
+                            if L.step and L.step > 0 then
+                                shown = shown + 1
+                                local ob = bars[shown]
+                                if not ob then
+                                    ob = CreateFrame("StatusBar", nil, host)
+                                    -- Anchors are constant to the fill texture; set once.
+                                    ob:SetPoint("TOPLEFT", ft, "TOPLEFT", 0, 0)
+                                    ob:SetPoint("BOTTOMRIGHT", ft, "BOTTOMRIGHT", 1, 0)
+                                    bars[shown] = ob
+                                end
+                                -- Texture/level change on config/rebuild, not per tick.
+                                if ob._texPath ~= texPath then
+                                    ob:SetStatusBarTexture(texPath)
+                                    local _obt = ob:GetStatusBarTexture()
+                                    if _obt then _obt:SetSnapToPixelGrid(false); _obt:SetTexelSnappingBias(0) end
+                                    ob._texPath = texPath
+                                end
+                                local _lvl = host:GetFrameLevel() + shown
+                                if ob._lvl ~= _lvl then ob:SetFrameLevel(_lvl); ob._lvl = _lvl end
+                                ob:SetMinMaxValues(L.step * 0.999, L.step)
+                                ob:SetValue(cur)
+                                ob:SetStatusBarColor(L.r, L.g, L.b, L.a)
+                                ob:Show()
+                            end
                         end
                     else
                         ft:SetVertexColor(r, g, b, a)
@@ -4003,6 +4543,24 @@ local function UpdateSecondaryResource()
             -- Threshold coloring via a second, threshold-colored
             -- StatusBar overlay per pip.
             local _useThresh = _tsEntry and _tsThreshCount and _tsThreshCount > 0
+            -- Multi-band: precompute each band's start count. A band overlay fills
+            -- pip i when cur >= max(i, start_k); higher bands sit on higher frame
+            -- levels so the topmost filled band wins.
+            local _bandStarts
+            if _tsBandOn and _tsBands then
+                _bandStarts = {}
+                if _tsBandReverse then
+                    for k = 1, #_tsBands do
+                        _bandStarts[k] = (_tsBands[k].to or 0)
+                    end
+                else
+                    local prev = 0
+                    for k = 1, #_tsBands do
+                        _bandStarts[k] = prev + 1
+                        prev = _tsBands[k].to or prev
+                    end
+                end
+            end
             for i = 1, maxC do
                 local pip = pips[i]
                 if pip and pip:IsShown() then
@@ -4024,28 +4582,85 @@ local function UpdateSecondaryResource()
                     pip._secretBar:SetStatusBarColor(r, g, b, a)
                     pip._secretBar:Show()
 
-                    -- Threshold overlay (drawn on top of the base fill)
-                    -- Partial-only: pips below the threshold index never recolor.
-                    local showThresh = _useThresh and not (_tsPartialOnly and i < _tsThreshCount)
-                    if showThresh then
-                        if not pip._secretThreshBar then
-                            local tb = CreateFrame("StatusBar", nil, pip)
-                            tb:SetAllPoints(pip._fill)
-                            tb:SetStatusBarTexture(texPath)
-                            tb:SetFrameLevel(pip:GetFrameLevel() + 1)
-                            pip._secretThreshBar = tb
-                        else
-                            pip._secretThreshBar:SetStatusBarTexture(texPath)
+                    if _tsBandOn and _bandStarts then
+                        -- Multi-band overlays: one StatusBar per band, higher bands
+                        -- on top -> the topmost reached band colors the whole bar.
+                        if not pip._bandBars then pip._bandBars = {} end
+                        for k = 1, #_tsBands do
+                            local bb = pip._bandBars[k]
+                            if not bb then
+                                bb = CreateFrame("StatusBar", nil, pip)
+                                bb:SetAllPoints(pip._fill)
+                                pip._bandBars[k] = bb
+                            end
+                            -- Texture/level only change on a config or rebuild, not
+                            -- per tick -- re-apply only when they actually differ so
+                            -- the hot loop doesn't fire pips x bands redundant calls.
+                            if bb._texPath ~= texPath then
+                                bb:SetStatusBarTexture(texPath); bb._texPath = texPath
+                            end
+                            local _lvl = pip:GetFrameLevel() + k
+                            if bb._lvl ~= _lvl then
+                                bb:SetFrameLevel(_lvl); bb._lvl = _lvl
+                            end
+                            local lo = (i > _bandStarts[k]) and i or _bandStarts[k]
+                            bb:SetMinMaxValues(lo - 1, lo)
+                            bb:SetValue(cur)
+                            local band = _tsBands[k]
+                            bb:SetStatusBarColor(band.r or 1, band.g or 1, band.b or 1, a)
+                            bb:Show()
                         end
-                        -- Fills only when cur >= max(i, threshCount): the pip is
-                        -- active AND the threshold has been reached.
-                        local tlo = (i > _tsThreshCount) and i or _tsThreshCount
-                        pip._secretThreshBar:SetMinMaxValues(tlo - 1, tlo)
-                        pip._secretThreshBar:SetValue(cur)
-                        pip._secretThreshBar:SetStatusBarColor(_tsR or 1, _tsG or 0.2, _tsB or 0.2, a)
-                        pip._secretThreshBar:Show()
-                    elseif pip._secretThreshBar then
-                        pip._secretThreshBar:Hide()
+                        for k = #_tsBands + 1, #pip._bandBars do pip._bandBars[k]:Hide() end
+                        if not _tsBandReverse then
+                            -- "Up to" semantics: above the top band, revert to the base
+                            -- fill color. A topmost overlay fills when cur > top band's `to`.
+                            local _topTo = _tsBands[#_tsBands] and _tsBands[#_tsBands].to or 0
+                            if not pip._bandResetBar then
+                                local rb = CreateFrame("StatusBar", nil, pip)
+                                rb:SetAllPoints(pip._fill)
+                                pip._bandResetBar = rb
+                            end
+                            pip._bandResetBar:SetStatusBarTexture(texPath)
+                            pip._bandResetBar:SetFrameLevel(pip:GetFrameLevel() + #_tsBands + 1)
+                            local _rlo = (i > (_topTo + 1)) and i or (_topTo + 1)
+                            pip._bandResetBar:SetMinMaxValues(_rlo - 1, _rlo)
+                            pip._bandResetBar:SetValue(cur)
+                            pip._bandResetBar:SetStatusBarColor(r, g, b, a)
+                            pip._bandResetBar:Show()
+                        elseif pip._bandResetBar then
+                            -- "From" semantics: base fill below the first boundary is
+                            -- handled by the base _secretBar; no reset overlay needed.
+                            pip._bandResetBar:Hide()
+                        end
+                        if pip._secretThreshBar then pip._secretThreshBar:Hide() end
+                    else
+                        if pip._bandResetBar then pip._bandResetBar:Hide() end
+                        if pip._bandBars then
+                            for k = 1, #pip._bandBars do pip._bandBars[k]:Hide() end
+                        end
+                        -- Threshold overlay (drawn on top of the base fill)
+                        -- Partial-only: pips below the threshold index never recolor.
+                        local showThresh = _useThresh and not (_tsPartialOnly and i < _tsThreshCount)
+                        if showThresh then
+                            if not pip._secretThreshBar then
+                                local tb = CreateFrame("StatusBar", nil, pip)
+                                tb:SetAllPoints(pip._fill)
+                                tb:SetStatusBarTexture(texPath)
+                                tb:SetFrameLevel(pip:GetFrameLevel() + 1)
+                                pip._secretThreshBar = tb
+                            else
+                                pip._secretThreshBar:SetStatusBarTexture(texPath)
+                            end
+                            -- Fills only when cur >= max(i, threshCount): the pip is
+                            -- active AND the threshold has been reached.
+                            local tlo = (i > _tsThreshCount) and i or _tsThreshCount
+                            pip._secretThreshBar:SetMinMaxValues(tlo - 1, tlo)
+                            pip._secretThreshBar:SetValue(cur)
+                            pip._secretThreshBar:SetStatusBarColor(_tsR or 1, _tsG or 0.2, _tsB or 0.2, a)
+                            pip._secretThreshBar:Show()
+                        elseif pip._secretThreshBar then
+                            pip._secretThreshBar:Hide()
+                        end
                     end
 
                     -- Hide the normal fill; the StatusBar replaces it
@@ -4060,7 +4675,13 @@ local function UpdateSecondaryResource()
             -- Clean-value path: normal boolean comparisons
             -- Hide any leftover secret StatusBar overlays
             for i = 1, maxC do
-                if pips[i] and pips[i]._secretBar then pips[i]._secretBar:Hide() end
+                local p = pips[i]
+                if p then
+                    if p._secretBar then p._secretBar:Hide() end
+                    if p._secretThreshBar then p._secretThreshBar:Hide() end
+                    if p._bandResetBar then p._bandResetBar:Hide() end
+                    if p._bandBars then for k = 1, #p._bandBars do p._bandBars[k]:Hide() end end
+                end
             end
             -- Enhance 5-bar overflow: stacks 6-10 recolor pips 1-5
             local _enhFive = sp.enhanceFiveBar and powerType == "MAELSTROM_WEAPON"
@@ -4072,6 +4693,16 @@ local function UpdateSecondaryResource()
 
             local useThresh = _tsEntry and (cur >= _tsThreshCount or _enhRealCur >= _tsThreshCount)
             local tr, tg, tb = _tsR, _tsG, _tsB
+            -- Multi-band: whole bar takes the color of the band containing `cur`.
+            if _tsBandOn and not _enhFive then
+                local band = FindCountBand(_tsBands, cur, _tsBandReverse)
+                if band then
+                    useThresh = true
+                    tr, tg, tb = band.r, band.g, band.b
+                else
+                    useThresh = false
+                end
+            end
             for i = 1, maxC do
                 if pips[i] and pips[i]:IsShown() then
                     local active = i <= cur
@@ -4086,7 +4717,7 @@ local function UpdateSecondaryResource()
                             pips[i]:SetActive(true, tr, tg, tb)
                         end
                     elseif active and useThresh then
-                        if _tsPartialOnly and i < _tsThreshCount then
+                        if not _tsBandOn and _tsPartialOnly and i < _tsThreshCount then
                             pips[i]:SetActive(true, r, g, b, a)
                         else
                             pips[i]:SetActive(true, tr, tg, tb)
@@ -4105,6 +4736,16 @@ local function UpdateSecondaryResource()
         local cur = UnitPower("player", powerType)
         local useThresh = _tsEntry and cur >= _tsThreshCount
         local tr, tg, tb = _tsR, _tsG, _tsB
+        -- Multi-band
+        if _tsBandOn then
+            local band = FindCountBand(_tsBands, cur, _tsBandReverse)
+            if band then
+                useThresh = true
+                tr, tg, tb = band.r, band.g, band.b
+            else
+                useThresh = false
+            end
+        end
 
         -- Fractional resource detection
         local frac = 0
@@ -4190,7 +4831,7 @@ local function UpdateSecondaryResource()
                         pips[i]:SetActive(true, cr * 0.5, cg * 0.5, cb * 0.5, ca)
                     end
                 elseif active and useThresh then
-                    if _tsPartialOnly and i < _tsThreshCount then
+                    if not _tsBandOn and _tsPartialOnly and i < _tsThreshCount then
                         pips[i]:SetActive(true, r, g, b, a)
                     else
                         pips[i]:SetActive(true, tr, tg, tb)
@@ -4219,7 +4860,16 @@ local function UpdateSecondaryResource()
                 nextPip._rechargeBar = sb
             end
             nextPip._rechargeBar:SetValue(frac)
-            nextPip._rechargeBar:SetStatusBarColor(r * 0.75, g * 0.75, b * 0.75, a)
+            --  Partial generator (Evoker/Lock): Color the filling pip the same way the full pips are colored: when the
+            -- threshold/band applies to this pip's slot (index cur+1) use that color,
+            -- otherwise the base color. Kept dimmed (*0.75) so it still reads as
+            -- "recharging" rather than a completed pip.
+            local fr, fg, fb = r, g, b
+            local fi = cur + 1
+            if useThresh and not (not _tsBandOn and _tsPartialOnly and fi < _tsThreshCount) then
+                fr, fg, fb = tr, tg, tb
+            end
+            nextPip._rechargeBar:SetStatusBarColor(fr * 0.75, fg * 0.75, fb * 0.75, a)
             nextPip._rechargeBar:Show()
         end
 
@@ -4239,7 +4889,7 @@ end
 --  Visibility & combat fade
 -------------------------------------------------------------------------------
 local function ShouldShowSecondary()
-    local sp = ERB.db.profile.secondary
+    local sp = _G._ERB_ResolveSecondaryCfg()
     -- Check visibility options first
     if EllesmereUI and EllesmereUI.CheckVisibilityOptions and EllesmereUI.CheckVisibilityOptions(sp) then return false end
     local vis = sp.visibility
@@ -4290,7 +4940,7 @@ local function UpdateVisibility()
 
     -- Health bar visibility
     if healthBar then
-        local hp = ERB.db.profile.health
+        local hp = _G._ERB_ResolveHealthCfg()
         if hp and hp.enabled and not IsSpecDisabled(hp) and ShouldShowBar(hp) and not inVehicle then
             healthBar:Show()
             EllesmereUI.SetElementVisibility(healthBar, true)
@@ -4302,7 +4952,7 @@ local function UpdateVisibility()
 
     -- Power bar visibility
     if primaryBar then
-        local pp = ERB.db.profile.primary
+        local pp = _G._ERB_ResolvePowerCfg()
         local sp = ERB.db.profile.secondary
         -- Also check cachedPrimary: specs without a primary power (e.g. BM/MM Hunter)
         -- should hide the power bar even if enabled in settings
@@ -4318,7 +4968,7 @@ local function UpdateVisibility()
 
     -- Secondary resource visibility + ooc alpha
     if secondaryFrame then
-        local sp = ERB.db.profile.secondary
+        local sp = _G._ERB_ResolveSecondaryCfg()
         if sp and sp.enabled ~= false and not IsSpecDisabled(sp) and cachedSecondary and ShouldShowSecondary() and not inVehicle then
             secondaryFrame:Show()
             EllesmereUI.SetElementVisibility(secondaryFrame, true)
@@ -4350,6 +5000,11 @@ local function OnUpdate(self, dt)
                 cur = Lerp(cur, tgt, min(1, dt * SMOOTH_SPEED))
                 healthBar._smoothCurrent = cur
                 healthBar:SetValue(cur)
+            elseif cur ~= tgt then
+                -- Snap to the exact target so the bar reaches 100% at max instead of
+                -- settling short
+                healthBar._smoothCurrent = tgt
+                healthBar:SetValue(tgt)
             end
         end
         -- Poll threshold color at ~20fps so it reacts without waiting for UNIT_HEALTH.
@@ -4357,13 +5012,16 @@ local function OnUpdate(self, dt)
         _hpColorThrottle = _hpColorThrottle + dt
         if _hpColorThrottle >= 0.05 then
             _hpColorThrottle = 0
-            local hp = ERB.db.profile.health
+            local hp = _G._ERB_ResolveHealthCfg()
             local _hpPollEntry = hp and ResolveThresholdSpecEntry(hp) or nil
             local _hpPollEnabled = _hpPollEntry and (_hpPollEntry.thresholdEnabled ~= false) or false
+            local _hpPollBandOn, _hpPollBands, _hpPollBandMode, _hpPollBandRev
+            if hp then _hpPollBandOn, _hpPollBands, _hpPollBandMode, _hpPollBandRev = ResolveBandConfig(hp, _hpPollEntry) end
             if not _hpPollEnabled then _hpPollEntry = nil end
-            if _hpPollEntry and UnitHealthPercent then
+            if (_hpPollEntry or _hpPollBandOn) and UnitHealthPercent then
                 local ft = healthBar:GetStatusBarTexture()
                 if ft then
+                    local curve
                     local baseR, baseG, baseB
                     if hp.customColored then
                         baseR, baseG, baseB = hp.fillR, hp.fillG, hp.fillB
@@ -4372,10 +5030,17 @@ local function OnUpdate(self, dt)
                         if cc then baseR, baseG, baseB = cc[1], cc[2], cc[3]
                         else baseR, baseG, baseB = 0.15, 0.75, 0.30 end
                     end
-                    local tR = _hpPollEntry.thresholdR or hp.thresholdR or 1
-                    local tG = _hpPollEntry.thresholdG or hp.thresholdG or 0.2
-                    local tB = _hpPollEntry.thresholdB or hp.thresholdB or 0.2
-                    local curve = GetBarThresholdCurve(baseR, baseG, baseB, tR, tG, tB, _hpPollEntry.thresholdPct or hp.thresholdPct or 30)
+                    local _bandOn, _bands, _bandMode, _bandRev = _hpPollBandOn, _hpPollBands, _hpPollBandMode, _hpPollBandRev
+                    if _bandOn then
+                        local maxHP = UnitHealthMax and UnitHealthMax("player") or nil
+                        if maxHP and issecretvalue and issecretvalue(maxHP) then maxHP = nil end
+                        curve = GetBarBandCurve("healthpoll", _bands, _bandMode, maxHP, baseR, baseG, baseB, _bandRev)
+                    else
+                        local tR = _hpPollEntry.thresholdR or hp.thresholdR or 1
+                        local tG = _hpPollEntry.thresholdG or hp.thresholdG or 0.2
+                        local tB = _hpPollEntry.thresholdB or hp.thresholdB or 0.2
+                        curve = GetBarThresholdCurve(baseR, baseG, baseB, tR, tG, tB, _hpPollEntry.thresholdPct or hp.thresholdPct or 30)
+                    end
                     if curve then
                         local ok, colorResult = pcall(UnitHealthPercent, "player", false, curve)
                         if ok and colorResult and colorResult.GetRGBA then
@@ -4399,7 +5064,7 @@ local function OnUpdate(self, dt)
                 primaryBar._smoothTarget = remaining
                 primaryBar._smoothCurrent = remaining
                 -- Text
-                local pp = ERB.db and ERB.db.profile and ERB.db.profile.primary
+                local pp = _G._ERB_ResolvePowerCfg()
                 if pp and pp.textFormat and pp.textFormat ~= "none" then
                     local fmt = pp.textFormat
                     local percentSuffix = (pp.showPercent == false) and "" or "%"
@@ -4422,6 +5087,9 @@ local function OnUpdate(self, dt)
                     cur = Lerp(cur, tgt, min(1, dt * SMOOTH_SPEED))
                     primaryBar._smoothCurrent = cur
                     primaryBar:SetValue(cur)
+                elseif cur ~= tgt then
+                    primaryBar._smoothCurrent = tgt
+                    primaryBar:SetValue(tgt)
                 end
             end
         end
@@ -4443,6 +5111,13 @@ local function OnUpdate(self, dt)
                 cur = Lerp(cur, tgt, min(1, dt * SMOOTH_SPEED))
                 secondaryBar._smoothCurrent = cur
                 secondaryBar:SetValue(cur)
+            elseif cur ~= tgt then
+                -- Snap to the exact target once within the lerp threshold, so the bar
+                -- reaches 100% at max instead of settling ~0.5 short (a visible gap on
+                -- small-max bars like Devourer soul fragments). Guarded so it fires
+                -- once, not every frame.
+                secondaryBar._smoothCurrent = tgt
+                secondaryBar:SetValue(tgt)
             end
         end
     end
@@ -6214,9 +6889,12 @@ function ERB:ApplySmoothing()
     local interp = Enum and Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.ExponentialEaseOut
     local p = ERB.db and ERB.db.profile
     if not (interp and p) then return end
-    if healthBar    then healthBar._smoothing    = (p.health    and p.health.smoothBars)    and interp or nil end
-    if primaryBar   then primaryBar._smoothing   = (p.primary   and p.primary.smoothBars)   and interp or nil end
-    if secondaryBar then secondaryBar._smoothing = (p.secondary and p.secondary.smoothBars) and interp or nil end
+    local _hCfg = _G._ERB_ResolveHealthCfg(p)
+    local _pCfg = _G._ERB_ResolvePowerCfg(p)
+    local _sCfg = _G._ERB_ResolveSecondaryCfg(p)
+    if healthBar    then healthBar._smoothing    = (_hCfg      and _hCfg.smoothBars)        and interp or nil end
+    if primaryBar   then primaryBar._smoothing   = (_pCfg      and _pCfg.smoothBars)        and interp or nil end
+    if secondaryBar then secondaryBar._smoothing = (_sCfg and _sCfg.smoothBars) and interp or nil end
 end
 
 function ERB:ApplyAll()
@@ -6286,6 +6964,30 @@ local function ScheduleRosterApply()
     C_Timer.After(0.2, function()
         ERB:ApplyAll()
     end)
+end
+
+-- Talent/loadout changes fire TRAIT_CONFIG_UPDATED/PLAYER_TALENT_UPDATE in a
+-- burst (a loadout swap applies many nodes at once). Coalesce into a single
+-- out-of-combat rebuild instead of running the heavy BuildBars() per event.
+-- do-block + ns exposure so the pending flag/function use no main-chunk local
+-- slots (this file is at Lua's 200-local cap).
+do
+    local pending
+    function ns.ScheduleTalentApply()
+        if pending then return end
+        pending = true
+        C_Timer.After(0.1, function()
+            pending = false
+            if InCombatLockdown() then return end
+            ironfurBaseDur = IronfurBaseDuration()
+            cachedPrimary = GetPrimaryPowerType()
+            cachedSecondary = GetSecondaryResource()
+            BuildBars()
+            UpdatePrimaryBar()
+            UpdateSecondaryResource()
+            UpdateVisibility()
+        end)
+    end
 end
 
 
@@ -6381,6 +7083,7 @@ local function OnEvent(self, event, ...)
         ironfurGoEUntil = 0
         ironfurBaseDur = IronfurBaseDuration()
         IP.hashEndTime = 0
+        ns.InvalidateThresholdCaches()
         cachedPrimary = GetPrimaryPowerType()
         cachedSecondary = GetSecondaryResource()
         BuildBars()
@@ -6388,9 +7091,22 @@ local function OnEvent(self, event, ...)
         UpdatePrimaryBar()
         UpdateSecondaryResource()
         UpdateVisibility()
+    elseif event == "TRAIT_CONFIG_UPDATED" or event == "PLAYER_TALENT_UPDATE" then
+        -- A talent toggled or a loadout applied. Invalidate the talent-gate
+        -- caches immediately (cheap; hot paths re-resolve next tick) and
+        -- coalesce the heavy rebuild via a debounce so a burst of node events
+        -- rebuilds once, not once per event.
+        ns.InvalidateThresholdCaches()
+        ns.ScheduleTalentApply()
     elseif event == "UPDATE_SHAPESHIFT_FORM" then
         cachedPrimary = GetPrimaryPowerType()
         cachedSecondary = GetSecondaryResource()
+        -- Leaving Bear form drops all Ironfur in-game, so clear tracker
+        -- Otherwise shifting out and rapidly back in shows the stale stacks.
+        if not (cachedSecondary and cachedSecondary.power == "IRONFUR_BAR") then
+            wipe(ironfurTicks)
+            ironfurGoEUntil = 0
+        end
         BuildBars()
         UpdatePrimaryBar()
         UpdateSecondaryResource()
@@ -6608,6 +7324,8 @@ function ERB:OnEnable()
     eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
     eventFrame:RegisterEvent("ACTIVE_TALENT_GROUP_CHANGED")
     eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    eventFrame:RegisterEvent("TRAIT_CONFIG_UPDATED")
+    eventFrame:RegisterEvent("PLAYER_TALENT_UPDATE")
     eventFrame:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
     -- Visibility option events
     eventFrame:RegisterEvent("PLAYER_MOUNT_DISPLAY_CHANGED")

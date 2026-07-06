@@ -106,6 +106,92 @@ end
 ns.FD = FD
 
 -------------------------------------------------------------------------------
+--  Resource verification for the CD Ready Glow.
+--
+--  C_Spell.IsSpellUsable() can briefly report a resource-gated spell as
+--  usable right after login/reload (observed with Void Ray on Devourer
+--  Demon Hunter) before Blizzard's internal power data has fully settled.
+--  Rather than guess at a timing window, HasEnoughResources re-derives the
+--  answer from live UnitPower()/UnitPowerMax() values, which are always
+--  accurate -- including immediately after login. Callers AND this with
+--  IsSpellUsable so cooldown/form/lockout gating is unaffected; only the
+--  resource portion gets a deterministic second opinion.
+--
+--  Declared early in the file (before FD/ResolveSpellSettings usage further
+--  down) since Lua locals are only visible after their textual declaration --
+--  defining it later but using it earlier produced a nil-call error.
+--
+--  Optimization: GetSpellPowerCost() allocates a new Lua table on every call
+--  and is a C-API call. A spell's power cost only changes on talent/spec swap,
+--  not during combat, so the result is cached and invalidated on
+--  PLAYER_SPECIALIZATION_CHANGED and PLAYER_ENTERING_WORLD. The hot path (every
+--  UNIT_POWER_UPDATE) then does only a table lookup.
+-------------------------------------------------------------------------------
+local _spellPowerCostCache = {}
+
+local function InvalidateSpellPowerCostCache()
+    wipe(_spellPowerCostCache)
+end
+ns.InvalidateSpellPowerCostCache = InvalidateSpellPowerCostCache
+
+do
+    local _pccInvalidateFrame = CreateFrame("Frame")
+    _pccInvalidateFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    _pccInvalidateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    _pccInvalidateFrame:SetScript("OnEvent", InvalidateSpellPowerCostCache)
+end
+
+local function HasEnoughResources(spellID)
+    if not (C_Spell and C_Spell.GetSpellPowerCost) then return true end
+    -- Cache lookup: sentinel nil = not yet checked, false = no cost
+    -- (=> always enough), table = cached cost list.
+    local cached = _spellPowerCostCache[spellID]
+    if cached == nil then
+        local costs = C_Spell.GetSpellPowerCost(spellID)
+        if not costs or #costs == 0 then
+            _spellPowerCostCache[spellID] = false  -- no resource gate
+            return true
+        end
+        _spellPowerCostCache[spellID] = costs
+        cached = costs
+    elseif cached == false then
+        return true  -- no resource gate, cached
+    end
+    for _, c in ipairs(cached) do
+        local powerType = c.type
+        if powerType then
+            local cost = c.cost or 0
+            if c.costPercent and c.costPercent > 0 then
+                -- Power can be a SECRET number in tainted combat; can't compare it,
+                -- so default to castable rather than throw.
+                local maxP = UnitPowerMax("player", powerType)
+                if issecretvalue and issecretvalue(maxP) then return true end
+                cost = math.max(cost, (c.costPercent / 100) * maxP)
+            end
+            if cost > 0 then
+                local cur = UnitPower("player", powerType)
+                if issecretvalue and issecretvalue(cur) then return true end
+                if cur < cost then return false end
+            end
+        end
+    end
+    return true
+end
+ns.HasEnoughResources = HasEnoughResources
+
+-- True once we've received at least one genuine UNIT_POWER_FREQUENT for the
+-- player since the last PLAYER_ENTERING_WORLD. Both C_Spell.IsSpellUsable()
+-- and C_Spell.GetSpellPowerCost() can briefly return stale/empty data right
+-- at login/reload (observed: GetSpellPowerCost reporting 0 cost for a 100-Fury
+-- spell, making HasEnoughResources default to "enough" when it should not).
+-- Rather than guess a delay, we simply don't trust resource-gated glow
+-- decisions until the client has actually pushed us a real power value.
+-- This is event-driven, not polled: setting it costs one boolean write, and
+-- it naturally self-corrects via the already-registered UNIT_POWER_FREQUENT
+-- listener below, which re-triggers QueueCDGlowUpdate on every change.
+ns._cdGlowPowerConfirmed = true
+
+-------------------------------------------------------------------------------
 --  Constants
 -------------------------------------------------------------------------------
 local VIEWER_NAMES = {
@@ -114,6 +200,21 @@ local VIEWER_NAMES = {
     "BuffIconCooldownViewer",
     "BuffBarCooldownViewer",
 }
+
+-- Blizzard creates these 4 viewer frames once and never replaces the frame
+-- object for the rest of the session, so a global-table lookup (_G[name])
+-- is wasted work once we've found it -- cache the resolved frame reference.
+-- Used from both the 10Hz active-aura ticker and the CD Ready Glow update,
+-- both of which loop over all 4 viewers frequently.
+local _viewerFrameCache = {}
+local function GetViewerFrame(vi)
+    local f = _viewerFrameCache[vi]
+    if not f then
+        f = _G[VIEWER_NAMES[vi]]
+        if f then _viewerFrameCache[vi] = f end
+    end
+    return f
+end
 
 local VIEWER_TO_BAR = {
     EssentialCooldownViewer = "cooldowns",
@@ -192,20 +293,34 @@ ns.ResolveFrameSpellID = ResolveFrameSpellID
 -- spell may be the base whose active override is one of the identity ids -- e.g.
 -- assigned Corruption 172, frame shows Wither 445468 = FindSpellOverrideByID(172)
 -- -- or an identity id may be the base whose override is the assigned spell).
-local function ResolveSpellSettings(frame, sid2, sd2)
-    local settings = sd2 and sd2.spellSettings
-    if not settings or not sid2 then return nil end
-    -- No per-spell settings on this bar -> nothing to resolve. Skips the identity
-    -- set + GetBaseSpell work for the common case (keeps the swipe hot path light).
-    if next(settings) == nil then return nil end
+local function ResolveSpellSettings(frame, sid2, sd2, barKey)
+    if not sid2 then return nil end
+    -- Bar identity: explicit barKey wins (nil-frame callers like the preset
+    -- gain-sound path), else the frame's decorated context.
+    local fc0 = frame and _ecmeFC[frame]
+    local bk = barKey or (fc0 and fc0.barKey)
+    -- Bar tiers: barSettings ("Apply to Bar", per spec) chained to the
+    -- profile-level bd.barSpellSettings ("Apply to Bar (All Specs)"). nil when
+    -- neither exists -- the common case costs two table lookups.
+    local tier = ns.GetBarTierSettings and ns.GetBarTierSettings(sd2, bk)
+    -- Per-spell entries live in the spec's FAMILY store (they travel with the
+    -- spell across bars), not on the bar.
+    local settings = bk and ns.GetSpellSettingsStore and ns.GetSpellSettingsStore(bk)
+    if not settings or next(settings) == nil then return tier end
+
+    local ChainSettings = ns.ChainSettings
 
     -- Fast path: direct hit on the primary id (the common, non-override case).
     -- Returns before building the identity set / addId closure below, so the hot
     -- SetSwipeColor path stays allocation-free for spells without an override.
+    -- The chain re-assert is self-healing: every resolve re-points the entry's
+    -- __index at the CURRENT bar's tier, so moves / spec swaps / profile swaps
+    -- never leave a stale link (metatables are not serialized; this also
+    -- restores them after a fresh login).
     local direct = settings[sid2]
-    if direct then return direct end
+    if direct then ChainSettings(direct, tier); return direct end
 
-    local fc2 = _ecmeFC[frame]
+    local fc2 = fc0
 
     -- Build the frame's identity-id set (deduped).
     local ids = { sid2 }
@@ -214,7 +329,7 @@ local function ResolveSpellSettings(frame, sid2, sd2)
         for i = 1, #ids do if ids[i] == id then return end end
         ids[#ids + 1] = id
     end
-    local canon2 = ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(frame)
+    local canon2 = frame and ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(frame)
     if canon2 then addId(canon2) end
     if fc2 then
         addId(fc2.resolvedSid)
@@ -235,20 +350,21 @@ local function ResolveSpellSettings(frame, sid2, sd2)
     -- 1. Direct hit on any identity id.
     for i = 1, #ids do
         local s = settings[ids[i]]
-        if s then return s end
+        if s then ChainSettings(s, tier); return s end
     end
 
     -- 2. linkedSpellIDs reported by the cooldown info.
     if fc2 and fc2.linkedSpellIDs then
         for _, lid in ipairs(fc2.linkedSpellIDs) do
-            if settings[lid] then return settings[lid] end
+            local s = settings[lid]
+            if s then ChainSettings(s, tier); return s end
         end
     end
 
     -- 3. Override resolution across assignedSpells, both directions, against the
     --    full identity set.
     local FindOvr = C_SpellBook and C_SpellBook.FindSpellOverrideByID
-    if FindOvr and sd2.assignedSpells then
+    if FindOvr and sd2 and sd2.assignedSpells then
         local idOvr = {}
         for i = 1, #ids do idOvr[i] = FindOvr(ids[i]) end
         for _, asid in ipairs(sd2.assignedSpells) do
@@ -256,14 +372,18 @@ local function ResolveSpellSettings(frame, sid2, sd2)
                 local asidOvr = FindOvr(asid)
                 for i = 1, #ids do
                     if asidOvr == ids[i] or idOvr[i] == asid then
-                        return settings[asid]
+                        local s = settings[asid]
+                        ChainSettings(s, tier)
+                        return s
                     end
                 end
             end
         end
     end
 
-    return nil
+    -- No per-spell entry anywhere in the identity set: the bar tiers (if any)
+    -- are the effective settings.
+    return tier
 end
 ns.ResolveSpellSettings = ResolveSpellSettings
 
@@ -1991,6 +2111,19 @@ local function DecorateFrame(frame, barData)
                 local cseInfo = C_Spell.GetSpellCooldown(liveSid)
                 local onCD = cseInfo and cseInfo.isActive and not cseInfo.isOnGCD
                 if cse == "pixelGlowReady" or cse == "buttonGlowReady" then
+                    -- Plain CD Ready Glow: cooldown state only, decided right
+                    -- here -- no usability reads, no deferral, no events. The
+                    -- Resource Aware variants below carry those costs; these
+                    -- deliberately do not.
+                    -- Pool reassignment: glow state inherited from a previous
+                    -- spell on this frame belongs to that spell -- reset now.
+                    if fd._cdGlowBoundSid ~= sid2 then
+                        fd._cdGlowBoundSid = sid2
+                        if fd._cdStateGlowOn then
+                            ns.StopNativeGlow(fd.glowOverlay)
+                            fd._cdStateGlowOn = false
+                        end
+                    end
                     if not onCD then
                         if fd.glowOverlay and not fd._cdStateGlowOn then
                             local style = cse == "pixelGlowReady" and 1 or 3
@@ -2002,6 +2135,71 @@ local function DecorateFrame(frame, barData)
                         if fd.glowOverlay then ns.StopNativeGlow(fd.glowOverlay) end
                         fd._cdStateGlowOn = false
                     end
+                elseif cse == "pixelGlowReadyUsable" or cse == "buttonGlowReadyUsable" then
+                    -- Resource Aware CD Ready Glow: also requires the spell to
+                    -- be castable (resources/form/lockout).
+                    -- Pool reassignment reset, same as the plain variants.
+                    if fd._cdGlowBoundSid ~= sid2 then
+                        fd._cdGlowBoundSid = sid2
+                        if fd._cdStateGlowOn then
+                            ns.StopNativeGlow(fd.glowOverlay)
+                            fd._cdStateGlowOn = false
+                        end
+                    end
+                    -- Track this frame for the event-driven re-evaluation loop.
+                    -- The loop's events stay unregistered until the first watch,
+                    -- so the whole system is inert unless a Resource Aware glow
+                    -- is actually configured somewhere.
+                    if ns.CDGlowWatch then ns.CDGlowWatch(frame) end
+                    -- Defer the actual decision by one frame, same as
+                    -- hiddenOnCD/hiddenReady above: SetDesaturated fires inside
+                    -- Blizzard's secure CDM chain where C_Spell.IsSpellUsable can
+                    -- return stale values. The OnUpdate script is installed ONCE
+                    -- per frame object -- this hook fires on every repaint
+                    -- (range/resource tints), so the per-fire work must stay at
+                    -- plain field writes, never closure creation.
+                    local pending = fd._cdStateGlowPending
+                    if not pending then
+                        pending = CreateFrame("Frame")
+                        pending:Hide()
+                        fd._cdStateGlowPending = pending
+                        pending:SetScript("OnUpdate", function(self)
+                            self:Hide()
+                            -- Re-read the cooldown now instead of trusting a value
+                            -- sampled inside the secure chain a frame ago (GCD
+                            -- transients misreport isActive there).
+                            local ci = C_Spell.GetSpellCooldown(self.sid)
+                            local pOnCD = ci and ci.isActive and not ci.isOnGCD
+                            local isUsable
+                            if ns._cdmSoundSuppressed and ns._cdmSoundSuppressed() then
+                                -- Loading-screen settle window: IsSpellUsable is not
+                                -- trustworthy yet. Glow from cooldown state alone
+                                -- (pre-usability behavior); the queued post-settle
+                                -- pass re-evaluates with real data.
+                                isUsable = true
+                            else
+                                -- nil = API has no data for this spell -> treat as
+                                -- not usable; a later event re-evaluates.
+                                isUsable = C_Spell.IsSpellUsable and C_Spell.IsSpellUsable(self.sid)
+                            end
+                            local shouldGlow = (not pOnCD) and (isUsable == true)
+                            if shouldGlow then
+                                if fd.glowOverlay and not fd._cdStateGlowOn then
+                                    local style = self.cse == "pixelGlowReadyUsable" and 1 or 3
+                                    local gr, gg, gb = ns.ResolveGlowColor(self.ss2)
+                                    ns.StartNativeGlow(fd.glowOverlay, style, gr or 1, gg or 1, gb or 1)
+                                    fd._cdStateGlowOn = true
+                                end
+                            elseif fd._cdStateGlowOn then
+                                if fd.glowOverlay then ns.StopNativeGlow(fd.glowOverlay) end
+                                fd._cdStateGlowOn = false
+                            end
+                        end)
+                    end
+                    pending.cse = cse
+                    pending.sid = liveSid
+                    pending.ss2 = ss2
+                    pending:Show()
                 end
             end)
         end
@@ -2284,6 +2482,174 @@ _trinketEventFrame:SetScript("OnEvent", function(_, event, arg1)
         end
     end
 end)
+
+-------------------------------------------------------------------------------
+--  CD Ready Glow: event-driven usability re-evaluation
+--
+--  Frames whose resolved cdStateEffect is a Resource Aware ready-glow
+--  (pixelGlowReadyUsable / buttonGlowReadyUsable) are registered in a
+--  watched set (ns.CDGlowWatch, called from the decoration paths). While the
+--  set is non-empty, SPELL_UPDATE_COOLDOWN + UNIT_POWER_FREQUENT (player)
+--  drive a dirty flag; a hidden frame re-evaluates ONLY the watched frames on
+--  the next OnUpdate, then hides again. While the set is empty, no events are
+--  registered and nothing runs -- the whole system is zero-cost unless a
+--  ready-glow effect is actually configured somewhere.
+--
+--  SPELL_UPDATE_USABLE alone is not reliable for all resource types (e.g.
+--  Fury), so cooldown + power events stand in for it. UNIT_POWER_FREQUENT
+--  (not UNIT_POWER_UPDATE) is needed so continuous regen (energy ticking up
+--  toward a spell's cost) re-evaluates the glow without waiting for a
+--  discrete spend/gain event; the dirty flag caps the work at once per frame.
+--
+--  During the loading-screen settle window (ns._cdmSoundSuppressed, shared
+--  with the CDM sound system) API answers are not trustworthy: the flush
+--  keeps current state and retries shortly, and the first post-window pass
+--  is authoritative. That pass is what clears a glow that came up stale
+--  across a /reload (started by a decoration path before usability could be
+--  read).
+-------------------------------------------------------------------------------
+do
+    local _cdGlowWatched = setmetatable({}, { __mode = "k" })  -- frame -> true
+    local _cdGlowDirty = false
+    local _cdGlowEventsOn = false
+    local _cdGlowRetryPending = false
+
+    local _cdGlowUpdateFrame = CreateFrame("Frame")
+    _cdGlowUpdateFrame:Hide()
+    local _cdGlowEventFrame = CreateFrame("Frame")
+
+    local function SetGlowEventsRegistered(on)
+        if on == _cdGlowEventsOn then return end
+        _cdGlowEventsOn = on
+        if on then
+            _cdGlowEventFrame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+            _cdGlowEventFrame:RegisterUnitEvent("UNIT_POWER_FREQUENT", "player")
+        else
+            _cdGlowEventFrame:UnregisterEvent("SPELL_UPDATE_COOLDOWN")
+            _cdGlowEventFrame:UnregisterEvent("UNIT_POWER_FREQUENT")
+        end
+    end
+
+    local function QueueCDGlowUpdate()
+        if _cdGlowDirty then return end
+        _cdGlowDirty = true
+        _cdGlowUpdateFrame:Show()
+    end
+
+    -- Register a frame whose resolved cdStateEffect is a Resource Aware
+    -- ready-glow. Called
+    -- from the decoration paths (DecorateFrame's SetDesaturated hook and
+    -- RefreshCDMIconAppearance). The flush below prunes entries whose effect
+    -- or claim went away and unregisters the events once nothing is watched.
+    function ns.CDGlowWatch(frame)
+        if not _cdGlowWatched[frame] then
+            _cdGlowWatched[frame] = true
+            SetGlowEventsRegistered(true)
+        end
+    end
+
+    _cdGlowUpdateFrame:SetScript("OnUpdate", function(self)
+        self:Hide()
+        _cdGlowDirty = false
+        if not next(_cdGlowWatched) then
+            SetGlowEventsRegistered(false)
+            return
+        end
+        local hfd = ns._hookFrameData
+        local efc = ns._ecmeFC
+        local RSP = ns.ResolveSpellSettings
+        if not hfd or not efc or not RSP then return end
+        -- Settle window: keep current state, retry until the window ends;
+        -- the first post-window pass is the authoritative one.
+        if ns._cdmSoundSuppressed and ns._cdmSoundSuppressed() then
+            if not _cdGlowRetryPending then
+                _cdGlowRetryPending = true
+                C_Timer.After(1, function()
+                    _cdGlowRetryPending = false
+                    QueueCDGlowUpdate()
+                end)
+            end
+            return
+        end
+        for frame in pairs(_cdGlowWatched) do
+            local fd = hfd[frame]
+            local fc2 = efc[frame]
+            local sid2 = fc2 and fc2.spellID
+            local bk2 = fc2 and fc2.barKey
+            local keep = false
+            if fd and fd.glowOverlay and sid2 and bk2 then
+                local ss2 = RSP(frame, sid2, ns.GetBarSpellData(bk2))
+                local cse2 = ss2 and ss2.cdStateEffect
+                if cse2 == "pixelGlowReadyUsable" or cse2 == "buttonGlowReadyUsable" then
+                    keep = true
+                    -- Pool reassignment: glow state inherited from a previous
+                    -- spell on this frame belongs to that spell -- reset now.
+                    if fd._cdGlowBoundSid ~= sid2 then
+                        fd._cdGlowBoundSid = sid2
+                        if fd._cdStateGlowOn then
+                            ns.StopNativeGlow(fd.glowOverlay)
+                            fd._cdStateGlowOn = false
+                        end
+                    end
+                    local liveSid = sid2
+                    if C_SpellBook and C_SpellBook.FindSpellOverrideByID then
+                        liveSid = C_SpellBook.FindSpellOverrideByID(sid2) or sid2
+                    end
+                    local ci = C_Spell.GetSpellCooldown(liveSid)
+                    local onCD = ci and ci.isActive and not ci.isOnGCD
+                    if onCD then
+                        -- On cooldown always stops the glow -- a safety net
+                        -- independent of the SetDesaturated hook, in case that
+                        -- hook doesn't fire for a given transition.
+                        if fd._cdStateGlowOn then
+                            ns.StopNativeGlow(fd.glowOverlay)
+                            fd._cdStateGlowOn = false
+                        end
+                    else
+                        -- IsSpellUsable is the complete castability signal
+                        -- (resources, form, lockout). nil = no data yet ->
+                        -- treat as not usable; a later event re-evaluates.
+                        local isUsable = C_Spell.IsSpellUsable and C_Spell.IsSpellUsable(liveSid)
+                        if isUsable == true then
+                            if not fd._cdStateGlowOn then
+                                local style = cse2 == "pixelGlowReadyUsable" and 1 or 3
+                                local gr, gg, gb = ns.ResolveGlowColor(ss2)
+                                ns.StartNativeGlow(fd.glowOverlay, style, gr or 1, gg or 1, gb or 1)
+                                fd._cdStateGlowOn = true
+                            end
+                        elseif fd._cdStateGlowOn then
+                            ns.StopNativeGlow(fd.glowOverlay)
+                            fd._cdStateGlowOn = false
+                        end
+                    end
+                end
+            end
+            if not keep then
+                -- Effect removed, spell unassigned, or frame released back to
+                -- the pool: stop any leftover glow and drop the watch. Events
+                -- unregister once the set drains (checked below and on the
+                -- next queued flush).
+                _cdGlowWatched[frame] = nil
+                if fd and fd._cdStateGlowOn then
+                    if fd.glowOverlay then ns.StopNativeGlow(fd.glowOverlay) end
+                    fd._cdStateGlowOn = false
+                end
+            end
+        end
+        if not next(_cdGlowWatched) then
+            SetGlowEventsRegistered(false)
+        end
+    end)
+
+    -- One re-evaluation pass on the next frame. Called after rebuilds
+    -- (FullCDMRebuild) and by the event listeners; no-ops instantly when
+    -- nothing is watched.
+    ns.QueueCDGlowResourceCheck = QueueCDGlowUpdate
+
+    _cdGlowEventFrame:SetScript("OnEvent", function()
+        QueueCDGlowUpdate()
+    end)
+end
 
 -------------------------------------------------------------------------------
 --  Desaturation curve for custom frames (taint-safe).
@@ -3037,17 +3403,14 @@ local function CollectAndReanchor()
                                     -- byte-identical to the original `if bd then`.)
                                     if bd and not bd.hidePlaceholderIcon then
                                         local sdAS = ns.GetBarSpellData(targetBar)
-                                        if sdAS and sdAS.spellSettings then
-                                            -- Shared resolver: matches the stored key
-                                            -- against the frame's full identity set
-                                            -- (incl. GetCanonicalSpellIDForFrame, the
-                                            -- id the picker keys settings by).
-                                            local ssAS = ns.ResolveSpellSettings(frame, realSID, sdAS)
-                                                or sdAS.spellSettings[realSID]
-                                            if ssAS then
-                                                if ssAS.alwaysShow == "on" then showInactive = true
-                                                elseif ssAS.alwaysShow == "off" then showInactive = false end
-                                            end
+                                        -- Shared resolver: matches the stored key
+                                        -- against the frame's full identity set
+                                        -- (incl. GetCanonicalSpellIDForFrame, the
+                                        -- id the picker keys settings by).
+                                        local ssAS = ns.ResolveSpellSettings(frame, realSID, sdAS, targetBar)
+                                        if ssAS then
+                                            if ssAS.alwaysShow == "on" then showInactive = true
+                                            elseif ssAS.alwaysShow == "off" then showInactive = false end
                                         end
                                     end
                                     if bd and bd.enabled and bd.barType == "buffs"
@@ -3154,6 +3517,43 @@ local function CollectAndReanchor()
                                     f._cooldown:SetCooldown(timer.start, timer.duration)
                                 else
                                     f._cooldown:Clear()
+                                end
+                                -- Custom Active State Decimals (buff bars): the
+                                -- custom buff's own cast-timer duration is hardcoded
+                                -- (sd.spellDurations), so decimals apply to ITS
+                                -- countdown -- buffs have no active-state overlay.
+                                -- OFF BY DEFAULT = zero cost: the faDecimals gate is
+                                -- checked FIRST, so the ResolveSpellSettings + showCD
+                                -- work is skipped entirely when disabled; the else's
+                                -- Detach no-ops unless we previously attached.
+                                if ns.DecimalCountdown then
+                                    if isActive and bd.faDecimals then
+                                        -- nil frame: the frame's CDM context isn't set
+                                        -- up yet here, and a custom buff is an exact id
+                                        -- (no variant), so the direct family-store hit
+                                        -- resolves without it (matches PlayPresetBuffGainSound).
+                                        local ssB = ns.ResolveSpellSettings
+                                            and ns.ResolveSpellSettings(nil, sid, sdInj, injKey)
+                                        local showCDb = bd.showCooldownText
+                                        if ssB and ssB.showCooldownText ~= nil then showCDb = ssB.showCooldownText end
+                                        if showCDb then
+                                            ns.DecimalCountdown.Attach(f._cooldown, timer.start, timer.duration,
+                                                bd.faDecimalsThreshold or 5,
+                                                function(fs)
+                                                    if ns.StyleOverlayDecimalText then
+                                                        ns.StyleOverlayDecimalText(fs, bd, ssB, f:GetScale())
+                                                    end
+                                                end,
+                                                { on = bd.faDecimalsColorEnabled, r = bd.faDecimalsColorR,
+                                                  g = bd.faDecimalsColorG, b = bd.faDecimalsColorB })
+                                        else
+                                            ns.DecimalCountdown.Detach(f._cooldown, false)
+                                        end
+                                    else
+                                        -- Nothing to resolve; only restores Blizzard's
+                                        -- numbers if this frame was previously attached.
+                                        ns.DecimalCountdown.Detach(f._cooldown, true)
+                                    end
                                 end
                                 f:Show()
                                 f.layoutIndex = 5000 + idx
@@ -3485,8 +3885,8 @@ local function CollectAndReanchor()
                     -- against the fresh identity. Without this a per-icon glow stays
                     -- on the frame it was first stashed on until the next add/remove.
                     local sdRef = ns.GetBarSpellData and ns.GetBarSpellData(barKey)
-                    if sdRef and sdRef.spellSettings and next(sdRef.spellSettings) ~= nil
-                       and RefreshCDMIconAppearance then
+                    if RefreshCDMIconAppearance and ns.BarHasAnySpellSettings
+                       and ns.BarHasAnySpellSettings(barKey, sdRef) then
                         RefreshCDMIconAppearance(barKey)
                     end
                 end
@@ -4333,18 +4733,36 @@ ns.CollectAndReanchor = CollectAndReanchor
 -- (the same flag RescanBuffSoundFlag sets from these very spellSettings) and
 -- throttled so a refresh-cast a few frames apart can't double-fire.
 local _presetGainSoundAt = {}
+local _presetLossSoundAt = {}
 local PRESET_GAIN_SOUND_GAP = 0.3
-local function PlayPresetBuffGainSound(sd, sid, now)
+local function PlayPresetBuffGainSound(sd, barKey, sid, now)
     if not ns._cdmAnyBuffSound then return end
     -- Loading screen / login settle: cast/edge timers restart across a zone/login,
     -- which would false-fire the gain sound. Drop while suppressed.
     if ns._cdmSoundSuppressed and ns._cdmSoundSuppressed() then return end
-    local ss = sd and sd.spellSettings and sd.spellSettings[sid]
+    -- Family store direct hit + bar-tier fallback (no frame: id from assignedSpells).
+    local ss = ResolveSpellSettings(nil, sid, sd, barKey)
     local key = ss and ss.buffActiveSoundKey
     if not key or key == "none" then return end
     local last = _presetGainSoundAt[sid]
     if last and (now - last) < PRESET_GAIN_SOUND_GAP then return end
     _presetGainSoundAt[sid] = now
+    local paths = ns.FOCUSKICK_SOUND_PATHS
+    local path = paths and paths[key]
+    if path then PlaySoundFile(path, "Master") end
+end
+-- Loss counterpart to PlayPresetBuffGainSound for self-timed preset/custom buffs
+-- (no real aura-removed alert): fired when the displayed timer runs out. Separate
+-- throttle table so gain/loss never suppress each other.
+local function PlayPresetBuffLossSound(sd, sid, now)
+    if not ns._cdmAnyBuffSound then return end
+    if ns._cdmSoundSuppressed and ns._cdmSoundSuppressed() then return end
+    local ss = sd and sd.spellSettings and sd.spellSettings[sid]
+    local key = ss and ss.buffLostSoundKey
+    if not key or key == "none" then return end
+    local last = _presetLossSoundAt[sid]
+    if last and (now - last) < PRESET_GAIN_SOUND_GAP then return end
+    _presetLossSoundAt[sid] = now
     local paths = ns.FOCUSKICK_SOUND_PATHS
     local path = paths and paths[key]
     if path then PlaySoundFile(path, "Master") end
@@ -4383,7 +4801,14 @@ local function UpdateCustomBuffBars()
                                     duration = duration,
                                 }
                                 timer = _customAuraTimers[timerKey]
-                                PlayPresetBuffGainSound(sd, sid, now)
+                                PlayPresetBuffGainSound(sd, barKey, sid, now)
+                            end
+
+                            -- Loss edge: displayed timer ran out -> fire once, drop it.
+                            if timer and (now - timer.start) >= timer.duration then
+                                PlayPresetBuffLossSound(sd, sid, now)
+                                _customAuraTimers[timerKey] = nil
+                                timer = nil
                             end
 
                             local isActive = timer and duration > 0
@@ -4415,7 +4840,7 @@ local function UpdateCustomBuffBars()
                                     local spInfo = C_Spell and C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(sid)
                                     if spInfo and spInfo.iconID and f._tex then f._tex:SetTexture(spInfo.iconID) end
                                 end
-                                if isActive then
+                                if isActive and timer then
                                     f._cooldown:SetCooldown(timer.start, timer.duration)
                                 else
                                     f._cooldown:Clear()
@@ -4472,13 +4897,23 @@ local function UpdateCustomBuffBars()
             local durs = sd and sd.spellDurations
             if spellList and durs then
                 for _, sid in ipairs(spellList) do
-                    if type(sid) == "number" and sid > 0
-                       and (durs[sid] or 0) > 0 and _pendingCastIDs[sid] then
-                        _customAuraTimers[barData.key .. ":" .. sid] = {
-                            start = now, duration = durs[sid],
-                        }
-                        needBuffReanchor = true
-                        PlayPresetBuffGainSound(sd, sid, now)
+                    if type(sid) == "number" and sid > 0 and (durs[sid] or 0) > 0 then
+                        local tkey = barData.key .. ":" .. sid
+                        if _pendingCastIDs[sid] then
+                            _customAuraTimers[tkey] = {
+                                start = now, duration = durs[sid],
+                            }
+                            needBuffReanchor = true
+                            PlayPresetBuffGainSound(sd, barData.key, sid, now)
+                        else
+                            -- Loss edge: displayed window ran out -> fire once, drop timer.
+                            local t = _customAuraTimers[tkey]
+                            if t and (now - t.start) >= t.duration then
+                                PlayPresetBuffLossSound(sd, sid, now)
+                                _customAuraTimers[tkey] = nil
+                                needBuffReanchor = true
+                            end
+                        end
                     end
                 end
             end
@@ -4694,6 +5129,12 @@ function ns.SetupViewerHooks()
                 if isBuff then InstallBuffFrameHooks(v) end
                 if isBarViewer and ns.InvalidateTBBFrameCache then
                     ns.InvalidateTBBFrameCache()
+                end
+                -- A new tracked-bar spell acquires a pool frame here: let the
+                -- Tracking Bars auto-add pass pick it up (debounced, no-op
+                -- unless a never-seen spell appeared).
+                if isBarViewer and ns.QueueTBBAutoAdd then
+                    ns.QueueTBBAutoAdd()
                 end
                 -- Only buff viewers need real-time reanchors on Acquire.
                 -- CD/utility spell sets are static (rebuilt by FullCDMRebuild).
@@ -4918,14 +5359,21 @@ function ns.SetupViewerHooks()
                                 local effGlowType = buffGlowType
                                 if fd and fd._bgT ~= nil then effGlowType = fd._bgT end
                                 if effGlowType > 0 and fd and glowActive then
+                                    if not fd.buffGlowOverlay then
+                                        local ov = CreateFrame("Frame", nil, frame)
+                                        ov:SetAllPoints(frame)
+                                        ov:EnableMouse(false)
+                                        fd.buffGlowOverlay = ov
+                                    end
+                                    -- Keep the glow above Blizzard's cooldown swipe on
+                                    -- every icon. Blizzard increments each viewer icon's
+                                    -- base frame level by +1, so an absolute level lands
+                                    -- BEHIND the swipe on later icons (and the swipe then
+                                    -- clips the inner edge of the ring, making it look
+                                    -- thinner). Track the icon's base level and re-apply
+                                    -- each pass, matching the primary glowOverlay (+16).
+                                    fd.buffGlowOverlay:SetFrameLevel(frame:GetFrameLevel() + 16)
                                     if not fd.buffGlowActive then
-                                        if not fd.buffGlowOverlay then
-                                            local ov = CreateFrame("Frame", nil, frame)
-                                            ov:SetAllPoints(frame)
-                                            ov:SetFrameLevel(22)
-                                            ov:EnableMouse(false)
-                                            fd.buffGlowOverlay = ov
-                                        end
                                         local cr, cg, cb = bd.buffGlowR or 1.0, bd.buffGlowG or 0.776, bd.buffGlowB or 0.376
                                         local classColor = bd.buffGlowClassColor
                                         if fd._bgColor == "class" then
@@ -4961,14 +5409,16 @@ function ns.SetupViewerHooks()
                                     local pStyle = bd.pandemicGlowStyle or 1
                                     if pStyle == -1 then inPandemic = false end
                                     if inPandemic then
+                                        if not fd.pandemicOverlay then
+                                            local ov = CreateFrame("Frame", nil, frame)
+                                            ov:SetAllPoints(frame)
+                                            ov:EnableMouse(false)
+                                            fd.pandemicOverlay = ov
+                                        end
+                                        -- Same base-level tracking as the buff glow, one
+                                        -- level higher so pandemic sits above buff glow.
+                                        fd.pandemicOverlay:SetFrameLevel(frame:GetFrameLevel() + 17)
                                         if not fd.pandemicGlowActive then
-                                            if not fd.pandemicOverlay then
-                                                local ov = CreateFrame("Frame", nil, frame)
-                                                ov:SetAllPoints(frame)
-                                                ov:SetFrameLevel(23)
-                                                ov:EnableMouse(false)
-                                                fd.pandemicOverlay = ov
-                                            end
                                             local c = bd.pandemicGlowColor or { r = 1, g = 1, b = 0 }
                                             local style = bd.pandemicGlowStyle or 1
                                             local glowOpts = (style == 1) and {
@@ -5021,7 +5471,7 @@ function ns.SetupViewerHooks()
                 local ac = _activeCache
                 wipe(ac)
                 for vi = 1, 4 do
-                    local vf = _G[VIEWER_NAMES[vi]]
+                    local vf = GetViewerFrame(vi)
                     -- BuffIcon (3) / BuffBar (4) viewers SHOW a frame only while its
                     -- buff/effect is active; the cooldown viewers (1,2) always show
                     -- their icons, so "shown" is meaningless there. So in the buff
