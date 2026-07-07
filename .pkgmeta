@@ -18,6 +18,10 @@ move-folders:
   EllesmereUI/EllesmereUIRaidFrames: EllesmereUIRaidFrames
   EllesmereUI/EllesmereUIResourceBars: EllesmereUIResourceBars
   EllesmereUI/EllesmereUIUnitFrames: EllesmereUIUnitFrames
+  EllesmereUI/EllesmereUIAdvancedDebuffs: EllesmereUIAdvancedDebuffs
+  EllesmereUI/EllesmereUIPrivateAuras: EllesmereUIPrivateAuras
+  EllesmereUI/EllesmereUIRaidControl: EllesmereUIRaidControl
+  EllesmereUI/EllesmereUIReminders: EllesmereUIReminders
 
 externals:
   EllesmereUIUnitFrames/Libs/oUF:
