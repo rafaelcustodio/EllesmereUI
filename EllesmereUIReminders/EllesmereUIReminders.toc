@@ -1,0 +1,15 @@
+## Interface: 120000, 120001, 120005, 120007
+## Title: |cff0cd29fEllesmereUI|r Reminders
+## Category: |cff0cd29fEllesmere|rUI
+## Group: EllesmereUI
+## Notes: On-screen combat potion and lust reminders.
+## Author: Ellesmere
+## Version: 8.3.9
+## Dependencies: EllesmereUI
+## IconTexture: Interface\AddOns\EllesmereUI\media\eg-logo.tga
+
+# State lives in EllesmereUIDB (central store) under combatPotion* / lustReminder*,
+# so existing settings carry over from when this was part of the QoL addon.
+
+EllesmereUIReminders.lua
+EUI_Reminders_Options.lua
