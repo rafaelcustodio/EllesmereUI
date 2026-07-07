@@ -72,6 +72,22 @@ initFrame:SetScript("OnEvent", function(self)
         end,
     })
 
+    -- Show in the /eui sidebar under a dedicated "Extras" group. Injected at
+    -- runtime into the exposed EllesmereUI tables -- NOT edited into the upstream
+    -- ADDON_GROUPS/ADDON_ROSTER literals -- so it never conflicts on a merge.
+    -- Idempotent and shared across the fork's split addons (first to load wins).
+    EllesmereUI._ForkSidebarInject = EllesmereUI._ForkSidebarInject or function(folder, display, searchName)
+        local G, I = EllesmereUI.ADDON_GROUPS, EllesmereUI._addonInfoByFolder
+        if not (G and I) then return end
+        I[folder] = I[folder] or { folder = folder, display = display, search_name = searchName }
+        local grp
+        for _, g in ipairs(G) do if g.key == "forkextras" then grp = g; break end end
+        if not grp then grp = { key = "forkextras", label = "Extras", members = {} }; G[#G + 1] = grp end
+        for _, m in ipairs(grp.members) do if m == folder then return end end
+        grp.members[#grp.members + 1] = folder
+    end
+    EllesmereUI._ForkSidebarInject("EllesmereUIRaidControl", "Raid Control", "EllesmereUI Raid Control")
+
     SLASH_EUIRAIDCONTROL1 = "/erc"
     SlashCmdList.EUIRAIDCONTROL = function()
         if InCombatLockdown and InCombatLockdown() then return end
