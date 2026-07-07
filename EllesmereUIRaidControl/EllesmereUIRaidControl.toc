@@ -1,0 +1,15 @@
+## Interface: 120000, 120001, 120005, 120007
+## Title: |cff0cd29fEllesmereUI|r Raid Control
+## Category: |cff0cd29fEllesmere|rUI
+## Group: EllesmereUI
+## Notes: A compact, movable raid-management panel (markers, ready check, roles).
+## Author: Ellesmere
+## Version: 8.3.9
+## Dependencies: EllesmereUI
+## IconTexture: Interface\AddOns\EllesmereUI\media\eg-logo.tga
+
+# State lives in EllesmereUIDB (central store) under raidControl / raidControlPos,
+# just like it did when this was a root file of the parent addon.
+
+EllesmereUIRaidControl.lua
+EUI_RaidControl_Options.lua
