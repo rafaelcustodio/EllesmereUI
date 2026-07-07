@@ -115,11 +115,11 @@ ns.NP_ABSORB_STYLE_ALPHA = {
 -- scope to stay under Lua 5.1's 200-local limit.
 function ns._appendDisplayPresetKeys(t)
     for _, k in ipairs({
-        "topSlotSize", "topSlotXOffset", "topSlotYOffset",
-        "rightSlotSize", "rightSlotXOffset", "rightSlotYOffset",
-        "leftSlotSize", "leftSlotXOffset", "leftSlotYOffset",
-        "toprightSlotSize", "toprightSlotXOffset", "toprightSlotYOffset", "toprightSlotGrowth",
-        "topleftSlotSize", "topleftSlotXOffset", "topleftSlotYOffset", "topleftSlotGrowth",
+        "topSlotSize", "topSlotXOffset", "topSlotYOffset", "topSlotRaiseStrata",
+        "rightSlotSize", "rightSlotXOffset", "rightSlotYOffset", "rightSlotRaiseStrata",
+        "leftSlotSize", "leftSlotXOffset", "leftSlotYOffset", "leftSlotRaiseStrata",
+        "toprightSlotSize", "toprightSlotXOffset", "toprightSlotYOffset", "toprightSlotGrowth", "toprightSlotRaiseStrata",
+        "topleftSlotSize", "topleftSlotXOffset", "topleftSlotYOffset", "topleftSlotGrowth", "topleftSlotRaiseStrata",
         "textSlotTopSize", "textSlotTopXOffset", "textSlotTopYOffset",
         "textSlotRightSize", "textSlotRightXOffset", "textSlotRightYOffset",
         "textSlotLeftSize", "textSlotLeftXOffset", "textSlotLeftYOffset",
@@ -173,9 +173,12 @@ local defaults = {
     miniboss = { r = 0.518, g = 0.243, b = 0.984 },
     boss = { r = 0.518, g = 0.243, b = 0.984 },
     enemyInCombat = { r = 0.800, g = 0.137, b = 0.137 },
-    -- "Mini Enemies" (non-elite trash, dungeons only) has NO static default: when
-    -- unset it views the user's enemyInCombat color, so it starts identical to
-    -- "Enemies" and the user customizes from there (see GetReactionColor).
+    -- "Mini Enemies" (non-elite trash) has NO static default: when unset it views
+    -- the user's enemyInCombat color, so it starts identical to "Enemies" and the
+    -- user customizes from there (see GetReactionColor).
+    -- Mini Coloring M+ Only: on = restrict the Mini Enemies color to 5-man
+    -- dungeons; off = apply it everywhere (default; see GetReactionColor).
+    miniColoringMPlusOnly = false,
     darkenEnemiesOOC = true,
     tankHasAggro = { r = 0.05, g = 0.82, b = 0.62 },
     tankHasAggroEnabled = false,
@@ -380,6 +383,8 @@ local defaults = {
     pandemicGlowLines = 8,
     pandemicGlowThickness = 1,
     pandemicGlowSpeed = 4,
+    pandemicGlowBackground = false,
+    pandemicGlowBackgroundColor = { r = 0, g = 0, b = 0 },
     dispelGlow = false,
     dispelGlowStyle = 2,
     dispelGlowColor = { r = 1.0, g = 1.0, b = 1.0 },
@@ -417,13 +422,15 @@ local defaults = {
     importantCastGlowLines = 8,
     importantCastGlowThickness = 2,
     importantCastGlowSpeed = 4,
+    importantCastGlowBackground = false,
+    importantCastGlowBackgroundColor = { r = 0, g = 0, b = 0 },
     -- Core Positions: slot-based size + XY offsets
-    topSlotSize = 26,        topSlotXOffset = 0,      topSlotYOffset = 0,
-    rightSlotSize = 24,      rightSlotXOffset = 0,    rightSlotYOffset = 0,
-    leftSlotSize = 24,       leftSlotXOffset = 0,     leftSlotYOffset = 0,
-    toprightSlotSize = 24,   toprightSlotXOffset = 0, toprightSlotYOffset = 0, toprightSlotGrowth = "right",
-    topleftSlotSize = 24,    topleftSlotXOffset = 0,  topleftSlotYOffset = 0,  topleftSlotGrowth = "left",
-    bottomSlotSize = 26,     bottomSlotXOffset = 0,   bottomSlotYOffset = 0,
+    topSlotSize = 26,        topSlotXOffset = 0,      topSlotYOffset = 0,      topSlotRaiseStrata = false,
+    rightSlotSize = 24,      rightSlotXOffset = 0,    rightSlotYOffset = 0,    rightSlotRaiseStrata = false,
+    leftSlotSize = 24,       leftSlotXOffset = 0,     leftSlotYOffset = 0,     leftSlotRaiseStrata = false,
+    toprightSlotSize = 24,   toprightSlotXOffset = 0, toprightSlotYOffset = 0, toprightSlotGrowth = "right", toprightSlotRaiseStrata = false,
+    topleftSlotSize = 24,    topleftSlotXOffset = 0,  topleftSlotYOffset = 0,  topleftSlotGrowth = "left",   topleftSlotRaiseStrata = false,
+    bottomSlotSize = 26,     bottomSlotXOffset = 0,   bottomSlotYOffset = 0,   bottomSlotRaiseStrata = false,
     -- Core Text Positions: slot-based size + XY offsets
     textSlotTopSize = 10,    textSlotTopXOffset = 0,  textSlotTopYOffset = 0,
     textSlotRightSize = 10,  textSlotRightXOffset = 0, textSlotRightYOffset = 0,
@@ -750,6 +757,13 @@ local function GetPandemicGlowSpeed()
     return (p and p.pandemicGlowSpeed) or defaults.pandemicGlowSpeed
 end
 ns.GetPandemicGlowSpeed = GetPandemicGlowSpeed
+local function GetPandemicGlowBackground()
+    return p and p.pandemicGlowBackground == true
+end
+local function GetPandemicGlowBackgroundColor()
+    local c = (p and p.pandemicGlowBackgroundColor) or defaults.pandemicGlowBackgroundColor
+    return c.r or 0, c.g or 0, c.b or 0
+end
 
 -- Dispellable buff glow: taint-safe detection via GetAuraDispelTypeColor
 do
@@ -1088,15 +1102,32 @@ local function FindSlotForElement(element)
 end
 ns.FindSlotForElement = FindSlotForElement
 
+-- The four combined health-text elements (percent + number, either order,
+-- "|" or "-" separator). Kept as one set so every eligibility check that treats
+-- them as a single "combined health" category stays in lockstep.
+local COMBO_HEALTH_ELEMENTS = {
+    healthPctNum     = true, healthNumPct     = true,
+    healthPctNumDash = true, healthNumPctDash = true,
+}
+local function IsComboHealthText(element)
+    return COMBO_HEALTH_ELEMENTS[element] == true
+end
+ns.IsComboHealthText = IsComboHealthText
+
 local function SetCombinedHealthText(fs, element, pctText, numText)
     if element == "healthPctNum" then
         fs:SetFormattedText("%s | %s", pctText, numText)
     elseif element == "healthNumPct" then
         fs:SetFormattedText("%s | %s", numText, pctText)
+    elseif element == "healthPctNumDash" then
+        fs:SetFormattedText("%s - %s", pctText, numText)
+    elseif element == "healthNumPctDash" then
+        fs:SetFormattedText("%s - %s", numText, pctText)
     else
         fs:SetText("")
     end
 end
+ns.SetCombinedHealthText = SetCombinedHealthText
 
 -- Estimate pixel width of health text for a given element type.
 -- We can't read actual rendered widths (WoW secret values), so we use
@@ -1108,6 +1139,8 @@ local healthTextWidths = {
     healthNumber  = 38,
     healthPctNum  = 75,
     healthNumPct  = 75,
+    healthPctNumDash = 75,
+    healthNumPctDash = 75,
 }
 local function EstimateHealthTextWidth(element)
     return (healthTextWidths[element] or 0) + HEALTH_TEXT_PADDING
@@ -1354,6 +1387,45 @@ local function GetAuraSlots()
 end
 ns.GetAuraSlots = GetAuraSlots
 
+-- Raise Strata: per-slot Core Positions toggle. When on, whichever element
+-- occupies that slot is bumped one strata level (MEDIUM -> HIGH) so it renders
+-- above the rest of the plate. Default off for every slot. Defined on ns (not a
+-- file local) to respect this file's local budget.
+function ns.GetSlotRaiseStrata(posKey)
+    if not posKey or posKey == "none" then return false end
+    local key = posKey .. "SlotRaiseStrata"
+    if p and p[key] ~= nil then return p[key] end
+    return defaults[key] or false
+end
+
+-- Apply each slot's Raise Strata setting to the element frame(s) sitting in it.
+-- Element frames otherwise share MEDIUM strata (see the plate build comments);
+-- raising to HIGH lifts that element above the flattened text/aura/indicator
+-- tiers. Children (cooldown, count carrier, border) inherit the frame's strata.
+function ns.ApplySlotStrata(plate)
+    if not plate then return end
+    local function StrataFor(slot)
+        return ns.GetSlotRaiseStrata(slot) and "HIGH" or "MEDIUM"
+    end
+    if plate.raidFrame then
+        plate.raidFrame:SetFrameStrata(StrataFor(GetRaidMarkerPos()))
+    end
+    if plate.classFrame then
+        plate.classFrame:SetFrameStrata(StrataFor(GetClassificationSlot()))
+    end
+    local ds, bs, cs = GetAuraSlots()
+    local dStr, bStr, cStr = StrataFor(ds), StrataFor(bs), StrataFor(cs)
+    if plate.debuffs then
+        for i = 1, #plate.debuffs do plate.debuffs[i]:SetFrameStrata(dStr) end
+    end
+    if plate.buffs then
+        for i = 1, #plate.buffs do plate.buffs[i]:SetFrameStrata(bStr) end
+    end
+    if plate.cc then
+        for i = 1, #plate.cc do plate.cc[i]:SetFrameStrata(cStr) end
+    end
+end
+
 -- Pandemic glow engine: procedural ants, button glow, autocast shine, FlipBook
 -- Wrapped in do...end to keep all internal locals out of the main chunk's 200-local budget.
 -- Externally-needed items are stored on ns.
@@ -1454,7 +1526,9 @@ local function StartPandemicGlow(slot, slotSize)
         local lineLen = math.floor((sz + sz) * (2 / N - 0.1))
         lineLen = min(lineLen, sz)
         if lineLen < 1 then lineLen = 1 end
-        StartProceduralAnts(pg.wrapper, N, th, period, lineLen, cr, cg, cb, sz)
+        local br, bg, bb = GetPandemicGlowBackgroundColor()
+        StartProceduralAnts(pg.wrapper, N, th, period, lineLen, cr, cg, cb, sz, nil,
+            GetPandemicGlowBackground() and br or nil, bg, bb)
     elseif entry.buttonGlow then
         -- Action Button Glow: animated ants texture
         pg.flipTex:Hide()
@@ -4630,6 +4704,11 @@ local function GetReactionColor(unit)
     -- still returned at their own priority steps (7, 8, 10b) further down.
     local inCombat = UnitAffectingCombat(unit)
     local classification = UnitClassification(unit)
+    -- Mini Enemies color scope: restricted to 5-man dungeons when "Mini Coloring
+    -- M+ Only" is on (default), applied everywhere when it is off.
+    local miniMPlusOnly = defaults.miniColoringMPlusOnly
+    if db.miniColoringMPlusOnly ~= nil then miniMPlusOnly = db.miniColoringMPlusOnly end
+    local miniColorScope = ns._inDungeon or not miniMPlusOnly
     local _isBossUnit = false  -- deferred: boss color is applied at step 10b
     local _isMiniBoss = false
     if classification == "elite" or classification == "worldboss" or classification == "rareelite" then
@@ -4685,7 +4764,7 @@ local function GetReactionColor(unit)
     -- tanks that do NOT use the special Tank Has Aggro color. Tanks WITH that
     -- option enabled skip this and keep Mini Enemies at its original low priority
     -- (step 10c), so their has-aggro / caster / mob-type colors still win on trash.
-    if ns._inDungeon
+    if miniColorScope
        and (classification == "normal" or classification == "minus" or classification == "trivial") then
         -- Neutral + mini-enemy: neutral coloring wins over the trash color, for
         -- ALL viewers. Placed above the tank-role gate, the DPS carve-out, and the
@@ -4758,7 +4837,7 @@ local function GetReactionColor(unit)
     -- NOTE: DPS/healers and non-special-aggro tanks already returned at step 7b
     -- (Mini Enemies promoted above Caster); this low-priority path now only
     -- applies to tanks with the special "Has Aggro" color enabled.
-    if ns._inDungeon
+    if miniColorScope
        and (classification == "normal" or classification == "minus" or classification == "trivial") then
         -- Views the user's "Enemies" color (enemyInCombat) until they explicitly
         -- set a Mini Enemies color, so trash starts identical to before.
@@ -5371,6 +5450,7 @@ function NameplateFrame:ApplyAppearance()
     if self.UpdateBorderWrap and (self._wrapActive or ns.GetWrapBorderCastbar()) then
         self:UpdateBorderWrap()
     end
+    ns.ApplySlotStrata(self)
 end
 
 -- PERF: Set up health text font, position, color, and cache slot assignments.
@@ -5427,7 +5507,7 @@ function NameplateFrame:ApplyHealthTextAppearance()
             ca[ci].element = element
             ca[ci].fs = fs
             ca[ci].slotKey = slot.key
-        elseif element == "healthPctNum" or element == "healthNumPct" then
+        elseif IsComboHealthText(element) then
             local fs = self.hpText
             fs:SetParent(self.healthTextFrame)
             SetFSFont(fs, slotFontSz, GetNPOutline())
@@ -5451,7 +5531,7 @@ function NameplateFrame:ApplyHealthTextAppearance()
     -- Top slot health text
     local topElement = GetTextSlot("textSlotTop")
     if topElement == "healthPercent" or topElement == "healthPercentNoSign" or topElement == "healthNumber"
-       or topElement == "healthPctNum" or topElement == "healthNumPct" then
+       or IsComboHealthText(topElement) then
         local nameYOff = GetNameYOffset()
         local cpPush = GetClassPowerTopPush(self)
         local txOff, tyOff = GetTextSlotOffsets("textSlotTop")
@@ -5486,7 +5566,7 @@ function NameplateFrame:ApplyHealthTextAppearance()
         local e = ca[i]
         local el = e.element
         if el == "healthPercent" or el == "healthPercentNoSign"
-           or el == "healthPctNum" or el == "healthNumPct" then
+           or IsComboHealthText(el) then
             local dec = (p and e.slotKey and p[e.slotKey .. "PctDecimal"]) and true or false
             e.pctDecimal = dec
             if dec then anyDec = true end
@@ -5942,7 +6022,7 @@ function NameplateFrame:UpdateHealthValues()
                 fs:SetText(entry.pctDecimal and pctNoSignTextDec or pctNoSignText)
             elseif el == "healthNumber" then
                 fs:SetText(numText)
-            elseif el == "healthPctNum" or el == "healthNumPct" then
+            elseif IsComboHealthText(el) then
                 SetCombinedHealthText(fs, el, entry.pctDecimal and pctTextDec or pctText, numText)
             end
         end
@@ -7081,9 +7161,22 @@ function NameplateFrame:UpdateImportantCastGlow(spellID)
     local style = cfg.importantCastGlowStyle or defaults.importantCastGlowStyle or 1
     if style ~= 1 and style ~= 4 then style = 1 end
     local c = cfg.importantCastGlowColor or defaults.importantCastGlowColor or { r = 1, g = 0.2, b = 0.2 }
+    local bgColor = cfg.importantCastGlowBackgroundColor or defaults.importantCastGlowBackgroundColor or { r = 0, g = 0, b = 0 }
+    local bgOn = cfg.importantCastGlowBackground == true
+    local impN, impTh, impPeriod
+    if style ~= 4 then
+        impN = cfg.importantCastGlowLines or defaults.importantCastGlowLines or 8
+        impTh = cfg.importantCastGlowThickness or defaults.importantCastGlowThickness or 2
+        impPeriod = cfg.importantCastGlowSpeed or defaults.importantCastGlowSpeed or 4
+    end
 
     -- Ensure glow animation is running (idempotent if already active)
-    if not self._importantGlowActive or self._importantGlowStyle ~= style then
+    if not self._importantGlowActive or self._importantGlowStyle ~= style
+       or self._importantGlowR ~= c.r or self._importantGlowG ~= c.g or self._importantGlowB ~= c.b
+       or self._importantGlowBgOn ~= bgOn or self._importantGlowBgR ~= bgColor.r
+       or self._importantGlowBgG ~= bgColor.g or self._importantGlowBgB ~= bgColor.b
+       or self._importantGlowN ~= impN or self._importantGlowTh ~= impTh
+       or self._importantGlowPeriod ~= impPeriod then
         Glows.StopAllGlows(self._importantCastOverlay)
         local pW, pH = self.cast:GetWidth(), self.cast:GetHeight()
         if pW < 5 then pW = 100 end
@@ -7091,16 +7184,18 @@ function NameplateFrame:UpdateImportantCastGlow(spellID)
         if style == 4 then
             (StartAutoCastShine or Glows.StartAutoCastShine)(self._importantCastOverlay, pW, c.r, c.g, c.b, 1.0, pH)
         else
-            local N = cfg.importantCastGlowLines or defaults.importantCastGlowLines or 8
-            local th = cfg.importantCastGlowThickness or defaults.importantCastGlowThickness or 2
-            local period = cfg.importantCastGlowSpeed or defaults.importantCastGlowSpeed or 4
-            local lineLen = math.floor((pW + pH) * (2 / N - 0.1))
+            local lineLen = math.floor((pW + pH) * (2 / impN - 0.1))
             lineLen = math.min(lineLen, math.min(pW, pH))
             if lineLen < 1 then lineLen = 1 end
-            (StartProceduralAnts or Glows.StartProceduralAnts)(self._importantCastOverlay, N, th, period, lineLen, c.r, c.g, c.b, pW, pH)
+            (StartProceduralAnts or Glows.StartProceduralAnts)(self._importantCastOverlay, impN, impTh, impPeriod, lineLen, c.r, c.g, c.b, pW, pH,
+                bgOn and (bgColor.r or 0) or nil, bgColor.g or 0, bgColor.b or 0)
         end
         self._importantGlowActive = true
         self._importantGlowStyle = style
+        self._importantGlowR, self._importantGlowG, self._importantGlowB = c.r, c.g, c.b
+        self._importantGlowBgOn = bgOn
+        self._importantGlowBgR, self._importantGlowBgG, self._importantGlowBgB = bgColor.r, bgColor.g, bgColor.b
+        self._importantGlowN, self._importantGlowTh, self._importantGlowPeriod = impN, impTh, impPeriod
     end
 
     -- SetAlphaFromBoolean handles the secret boolean taint-free.

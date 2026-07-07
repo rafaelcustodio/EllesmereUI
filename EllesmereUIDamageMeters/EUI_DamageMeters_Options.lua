@@ -383,7 +383,7 @@ initFrame:SetScript("OnEvent", function(self)
             local accentSwatch, updateAccent = EllesmereUI.BuildColorSwatch(
                 rgn, hdrRow2:GetFrameLevel() + 3,
                 function()
-                    return EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                    return EllesmereUI.ResolveActiveAccent()
                 end,
                 function()
                     Set("hdrTextUseAccent", true)
@@ -472,7 +472,7 @@ initFrame:SetScript("OnEvent", function(self)
             local accentSwatch, updateAccent = EllesmereUI.BuildColorSwatch(
                 rgn, hdrRow2:GetFrameLevel() + 3,
                 function()
-                    return EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                    return EllesmereUI.ResolveActiveAccent()
                 end,
                 function()
                     Set("iconColorUseAccent", true)
@@ -545,7 +545,7 @@ initFrame:SetScript("OnEvent", function(self)
                   { tooltip = "Class Color",
                     hasAlpha = false,
                     getValue = function()
-                        local cc = EllesmereUI.GetClassColor("PALADIN")
+                        local cc = EllesmereUI._playerClass and EllesmereUI.GetClassColor(EllesmereUI._playerClass)
                         if cc then return cc.r, cc.g, cc.b end
                         return 0.96, 0.55, 0.73
                     end,
@@ -584,7 +584,7 @@ initFrame:SetScript("OnEvent", function(self)
                   { tooltip = "Accent Color",
                     hasAlpha = false,
                     getValue = function()
-                        return EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                        return EllesmereUI.ResolveActiveAccent()
                     end,
                     setValue = function() end,
                     onClick = function()
@@ -603,16 +603,57 @@ initFrame:SetScript("OnEvent", function(self)
         y = y - h
 
         -- Bar Spacing | Icon Style
-        _, h = W:DualRow(parent, y,
+        local iconRow, h = W:DualRow(parent, y,
             { type="slider", text="Spacing", min = -1, max = 10, step = 1,
-              getValue = function() return Cfg("barSpacing") or 2 end,
-              setValue = function(v) Set("barSpacing", v); Refresh() end },
+            getValue = function() return Cfg("barSpacing") or 2 end,
+            setValue = function(v) Set("barSpacing", v); Refresh() end },
             { type="dropdown", text="Icon Style",
               values = _G._EDM_IconStyleValues or {},
               order  = _G._EDM_IconStyleOrder or {},
               getValue = function() return Cfg("iconStyle") or "spec" end,
-              setValue = function(v) Set("iconStyle", v); ApplyIconBrd(); Refresh() end })
+              setValue = function(v) Set("iconStyle", v); ApplyIconBrd(); Refresh(); EllesmereUI:RefreshPage() end })
         y = y - h
+
+        -- Inline cog: Icon Zoom (right region, next to "Icon Style")
+        do
+            local rgn = iconRow._rightRegion
+            local _, cogShow = EllesmereUI.BuildCogPopup({
+                title = "Icon Zoom",
+                rows = {
+                    { type = "slider", label = "Zoom", min = 0, max = 0.20, step = 0.01,
+                    get = function() return Cfg("classIconZoom") or 0.06 end,
+                    set = function(v) Set("classIconZoom", v); Refresh() end },
+                },
+            })
+            -- Icon Zoom only affects the Spec + Blizzard icon styles; the sprite
+            -- presets are pre-framed art, so grey + block the cog for those (and
+            -- for "None", where there is no icon).
+            local function zoomOff()
+                local s = Cfg("iconStyle") or "spec"
+                return s ~= "spec" and s ~= "blizzard"
+            end
+            local cogBtn = CreateFrame("Button", nil, rgn)
+            cogBtn:SetSize(26, 26)
+            cogBtn:SetPoint("RIGHT", rgn._control, "LEFT", -8, 0)
+            cogBtn:SetFrameLevel(rgn:GetFrameLevel() + 5)
+            cogBtn:SetAlpha(zoomOff() and 0.15 or 0.4)
+            local cogTex = cogBtn:CreateTexture(nil, "OVERLAY")
+            cogTex:SetAllPoints()
+            cogTex:SetTexture(EllesmereUI.COGS_ICON)
+            cogBtn:SetScript("OnEnter", function(self)
+                if zoomOff() then
+                    EllesmereUI.ShowWidgetTooltip(self, "Icon Zoom only applies to the Spec and Blizzard icon styles.")
+                else
+                    self:SetAlpha(0.7)
+                end
+            end)
+            cogBtn:SetScript("OnLeave", function(self)
+                EllesmereUI.HideWidgetTooltip()
+                self:SetAlpha(zoomOff() and 0.15 or 0.4)
+            end)
+            cogBtn:SetScript("OnClick", function(self) if not zoomOff() then cogShow(self) end end)
+            EllesmereUI.RegisterWidgetRefresh(function() cogBtn:SetAlpha(zoomOff() and 0.15 or 0.4) end)
+        end
 
         -- Border Style (+ cog) | Border Size (+ inline swatch)
         -- Shadow (Glow rendered behind) needs Show Behind support, which DM lacks,
@@ -1210,7 +1251,7 @@ initFrame:SetScript("OnEvent", function(self)
                   { tooltip = "Accent Color",
                     hasAlpha = false,
                     getValue = function()
-                        return EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                        return EllesmereUI.ResolveActiveAccent()
                     end,
                     setValue = function() end,
                     onClick = function()
@@ -1539,7 +1580,7 @@ initFrame:SetScript("OnEvent", function(self)
                   { tooltip = "Class Color",
                     hasAlpha = false,
                     getValue = function()
-                        local cc = EllesmereUI.GetClassColor(select(2, UnitClass("player")))
+                        local cc = EllesmereUI._playerClass and EllesmereUI.GetClassColor(EllesmereUI._playerClass)
                         if cc then return cc.r, cc.g, cc.b end
                         return 0.96, 0.55, 0.73
                     end,
@@ -1578,7 +1619,7 @@ initFrame:SetScript("OnEvent", function(self)
                   { tooltip = "Accent Color",
                     hasAlpha = false,
                     getValue = function()
-                        return EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                        return EllesmereUI.ResolveActiveAccent()
                     end,
                     setValue = function() end,
                     onClick = function()
@@ -1632,7 +1673,7 @@ initFrame:SetScript("OnEvent", function(self)
             local accentSwatch, updateAccent = EllesmereUI.BuildColorSwatch(
                 rgn, textRow:GetFrameLevel() + 3,
                 function()
-                    return EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                    return EllesmereUI.ResolveActiveAccent()
                 end,
                 function()
                     SHDB().textColorUseAccent = true

@@ -2425,7 +2425,7 @@ do
         { range = 25,  id = 13289 }, -- Egan's Blaster
         { range = 30,  id = 17202 }, -- Snowball
         { range = 35,  id = 18904 }, -- Zorbin's Ultra-Shrinker
-        { range = 40,  id = 18640 }, -- Happy Fun Rock
+        { range = 40,  ids = { 18640, 28767 } }, -- Happy Fun Rock / The Decapitator (either works)
         { range = 45,  id = 32698 }, -- Wrangling Rope
         { range = 60,  id = 32825 }, -- Soul Cannon
         { range = 80,  id = 35278 }, -- Reinforced Net
@@ -2482,7 +2482,13 @@ do
             end
         elseif classFile == "PALADIN" then
             if specID == 65 then -- Holy
-                _crosshairCutoffRange = 40
+                -- Holy is a 40yd healer by default; opt into melee (5yd) via the
+                -- "Show Melee Range for Hpal" crosshair toggle.
+                if CrosshairGet("crosshairHpalMelee") then
+                    _crosshairCutoffRange = 5
+                else
+                    _crosshairCutoffRange = 40
+                end
             else
                 _crosshairCutoffRange = 5
             end
@@ -2505,6 +2511,8 @@ do
         end
     end
     RefreshCrosshairCutoffRange()
+    -- Exposed so the crosshair options toggle can re-resolve the cutoff live.
+    EllesmereUI._RefreshCrosshairCutoffRange = RefreshCrosshairCutoffRange
 
     EllesmereUI._getCrosshairCutoffRange = function()
         if _chPlayerClass == "DRUID" and DRUID_MELEE_FORMS[GetShapeshiftForm()] then
@@ -2523,7 +2531,16 @@ do
         
         local maxRange = nil
         for _, item in ipairs(checkItems) do
-            local inRange = C_Item.IsItemInRange(item.id, "target")
+            local inRange
+            if item.ids then
+                -- Either item satisfies the check: one may be invalid/removed on
+                -- some clients, so try each and take an in-range result.
+                for _, iid in ipairs(item.ids) do
+                    if C_Item.IsItemInRange(iid, "target") == true then inRange = true; break end
+                end
+            else
+                inRange = C_Item.IsItemInRange(item.id, "target")
+            end
             if inRange == true then
                 maxRange = item.range
                 break
@@ -3435,6 +3452,230 @@ do
 end
 
 -------------------------------------------------------------------------------
+--  Combat Alert
+--  Shows a large center-screen text alert when you enter and/or leave combat
+--  (PLAYER_REGEN_DISABLED / PLAYER_REGEN_ENABLED). Each transition has its own
+--  display text and color (a custom color or the player's class color); a single
+--  Text Size and a shared unlock-mode position apply to both. The "Show On" mode
+--  selects enter-only, leave-only or both. Zero cost when idle: no combat events
+--  are registered unless the master toggle is on.
+-------------------------------------------------------------------------------
+do
+    local alertFrame
+    local watcher
+    local installed = false
+    local DEFAULT_TEXT_SIZE = 22
+    local DEFAULT_POS = { point = "CENTER", relPoint = "CENTER", x = 0, y = 169 }
+
+    local DEFAULTS = {
+        enterText  = "+Combat",
+        leaveText  = "-Combat",
+        enterColor = { r = 1.00, g = 1.00, b = 1.00 },
+        leaveColor = { r = 1.00, g = 1.00, b = 1.00 },
+    }
+
+    -- Resolve the effective color for a transition: the player's class color
+    -- when the class-color toggle is on, otherwise the stored custom color.
+    local function ResolveColor(which)
+        local db = EllesmereUIDB
+        local useClass = db and db[which == "leave" and "combatAlertLeaveUseClassColor" or "combatAlertEnterUseClassColor"]
+        if useClass then
+            local _, classToken = UnitClass("player")
+            local c = classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken]
+            if c then return c.r, c.g, c.b end
+        end
+        local c = (db and db[which == "leave" and "combatAlertLeaveColor" or "combatAlertEnterColor"])
+            or (which == "leave" and DEFAULTS.leaveColor or DEFAULTS.enterColor)
+        return c.r, c.g, c.b
+    end
+
+    local function AlertText(which)
+        local db = EllesmereUIDB
+        if which == "leave" then
+            return (db and db.combatAlertLeaveText) or DEFAULTS.leaveText
+        end
+        return (db and db.combatAlertEnterText) or DEFAULTS.enterText
+    end
+
+    -- Applies the configured font size and saved position (or the default
+    -- dead-center placement) to the overlay.
+    local function ApplyOverlaySettings()
+        if not alertFrame then return end
+        local fontPath = (EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("extras"))
+            or EllesmereUI.EXPRESSWAY or "Fonts\\FRIZQT__.TTF"
+        -- Always keep an outline so the alert stays readable over any background.
+        local outline = (EllesmereUI.GetFontOutlineFlag and EllesmereUI.GetFontOutlineFlag("extras")) or ""
+        if not outline:find("OUTLINE") then
+            outline = (outline == "" ) and "OUTLINE" or (outline .. ", OUTLINE")
+        end
+        local size = (EllesmereUIDB and EllesmereUIDB.combatAlertTextSize) or DEFAULT_TEXT_SIZE
+        alertFrame._text:SetFont(fontPath, size, outline)
+        -- Keep the frame (and the unlock-mode mover) sized to roughly the text.
+        alertFrame:SetSize(size * 7, size + 14)
+
+        alertFrame:ClearAllPoints()
+        local pos = EllesmereUIDB and EllesmereUIDB.combatAlertPos
+        if pos and pos.point then
+            alertFrame:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, pos.x or 0, pos.y or 0)
+        else
+            alertFrame:SetPoint(DEFAULT_POS.point, UIParent, DEFAULT_POS.relPoint, DEFAULT_POS.x, DEFAULT_POS.y)
+        end
+    end
+
+    local function CreateAlertFrame()
+        if alertFrame then return end
+
+        alertFrame = CreateFrame("Frame", nil, UIParent)
+        alertFrame:SetSize(240, 50)
+        alertFrame:SetFrameStrata("HIGH")
+        alertFrame:SetFrameLevel(60)
+        alertFrame:EnableMouse(false)
+        alertFrame:SetMouseClickEnabled(false)
+
+        local fs = alertFrame:CreateFontString(nil, "OVERLAY")
+        fs:SetPoint("CENTER")
+        alertFrame._text = fs
+        ApplyOverlaySettings()
+
+        -- Quick fade-in, brief hold, fade-out; hide when finished.
+        local ag = alertFrame:CreateAnimationGroup()
+        local fadeIn = ag:CreateAnimation("Alpha")
+        fadeIn:SetFromAlpha(0); fadeIn:SetToAlpha(1); fadeIn:SetDuration(0.15); fadeIn:SetOrder(1)
+        local hold = ag:CreateAnimation("Alpha")
+        hold:SetFromAlpha(1); hold:SetToAlpha(1); hold:SetDuration(1.2); hold:SetOrder(2)
+        local fadeOut = ag:CreateAnimation("Alpha")
+        fadeOut:SetFromAlpha(1); fadeOut:SetToAlpha(0); fadeOut:SetDuration(0.5); fadeOut:SetOrder(3)
+        ag:SetScript("OnFinished", function() alertFrame:Hide() end)
+        alertFrame._ag = ag
+
+        alertFrame:SetScript("OnHide", function() ag:Stop() end)
+        alertFrame:Hide()
+    end
+
+    local function ShowAlert(which)
+        -- Never fire live alerts while unlock mode is positioning the frame.
+        if EllesmereUI._unlockActive then return end
+        CreateAlertFrame()
+        ApplyOverlaySettings()
+
+        alertFrame._text:SetText(AlertText(which))
+        alertFrame._text:SetTextColor(ResolveColor(which))
+        alertFrame._text:SetAlpha(1)
+
+        alertFrame._ag:Stop()
+        alertFrame:SetAlpha(1)
+        alertFrame:Show()
+        alertFrame._ag:Play()
+    end
+
+    local function OnCombatEvent(_, event)
+        local db = EllesmereUIDB
+        if not (db and db.combatAlertEnabled) then return end
+        local mode = db.combatAlertMode or "both"
+        if event == "PLAYER_REGEN_DISABLED" then
+            if mode ~= "leave" then ShowAlert("enter") end
+        elseif event == "PLAYER_REGEN_ENABLED" then
+            if mode ~= "enter" then ShowAlert("leave") end
+        end
+    end
+
+    local function ApplyCombatAlert()
+        local on = EllesmereUIDB and EllesmereUIDB.combatAlertEnabled
+        if on and not installed then
+            watcher:RegisterEvent("PLAYER_REGEN_DISABLED")
+            watcher:RegisterEvent("PLAYER_REGEN_ENABLED")
+            installed = true
+        elseif not on and installed then
+            watcher:UnregisterAllEvents()
+            installed = false
+        end
+        if alertFrame then ApplyOverlaySettings() end
+    end
+    EllesmereUI._applyCombatAlert = ApplyCombatAlert
+
+    -- Fires a sample alert for the given transition ("enter"/"leave") so the
+    -- look can be checked from the options cog without a real combat change.
+    EllesmereUI._combatAlertPreview = function(which)
+        if EllesmereUI._unlockActive then return end
+        CreateAlertFrame()
+        ApplyOverlaySettings()
+        alertFrame._text:SetText(AlertText(which))
+        alertFrame._text:SetTextColor(ResolveColor(which))
+        alertFrame._ag:Stop()
+        alertFrame:SetAlpha(1)
+        alertFrame:Show()
+        alertFrame._ag:Play()
+    end
+
+    -- Re-apply font size / position (called from the Text Size slider and from
+    -- unlock mode when the saved position changes).
+    EllesmereUI._applyCombatAlertFrame = function()
+        CreateAlertFrame()
+        ApplyOverlaySettings()
+    end
+
+    watcher = CreateFrame("Frame")
+    watcher:SetScript("OnEvent", OnCombatEvent)
+
+    -- Register the alert with Unlock Mode so its position can be dragged.
+    C_Timer.After(2, function()
+        if not (EllesmereUI and EllesmereUI.RegisterUnlockElements) then return end
+        local MK = EllesmereUI.MakeUnlockElement
+        if not MK then return end
+        EllesmereUI:RegisterUnlockElements({
+            MK({
+                key      = "EUI_CombatAlert",
+                label    = "Combat Alert",
+                group    = "Quality of Life",
+                order    = 721,
+                noResize = true,
+                isHidden = function()
+                    return not (EllesmereUIDB and EllesmereUIDB.combatAlertEnabled)
+                end,
+                getFrame = function()
+                    CreateAlertFrame()
+                    return alertFrame
+                end,
+                getSize = function()
+                    local size = (EllesmereUIDB and EllesmereUIDB.combatAlertTextSize) or DEFAULT_TEXT_SIZE
+                    return size * 7, size + 14
+                end,
+                savePos = function(_, point, relPoint, x, y)
+                    if not point then return end
+                    if not EllesmereUIDB then EllesmereUIDB = {} end
+                    EllesmereUIDB.combatAlertPos = { point = point, relPoint = relPoint, x = x, y = y }
+                    if alertFrame and not EllesmereUI._unlockActive then
+                        ApplyOverlaySettings()
+                    end
+                end,
+                loadPos = function()
+                    local pos = EllesmereUIDB and EllesmereUIDB.combatAlertPos
+                    if pos and pos.point then return pos end
+                    return { point = DEFAULT_POS.point, relPoint = DEFAULT_POS.relPoint, x = DEFAULT_POS.x, y = DEFAULT_POS.y }
+                end,
+                clearPos = function()
+                    if EllesmereUIDB then EllesmereUIDB.combatAlertPos = nil end
+                    if alertFrame then ApplyOverlaySettings() end
+                end,
+                applyPos = function()
+                    CreateAlertFrame()
+                    ApplyOverlaySettings()
+                end,
+            }),
+        })
+    end)
+
+    local boot = CreateFrame("Frame")
+    boot:RegisterEvent("PLAYER_LOGIN")
+    boot:SetScript("OnEvent", function(self)
+        self:UnregisterAllEvents()
+        if EllesmereUIDB and EllesmereUIDB.combatAlertEnabled then
+            ApplyCombatAlert()
+        end
+    end)
+end
+
+-------------------------------------------------------------------------------
 --  Hide Item Transforms
 --  Cancels cosmetic transform auras (profession gear, holiday costumes, toys,
 --  consumables) as soon as they land on the player. CancelUnitBuff is blocked
@@ -3622,6 +3863,143 @@ do
     boot:SetScript("OnEvent", function(self)
         self:UnregisterAllEvents()
         ApplyHideTransforms()
+    end)
+end
+
+-------------------------------------------------------------------------------
+--  Equipment Flyout item levels
+--  Blizzard's character-sheet gear flyout (hover a gear slot -> the popup of
+--  same-slot items from your bags/equipped) only shows item icons. When this is
+--  enabled we overlay each flyout button with the item level of the item it
+--  represents, coloured by item quality, so you can compare upgrades at a
+--  glance without reading every tooltip.
+--
+--  We hook EquipmentFlyout_DisplayButton (called once per button whenever the
+--  flyout is populated) and read live from EllesmereUIDB, so toggling the
+--  option takes effect on the next flyout without a reload.
+--  Toggle: EllesmereUIDB.flyoutItemLevels (Quality of Life -> UI).
+-------------------------------------------------------------------------------
+do
+    local function FlyoutEnabled()
+        return EllesmereUIDB and EllesmereUIDB.flyoutItemLevels
+    end
+
+    -- Compute item level + quality + link from a decoded bag/slot pair. Prefers
+    -- the ItemLocation API (exact per-item level, no caching) and falls back to
+    -- the item link when the location can't be built.
+    local function LevelFromSlot(isBags, bag, slot)
+        if isBags then
+            if ItemLocation then
+                local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
+                if loc and loc:IsValid() and C_Item.DoesItemExist(loc) then
+                    return C_Item.GetCurrentItemLevel(loc), C_Item.GetItemQuality(loc), C_Item.GetItemLink(loc)
+                end
+            end
+            local link = C_Container and C_Container.GetContainerItemLink(bag, slot)
+            if link then
+                return C_Item.GetDetailedItemLevelInfo(link), select(3, C_Item.GetItemInfo(link)), link
+            end
+            return
+        end
+        -- Equipped / bank inventory slot.
+        local link = GetInventoryItemLink("player", slot)
+        if link then
+            local quality = GetInventoryItemQuality and GetInventoryItemQuality("player", slot)
+            return C_Item.GetDetailedItemLevelInfo(link), quality or select(3, C_Item.GetItemInfo(link)), link
+        end
+    end
+
+    -- Return item level + quality + link for a flyout button. Handles all three
+    -- flyout shapes across game versions:
+    --   * modern flyouts that store an ItemLocation object on the button,
+    --   * current retail packed location decoded via EquipmentManager_GetLocationData,
+    --   * older clients decoded via EquipmentManager_UnpackLocation.
+    local function ButtonItemInfo(button)
+        if button.GetItemLocation then
+            local ok, loc = pcall(button.GetItemLocation, button)
+            if ok and loc and loc.IsValid and loc:IsValid() and C_Item.DoesItemExist(loc) then
+                return C_Item.GetCurrentItemLevel(loc), C_Item.GetItemQuality(loc), C_Item.GetItemLink(loc)
+            end
+        end
+
+        local location = button.location
+        if not location or type(location) ~= "number" then return end
+        if EQUIPMENTFLYOUT_FIRST_SPECIAL_LOCATION
+            and location >= EQUIPMENTFLYOUT_FIRST_SPECIAL_LOCATION then
+            return
+        end
+
+        if EquipmentManager_GetLocationData then
+            local ld = EquipmentManager_GetLocationData(location)
+            if not ld or ld.slot == nil then return end
+            return LevelFromSlot(ld.isBags, ld.bag, ld.slot)
+        elseif EquipmentManager_UnpackLocation then
+            local _, _, bags, voidStorage, slot, bag = EquipmentManager_UnpackLocation(location)
+            if voidStorage then return end
+            return LevelFromSlot(bags, bag, slot)
+        end
+    end
+
+    -- Item-level FontStrings live in an external weak-keyed table, NOT on the
+    -- button. The flyout buttons are Blizzard-owned (and the flyout is the
+    -- secure item-equipping path), so writing a custom key onto them would
+    -- taint their execution context. Creating the FontString region on the
+    -- button is fine; only the state reference must stay off the frame table.
+    local _flyoutFS = setmetatable({}, { __mode = "k" })  -- [button] = fontstring
+
+    -- Lazily attach (and return) the item-level FontString for a flyout button.
+    local function EnsureText(button)
+        local fs = _flyoutFS[button]
+        if not fs then
+            local font = EllesmereUI._font
+                or "Interface\\AddOns\\EllesmereUI\\media\\fonts\\Expressway.ttf"
+            local flag = (EllesmereUI.SlugFlag and EllesmereUI.SlugFlag("OUTLINE, SLUG"))
+                or "OUTLINE, SLUG"
+            fs = button:CreateFontString(nil, "OVERLAY", nil, 7)
+            fs:SetFont(font, 12, flag)
+            fs:SetPoint("TOP", button, "TOP", 0, -2)
+            fs:SetJustifyH("CENTER")
+            _flyoutFS[button] = fs
+        end
+        return fs
+    end
+
+    local function InstallHook()
+        if not EquipmentFlyout_DisplayButton then return end
+        hooksecurefunc("EquipmentFlyout_DisplayButton", function(button)
+            local fs = _flyoutFS[button]
+            if not FlyoutEnabled() then
+                if fs then fs:SetText("") end
+                return
+            end
+
+            local ilvl, quality, link = ButtonItemInfo(button)
+            fs = EnsureText(button)
+            if ilvl and ilvl > 0 then
+                fs:SetText(ilvl)
+                -- Match the character sheet: custom color > upgrade track > rarity.
+                local c
+                if EllesmereUI.GetItemLevelColor then
+                    c = EllesmereUI.GetItemLevelColor(link, quality)
+                elseif quality and ITEM_QUALITY_COLORS then
+                    c = ITEM_QUALITY_COLORS[quality]
+                end
+                if c then
+                    fs:SetTextColor(c.r, c.g, c.b, 1)
+                else
+                    fs:SetTextColor(1, 1, 1, 1)
+                end
+            else
+                fs:SetText("")
+            end
+        end)
+    end
+
+    local f = CreateFrame("Frame")
+    f:RegisterEvent("PLAYER_LOGIN")
+    f:SetScript("OnEvent", function(self)
+        self:UnregisterAllEvents()
+        InstallHook()
     end)
 end
 

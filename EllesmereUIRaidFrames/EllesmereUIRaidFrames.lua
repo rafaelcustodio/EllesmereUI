@@ -523,10 +523,13 @@ local defaults = {
         absorbBarEnabled = false,
         absorbBarHeight  = 4,
         absorbBarColor   = { r = 1, g = 1, b = 1 },
+        -- Fill direction for the vertical (Right/Left Edge) positions.
+        absorbBarGrowDir = "up",
         -- Heal Absorb Bar: separate strip showing the heal-absorb amount
         healAbsorbBarPosition = "none",
         healAbsorbBarHeight   = 4,
         healAbsorbBarColor    = { r = 200/255, g = 29/255, b = 29/255 },
+        healAbsorbBarGrowDir  = "up",
 
         -- Indicators
         roleIconStyle    = "modern",  -- none/modern/modernCircle/styled/classicCircle/classic/blizzDefault/blizzLight
@@ -629,6 +632,8 @@ local defaults = {
         debuffCCGlowClassColor = false,
         debuffCCGlowR = 1.0, debuffCCGlowG = 0.776, debuffCCGlowB = 0.376,
         debuffCCGlowLines = 8, debuffCCGlowThickness = 2, debuffCCGlowSpeed = 4,
+        debuffCCGlowBackground = false,
+        debuffCCGlowBackgroundR = 0, debuffCCGlowBackgroundG = 0, debuffCCGlowBackgroundB = 0,
         -- Defensives & Externals
         showDefensives   = true,
         showExternals    = true,
@@ -1523,7 +1528,7 @@ local function GetNameColor(unit, s)
     s = s or db.profile
     local mode = s.nameColorMode or "class"
     if mode == "accent" then
-        local r, g, b = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+        local r, g, b = EllesmereUI.ResolveActiveAccent()
         if r then return r, g, b end
         return 1, 1, 1
     elseif mode == "custom" then
@@ -1630,7 +1635,7 @@ local function GetHealthTextColor(unit, s)
     s = s or db.profile
     local mode = s.healthTextColorMode or "custom"
     if mode == "accent" then
-        local r, g, b = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+        local r, g, b = EllesmereUI.ResolveActiveAccent()
         if r then return r, g, b end
         return 1, 1, 1
     elseif mode == "class" then
@@ -1652,7 +1657,7 @@ function ns.GetHealAbsorbTextColor(unit, s)
     s = s or db.profile
     local mode = s.healAbsorbTextColorMode or "custom"
     if mode == "accent" then
-        local r, g, b = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+        local r, g, b = EllesmereUI.ResolveActiveAccent()
         if r then return r, g, b end
         return 1, 0.3, 0.3
     elseif mode == "class" then
@@ -2247,7 +2252,9 @@ end
 
 -------------------------------------------------------------------------------
 --  Absorb Bar position (replaces the old on/off toggle)
---  Positions: none / aboveRight / aboveLeft / topRight / topLeft.
+--  Positions: none / aboveRight / aboveLeft / topRight / topLeft /
+--  rightVertical / leftVertical (vertical side bar; fill direction comes
+--  from the per-bar grow-direction setting, default up).
 --  Legacy: the old boolean (absorbBarEnabled) maps to "aboveRight" when on and
 --  "none" when off. The new key (absorbBarPosition) takes precedence once the
 --  user picks one, so existing settings carry over with no migration.
@@ -2271,10 +2278,28 @@ end
 -- absorb-style texture. "belowAbsorb" (heal bar only) sits flush below the
 -- Absorb Bar's bottom edge, derived from the Absorb Bar's POSITION -- not its
 -- live visibility, so it never shifts up. "*Right" fills from the right edge.
-ns.ApplyStripBarLayout = function(stripBar, ab, button, position, height, absorbPos, absorbHeight)
+-- "*Vertical" hug the health bar's left/right edge as a vertical bar
+-- (Grid2-style side bar); "height" acts as its width and vertGrowDir
+-- ("up" default / "down", per bar) picks the fill direction.
+ns.ApplyStripBarLayout = function(stripBar, ab, button, position, height, absorbPos, absorbHeight, vertGrowDir)
     if not stripBar then return end
     local hp = ab._hpBar or button
     stripBar:ClearAllPoints()
+    if position == "rightVertical" or position == "leftVertical" then
+        stripBar:SetOrientation("VERTICAL")
+        stripBar:SetReverseFill(vertGrowDir == "down")
+        stripBar:SetWidth(PixelSnap(height or 4))
+        if position == "rightVertical" then
+            stripBar:SetPoint("TOPRIGHT", hp, "TOPRIGHT", 0, 0)
+            stripBar:SetPoint("BOTTOMRIGHT", hp, "BOTTOMRIGHT", 0, 0)
+        else
+            stripBar:SetPoint("TOPLEFT", hp, "TOPLEFT", 0, 0)
+            stripBar:SetPoint("BOTTOMLEFT", hp, "BOTTOMLEFT", 0, 0)
+        end
+        stripBar:SetFrameLevel(ab:GetFrameLevel() + 1)
+        return
+    end
+    stripBar:SetOrientation("HORIZONTAL")
     stripBar:SetHeight(PixelSnap(height or 4))
     if position == "belowAbsorb" then
         absorbPos = absorbPos or "none"
@@ -2359,10 +2384,11 @@ local function UpdateAbsorb(button, unit)
         if barOn then
             local bc = s.absorbBarColor or { r = 1, g = 1, b = 1 }
             local bh = s.absorbBarHeight or 4
-            -- Re-layout only when position/height changes (no per-update SetPoint churn).
-            if topBar._lpPos ~= barPos or topBar._lpH ~= bh then
-                topBar._lpPos = barPos; topBar._lpH = bh
-                ns.ApplyStripBarLayout(topBar, ab, button, barPos, bh)
+            local gd = s.absorbBarGrowDir or "up"
+            -- Re-layout only when position/height/direction changes (no per-update SetPoint churn).
+            if topBar._lpPos ~= barPos or topBar._lpH ~= bh or topBar._lpGD ~= gd then
+                topBar._lpPos = barPos; topBar._lpH = bh; topBar._lpGD = gd
+                ns.ApplyStripBarLayout(topBar, ab, button, barPos, bh, nil, nil, gd)
             end
             topBar:SetStatusBarColor(bc.r, bc.g, bc.b, bc.a or 1)
             topBar:SetMinMaxValues(0, maxHealth)
@@ -2381,12 +2407,15 @@ local function UpdateAbsorb(button, unit)
             local hbc = s.healAbsorbBarColor or { r = 200/255, g = 29/255, b = 29/255 }
             local hbh = s.healAbsorbBarHeight or 4
             local abh = s.absorbBarHeight or 4
+            local hgd = s.healAbsorbBarGrowDir or "up"
             -- Re-layout only when its or the Absorb Bar's position/height changes.
             if healTopBar._lpPos ~= healBarPos or healTopBar._lpH ~= hbh
-               or healTopBar._lpAP ~= barPos or healTopBar._lpAH ~= abh then
+               or healTopBar._lpAP ~= barPos or healTopBar._lpAH ~= abh
+               or healTopBar._lpGD ~= hgd then
                 healTopBar._lpPos = healBarPos; healTopBar._lpH = hbh
                 healTopBar._lpAP = barPos; healTopBar._lpAH = abh
-                ns.ApplyStripBarLayout(healTopBar, ab, button, healBarPos, hbh, barPos, abh)
+                healTopBar._lpGD = hgd
+                ns.ApplyStripBarLayout(healTopBar, ab, button, healBarPos, hbh, barPos, abh, hgd)
             end
             healTopBar:SetStatusBarColor(hbc.r, hbc.g, hbc.b, hbc.a or 1)
             healTopBar:SetMinMaxValues(0, maxHealth)
@@ -4106,15 +4135,15 @@ local function UpdateButton(button)
         if s.statusTextPosition == "none" then
             d.statusText:Hide()
         elseif UnitIsDeadOrGhost(unit) then
-            d.statusText:SetText("DEAD")
+            d.statusText:SetText(EllesmereUI.L("DEAD"))
             d.statusText:SetTextColor(stc.r, stc.g, stc.b)
             d.statusText:Show()
         elseif not UnitIsConnected(unit) then
-            d.statusText:SetText("OFFLINE")
+            d.statusText:SetText(EllesmereUI.L("OFFLINE"))
             d.statusText:SetTextColor(stc.r, stc.g, stc.b)
             d.statusText:Show()
         elseif s.statusShowAFK and UnitIsAFK and not issecretvalue(UnitIsAFK(unit)) and UnitIsAFK(unit) then
-            d.statusText:SetText("AFK")
+            d.statusText:SetText(EllesmereUI.L("AFK"))
             d.statusText:SetTextColor(stc.r, stc.g, stc.b)
             d.statusText:Show()
         else
@@ -4527,17 +4556,23 @@ function ns.ApplyDebuffCCGlow(icon, auraData, unit, s)
             if cc then cr, cg, cb = cc.r, cc.g, cc.b end
         end
         local sz = s.debuffSize or 18
-        local oN, oTh, oPer
+        local oN, oTh, oPer, oBgR, oBgG, oBgB
         if gType == 1 then  -- Pixel Glow uses the Lines/Thickness/Speed params
             oN, oTh, oPer = s.debuffCCGlowLines or 8, s.debuffCCGlowThickness or 2, s.debuffCCGlowSpeed or 4
+            if s.debuffCCGlowBackground then
+                oBgR, oBgG, oBgB = s.debuffCCGlowBackgroundR or 0, s.debuffCCGlowBackgroundG or 0, s.debuffCCGlowBackgroundB or 0
+            end
         end
         if (not gov._euiGlowActive) or gov._ccStyle ~= gType or gov._ccW ~= sz
            or gov._ccCR ~= cr or gov._ccCG ~= cg or gov._ccCB ~= cb
-           or gov._ccN ~= oN or gov._ccTh ~= oTh or gov._ccPer ~= oPer then
-            Glows.StartGlow(gov, gType, sz, cr, cg, cb, oN and { N = oN, th = oTh, period = oPer } or nil)
+           or gov._ccN ~= oN or gov._ccTh ~= oTh or gov._ccPer ~= oPer
+           or gov._ccBgR ~= oBgR or gov._ccBgG ~= oBgG or gov._ccBgB ~= oBgB then
+            Glows.StartGlow(gov, gType, sz, cr, cg, cb,
+                oN and { N = oN, th = oTh, period = oPer, bg = oBgR and { r = oBgR, g = oBgG, b = oBgB } or nil } or nil)
             gov._ccStyle, gov._ccW = gType, sz
             gov._ccCR, gov._ccCG, gov._ccCB = cr, cg, cb
             gov._ccN, gov._ccTh, gov._ccPer = oN, oTh, oPer
+            gov._ccBgR, gov._ccBgG, gov._ccBgB = oBgR, oBgG, oBgB
         end
     elseif icon._ccGlowOverlay and icon._ccGlowOverlay._euiGlowActive and Glows and Glows.StopGlow then
         Glows.StopGlow(icon._ccGlowOverlay)
@@ -5791,15 +5826,15 @@ ns._UpdateButtonHealth = function(button)
         if s.statusTextPosition == "none" then
             d.statusText:Hide()
         elseif UnitIsDeadOrGhost(unit) then
-            d.statusText:SetText("DEAD")
+            d.statusText:SetText(EllesmereUI.L("DEAD"))
             d.statusText:SetTextColor(stc.r, stc.g, stc.b)
             d.statusText:Show()
         elseif not UnitIsConnected(unit) then
-            d.statusText:SetText("OFFLINE")
+            d.statusText:SetText(EllesmereUI.L("OFFLINE"))
             d.statusText:SetTextColor(stc.r, stc.g, stc.b)
             d.statusText:Show()
         elseif s.statusShowAFK and UnitIsAFK and not issecretvalue(UnitIsAFK(unit)) and UnitIsAFK(unit) then
-            d.statusText:SetText("AFK")
+            d.statusText:SetText(EllesmereUI.L("AFK"))
             d.statusText:SetTextColor(stc.r, stc.g, stc.b)
             d.statusText:Show()
         else
@@ -6487,7 +6522,7 @@ FB.SetMoverShown = function(owner, show, frameName, labelText)
         local mbg = m:CreateTexture(nil, "BACKGROUND")
         mbg:SetAllPoints()
         mbg:SetColorTexture(0.075, 0.113, 0.141, 0.95)
-        local ar, ag, ab = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+        local ar, ag, ab = EllesmereUI.ResolveActiveAccent()
         if EllesmereUI.MakeBorder then
             EllesmereUI.MakeBorder(m, ar or 1, ag or 1, ab or 1, 0.6)
         end
@@ -9214,7 +9249,9 @@ do
         absorbs = {
             "absorbStyle", "absorbOpacity", "absorbColor", "absorbEdgeMode", "showOvershield",
             "absorbBarEnabled", "absorbBarPosition", "absorbBarHeight", "absorbBarColor",
+            "absorbBarGrowDir",
             "healAbsorbBarPosition", "healAbsorbBarHeight", "healAbsorbBarColor",
+            "healAbsorbBarGrowDir",
             "healAbsorbStyle", "healAbsorbOpacity", "healAbsorbColor", "healAbsorbEdgeMode",
             "healAbsorbBgOpacity",
             "maxHealthStyle", "maxHealthOpacity", "maxHealthColor", "maxHealthBgOpacity",
@@ -11963,7 +12000,7 @@ local function ApplyPreviewData(f, index)
             end
             if barOn and absorbAmt > 0 then
                 local bc = s.absorbBarColor or { r = 1, g = 1, b = 1 }
-                ns.ApplyStripBarLayout(topBar, f._absorbBar, f, barPos, s.absorbBarHeight or 4)
+                ns.ApplyStripBarLayout(topBar, f._absorbBar, f, barPos, s.absorbBarHeight or 4, nil, nil, s.absorbBarGrowDir or "up")
                 topBar:SetStatusBarColor(bc.r, bc.g, bc.b, bc.a or 1)
                 topBar:SetValue(absorbAmt)
                 topBar:Show()
@@ -11986,7 +12023,7 @@ local function ApplyPreviewData(f, index)
                 local haAmtPv = ns.previewHealAbsorbValues[index] or 0
                 if healBarOn and haAmtPv > 0 then
                     local hbc = s.healAbsorbBarColor or { r = 200/255, g = 29/255, b = 29/255 }
-                    ns.ApplyStripBarLayout(healTopBarPv, f._absorbBar, f, healBarPos, s.healAbsorbBarHeight or 4, ns.GetAbsorbBarPosition(s), s.absorbBarHeight or 4)
+                    ns.ApplyStripBarLayout(healTopBarPv, f._absorbBar, f, healBarPos, s.healAbsorbBarHeight or 4, ns.GetAbsorbBarPosition(s), s.absorbBarHeight or 4, s.healAbsorbBarGrowDir or "up")
                     healTopBarPv:SetStatusBarColor(hbc.r, hbc.g, hbc.b, hbc.a or 1)
                     healTopBarPv:SetValue(haAmtPv)
                     healTopBarPv:Show()
@@ -12673,7 +12710,7 @@ local function ApplyPreviewData(f, index)
         ApplyFont(f._nameText, s.nameSize or 10)
         local nameMode = s.nameColorMode or "class"
         if nameMode == "accent" then
-            local ar, ag, ab = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+            local ar, ag, ab = EllesmereUI.ResolveActiveAccent()
             if ar then f._nameText:SetTextColor(ar, ag, ab)
             else f._nameText:SetTextColor(1, 1, 1) end
         elseif nameMode == "custom" then
@@ -12744,7 +12781,7 @@ local function ApplyPreviewData(f, index)
         local htMode = s.healthTextColorMode or "custom"
         local htr, htg, htb = 1, 1, 1
         if htMode == "accent" then
-            local ar, ag, ab = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+            local ar, ag, ab = EllesmereUI.ResolveActiveAccent()
             if ar then htr, htg, htb = ar, ag, ab end
         elseif htMode == "class" then
             local cc = EllesmereUI.GetClassColor(classToken)
@@ -12792,7 +12829,7 @@ local function ApplyPreviewData(f, index)
             local haCM = s.healAbsorbTextColorMode or "custom"
             local hr, hg, hb = 1, 0.3, 0.3
             if haCM == "accent" then
-                local ar, ag, ab = EllesmereUI.ResolveThemeColor(EllesmereUI.GetActiveTheme())
+                local ar, ag, ab = EllesmereUI.ResolveActiveAccent()
                 if ar then hr, hg, hb = ar, ag, ab end
             elseif haCM == "class" then
                 local cc = EllesmereUI.GetClassColor(classToken)
@@ -12836,13 +12873,13 @@ local function ApplyPreviewData(f, index)
             f._statusText:SetPoint("CENTER", f._health, "CENTER", stOX, stOY)
         end
         if isDead then
-            f._statusText:SetText("DEAD")
+            f._statusText:SetText(EllesmereUI.L("DEAD"))
             f._statusText:Show()
         elseif isOffline then
-            f._statusText:SetText("OFFLINE")
+            f._statusText:SetText(EllesmereUI.L("OFFLINE"))
             f._statusText:Show()
         elseif isAfk then
-            f._statusText:SetText("AFK")
+            f._statusText:SetText(EllesmereUI.L("AFK"))
             f._statusText:Show()
         else
             f._statusText:Hide()
