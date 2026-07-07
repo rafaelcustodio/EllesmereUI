@@ -193,3 +193,35 @@ local function BuildPrivateAurasPage(pageName, parent, yOffset)
 end
 
 _G._EUI_BuildPrivateAurasPage = BuildPrivateAurasPage
+
+-------------------------------------------------------------------------------
+--  Standalone module registration (was a QoL sub-page; now its own addon with
+--  a /epa slash). Settings still live under EllesmereUIQoLDB.
+-------------------------------------------------------------------------------
+local PAGE_PRIVAURAS = "Private Auras"
+local initFrame = CreateFrame("Frame")
+initFrame:RegisterEvent("PLAYER_LOGIN")
+initFrame:SetScript("OnEvent", function(self)
+    self:UnregisterEvent("PLAYER_LOGIN")
+    if not EllesmereUI or not EllesmereUI.RegisterModule then return end
+    EllesmereUI:RegisterModule("EllesmereUIPrivateAuras", {
+        title       = "Private Auras",
+        description = "Custom monitor for Blizzard private auras (boss mechanics).",
+        searchTerms = { "private aura", "private auras", "boss", "mechanic", "anchor", "aura" },
+        pages       = { PAGE_PRIVAURAS },
+        buildPage   = function(pageName, parent, yOffset)
+            if pageName == PAGE_PRIVAURAS then
+                return BuildPrivateAurasPage(pageName, parent, yOffset)
+            end
+        end,
+        onReset     = function()
+            if _G._EUI_PrivateAuras_Reset then _G._EUI_PrivateAuras_Reset() end
+        end,
+    })
+
+    SLASH_EUIPRIVAURAS1 = "/epa"
+    SlashCmdList.EUIPRIVAURAS = function()
+        if InCombatLockdown and InCombatLockdown() then return end
+        EllesmereUI:ShowModule("EllesmereUIPrivateAuras")
+    end
+end)

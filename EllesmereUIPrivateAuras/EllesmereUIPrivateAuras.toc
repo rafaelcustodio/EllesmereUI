@@ -1,0 +1,15 @@
+## Interface: 120000, 120001, 120005, 120007
+## Title: |cff0cd29fEllesmereUI|r Private Auras
+## Category: |cff0cd29fEllesmere|rUI
+## Group: EllesmereUI
+## Notes: Custom monitor for Blizzard private auras (boss mechanics).
+## Author: Ellesmere
+## Version: 8.3.9
+## Dependencies: EllesmereUI
+## IconTexture: Interface\AddOns\EllesmereUI\media\eg-logo.tga
+
+# Data lives under EllesmereUIDB (central store), via NewDB("EllesmereUIQoLDB"),
+# so existing user settings carry over from when this was part of the QoL addon.
+
+EllesmereUIPrivateAuras.lua
+EUI_PrivateAuras_Options.lua

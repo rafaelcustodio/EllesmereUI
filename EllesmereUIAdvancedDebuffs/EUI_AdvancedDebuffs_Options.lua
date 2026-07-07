@@ -356,3 +356,37 @@ local function BuildAdvancedDebuffsPage(pageName, parent, yOffset)
 end
 
 _G._EUI_BuildAdvancedDebuffsPage = BuildAdvancedDebuffsPage
+
+-------------------------------------------------------------------------------
+--  Standalone module registration. Advanced Debuffs used to be a sub-page of
+--  the QoL panel; it now lives in its own addon folder and registers its own
+--  module (sidebar entry in /eui, plus a /ead slash). Its settings still live
+--  under EllesmereUIQoLDB (see the feature file), so nothing resets.
+-------------------------------------------------------------------------------
+local PAGE_ADVDEBUFFS = "Advanced Debuffs"
+local initFrame = CreateFrame("Frame")
+initFrame:RegisterEvent("PLAYER_LOGIN")
+initFrame:SetScript("OnEvent", function(self)
+    self:UnregisterEvent("PLAYER_LOGIN")
+    if not EllesmereUI or not EllesmereUI.RegisterModule then return end
+    EllesmereUI:RegisterModule("EllesmereUIAdvancedDebuffs", {
+        title       = "Advanced Debuffs",
+        description = "Player debuff tracker with a freely-movable icon grid.",
+        searchTerms = { "debuff", "debuffs", "advanced debuffs", "aura", "dispel", "bloodlust" },
+        pages       = { PAGE_ADVDEBUFFS },
+        buildPage   = function(pageName, parent, yOffset)
+            if pageName == PAGE_ADVDEBUFFS then
+                return BuildAdvancedDebuffsPage(pageName, parent, yOffset)
+            end
+        end,
+        onReset     = function()
+            if _G._EUI_AdvancedDebuffs_Reset then _G._EUI_AdvancedDebuffs_Reset() end
+        end,
+    })
+
+    SLASH_EUIADVDEBUFFS1 = "/ead"
+    SlashCmdList.EUIADVDEBUFFS = function()
+        if InCombatLockdown and InCombatLockdown() then return end
+        EllesmereUI:ShowModule("EllesmereUIAdvancedDebuffs")
+    end
+end)

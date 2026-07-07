@@ -10,139 +10,6 @@ local PAGE_BREZ     = "BattleRes"
 local PAGE_AUTOLOG  = "Keys, Logs & Brez"
 local PAGE_UPGCALC  = "Upgrade Calc"
 local PAGE_SHIFTER  = "Shifter"
-local PAGE_ADVDEBUFFS = "Adv. Debuffs"
-local PAGE_PRIVAURAS  = "Private Auras"
-
--------------------------------------------------------------------------------
---  Reminder section builder (Combat Potion / Lust)
---  Renders the enable toggle (with an inline eye preview) followed by a
---  dedicated config section -- Reminder Text, Text Size, Color and Sound --
---  shown only while the feature is enabled. spec carries the per-feature DB
---  keys, defaults and apply/preview hooks. Returns the advanced y offset.
--------------------------------------------------------------------------------
-local function BuildReminderSection(W, parent, y, spec)
-    local _, h
-    local function enabled() return EllesmereUIDB and EllesmereUIDB[spec.key] end
-    local function off() return not enabled() end
-
-    -- Enable toggle row (right half empty)
-    local row
-    row, h = W:DualRow(parent, y,
-        { type="toggle", text=spec.label, tooltip=spec.tooltip,
-          getValue=function() return enabled() or false end,
-          setValue=function(v)
-            if not EllesmereUIDB then EllesmereUIDB = {} end
-            EllesmereUIDB[spec.key] = v
-            if not v and spec.hidePreview then spec.hidePreview() end
-            EllesmereUI:RefreshPage(true)  -- rebuild so the section shows/hides
-          end },
-        { type="label", text="" }
-    );  y = y - h
-
-    -- Inline eye-preview toggle on the enable row
-    do
-        local leftRgn = row._leftRegion
-        local EYE_VISIBLE   = EllesmereUI.MEDIA_PATH .. "icons\\eui-visible.png"
-        local EYE_INVISIBLE = EllesmereUI.MEDIA_PATH .. "icons\\eui-invisible.png"
-        local shown = false
-        local eye = CreateFrame("Button", nil, leftRgn)
-        eye:SetSize(26, 26)
-        eye:SetPoint("RIGHT", leftRgn._control, "LEFT", -8, 0)
-        eye:SetFrameLevel(leftRgn:GetFrameLevel() + 5)
-        eye:SetAlpha(off() and 0.15 or 0.4)
-        local tex = eye:CreateTexture(nil, "OVERLAY"); tex:SetAllPoints()
-        local function refresh() tex:SetTexture(shown and EYE_INVISIBLE or EYE_VISIBLE) end
-        refresh()
-        eye:SetScript("OnEnter", function(self) self:SetAlpha(0.7); EllesmereUI.ShowWidgetTooltip(self, spec.previewLabel) end)
-        eye:SetScript("OnLeave", function(self) EllesmereUI.HideWidgetTooltip(); self:SetAlpha(off() and 0.15 or 0.4) end)
-        eye:SetScript("OnClick", function()
-            if off() then return end
-            shown = not shown; refresh()
-            if shown then
-                if spec.apply then spec.apply() end
-                if spec.preview then spec.preview() end
-            elseif spec.hidePreview then
-                spec.hidePreview()
-            end
-        end)
-        local block = CreateFrame("Frame", nil, eye)
-        block:SetAllPoints(); block:SetFrameLevel(eye:GetFrameLevel() + 10); block:EnableMouse(true)
-        block:SetScript("OnEnter", function() EllesmereUI.ShowWidgetTooltip(eye, EllesmereUI.DisabledTooltip(spec.name)) end)
-        block:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
-        if off() then block:Show() else block:Hide() end
-        EllesmereUI.RegisterWidgetRefresh(function()
-            if off() then
-                shown = false; refresh(); eye:SetAlpha(0.15); block:Show()
-                if spec.hidePreview then spec.hidePreview() end
-            else
-                eye:SetAlpha(0.4); block:Hide()
-            end
-        end)
-    end
-
-    -- Config section (only while enabled)
-    if enabled() then
-        _, h = W:SectionHeader(parent, spec.headerText, y);  y = y - h
-
-        -- Reminder Text
-        _, h = W:DualRow(parent, y,
-            { type="input", text="Reminder Text", inputWidth=180, maxLetters=80,
-              getValue=function()
-                local t = EllesmereUIDB and EllesmereUIDB[spec.textKey]
-                if t and t ~= "" then return t end
-                return spec.defaultText
-              end,
-              setValue=function(v)
-                if not EllesmereUIDB then EllesmereUIDB = {} end
-                v = (v and v:gsub("^%s+", ""):gsub("%s+$", "")) or ""
-                if v == "" or v == spec.defaultText then v = nil end
-                EllesmereUIDB[spec.textKey] = v
-                if spec.apply then spec.apply() end
-              end },
-            { type="spacer" }
-        );  y = y - h
-
-        -- Text Size | Color
-        _, h = W:DualRow(parent, y,
-            { type="slider", text="Text Size", min=10, max=50, step=1,
-              getValue=function() return (EllesmereUIDB and EllesmereUIDB[spec.sizeKey]) or 30 end,
-              setValue=function(v)
-                if not EllesmereUIDB then EllesmereUIDB = {} end
-                EllesmereUIDB[spec.sizeKey] = v
-                if spec.apply then spec.apply() end
-              end },
-            { type="colorpicker", text="Color",
-              getValue=function()
-                local c = EllesmereUIDB and EllesmereUIDB[spec.colorKey]
-                if c then return c.r, c.g, c.b end
-                return spec.defaultColor.r, spec.defaultColor.g, spec.defaultColor.b
-              end,
-              setValue=function(r, g, b)
-                if not EllesmereUIDB then EllesmereUIDB = {} end
-                EllesmereUIDB[spec.colorKey] = { r = r, g = g, b = b }
-                if spec.apply then spec.apply() end
-              end }
-        );  y = y - h
-
-        -- Sound
-        _, h = W:DualRow(parent, y,
-            EllesmereUI.BuildQoLSoundRow("Sound",
-                function() return EllesmereUIDB and EllesmereUIDB[spec.soundKey] or "none" end,
-                function(v)
-                    if not EllesmereUIDB then EllesmereUIDB = {} end
-                    EllesmereUIDB[spec.soundKey] = (v ~= "none" and v) or nil
-                end),
-            { type="spacer" }
-        );  y = y - h
-
-        -- Optional per-reminder extra rows (e.g. the Lust "self only" toggle).
-        if spec.extraConfig then
-            y = spec.extraConfig(W, parent, y)
-        end
-    end
-
-    return y
-end
 
 -------------------------------------------------------------------------------
 --  Hide Item Transforms picker popup
@@ -1803,53 +1670,6 @@ initFrame:SetScript("OnEvent", function(self)
             UpdateRestCogState()
         end
 
-        -- Combat Potion Reminder (toggle + eye, then a config section when on)
-        y = BuildReminderSection(W, parent, y, {
-            key = "combatPotionReminder",
-            name = "Combat Potion Reminder",
-            label = "Combat Potion Reminder",
-            tooltip = "Pulses an on-screen reminder while a combat potion in your bags is ready to use. Only triggers inside Mythic raids and Mythic+. Potions are auto-detected from your bags.",
-            headerText = "COMBAT POTION REMINDER",
-            textKey = "combatPotionText",   defaultText = "Combat Potion Ready!",
-            sizeKey = "combatPotionTextSize",
-            colorKey = "combatPotionColor",  defaultColor = { r = 0.3, g = 1, b = 0.3 },
-            soundKey = "combatPotionSound",
-            previewLabel = "Preview combat potion reminder",
-            apply = function() if EllesmereUI._applyCombatPotion then EllesmereUI._applyCombatPotion() end end,
-            preview = function() if EllesmereUI._combatPotionPreview then EllesmereUI._combatPotionPreview() end end,
-            hidePreview = function() if EllesmereUI._combatPotionHidePreview then EllesmereUI._combatPotionHidePreview() end end,
-        })
-
-        -- Lust Reminder (toggle + eye, then a config section when on)
-        y = BuildReminderSection(W, parent, y, {
-            key = "lustReminder",
-            name = "Lust Reminder",
-            label = "Lust Reminder",
-            tooltip = "Pulses an on-screen reminder while you are in combat, not affected by Sated/Exhaustion, and a Bloodlust-type cooldown is available (Bloodlust/Heroism, Time Warp, Fury of the Aspects or Primal Rage). Only triggers when your own class can lust, or a lust-capable class is in your group.",
-            headerText = "LUST REMINDER",
-            textKey = "lustReminderText",   defaultText = "Lust Ready!",
-            sizeKey = "lustReminderTextSize",
-            colorKey = "lustReminderColor",  defaultColor = { r = 1, g = 0.5, b = 0.1 },
-            soundKey = "lustReminderSound",
-            previewLabel = "Preview lust reminder",
-            apply = function() if EllesmereUI._applyLustReminder then EllesmereUI._applyLustReminder() end end,
-            preview = function() if EllesmereUI._lustReminderPreview then EllesmereUI._lustReminderPreview() end end,
-            hidePreview = function() if EllesmereUI._lustReminderHidePreview then EllesmereUI._lustReminderHidePreview() end end,
-            extraConfig = function(W, parent, y)
-                local _, h = W:DualRow(parent, y,
-                    { type="toggle", text="Only When My Class Can Lust",
-                      tooltip="When on, the reminder only appears if your own class can cast a Bloodlust-type ability. When off, it also appears whenever a lust-capable class is in your group.",
-                      getValue=function() return EllesmereUIDB and EllesmereUIDB.lustReminderSelfOnly or false end,
-                      setValue=function(v)
-                        if not EllesmereUIDB then EllesmereUIDB = {} end
-                        EllesmereUIDB.lustReminderSelfOnly = v or nil
-                      end },
-                    { type="spacer" }
-                )
-                return y - h
-            end,
-        })
-
         _, h = W:Spacer(parent, y, 20);  y = y - h
 
         ---------------------------------------------------------------------------
@@ -2117,15 +1937,6 @@ initFrame:SetScript("OnEvent", function(self)
                     { type="slider", label="Y Offset", min=-200, max=200, step=1,
                       get=function() return cget("crosshairYOffset") or 0 end,
                       set=function(v) dbset("crosshairYOffset", v) end },
-                    { type="input", label="Melee Text", inputWidth=120,
-                      get=function() return cget("crosshairMeleeText") or "OUT OF MELEE" end,
-                      set=function(v) cset("crosshairMeleeText", v); applyCH() end },
-                    { type="slider", label="Melee Text Size", min=8, max=48, step=1,
-                      get=function() return cget("crosshairMeleeTextSize") or 16 end,
-                      set=function(v) dbset("crosshairMeleeTextSize", v) end },
-                    { type="slider", label="Melee Text Y", min=-200, max=200, step=1,
-                      get=function() return cget("crosshairMeleeTextYOffset") or 40 end,
-                      set=function(v) dbset("crosshairMeleeTextYOffset", v) end },
             }
             -- Holy Paladin uses a 40yd out-of-range cutoff by default; let
             -- paladins opt into a melee (5yd) cutoff. Shown only for Paladins.
@@ -2235,22 +2046,6 @@ initFrame:SetScript("OnEvent", function(self)
             mcSwatch:SetAlpha(mcInitOff and 0.3 or 1)
             if mcInitOff then mcBlock:Show() else mcBlock:Hide() end
         end
-
-        -- Text Out of Melee Range (toggle; message/size/position live in the cog)
-        local meleeTextRow
-        meleeTextRow, h = W:DualRow(parent, y,
-            { type="toggle", text="Text Out of Melee Range",
-              tooltip="Shows a warning text on screen when your current target is out of melee range. Edit the message, size and position in the crosshair cog. The text uses the same colour as the melee-range colour.",
-              disabled=function() return crosshairOff() end,
-              disabledTooltip="Enable the crosshair to use this option.",
-              getValue=function() return cget("crosshairMeleeTextEnabled") == true end,
-              setValue=function(v)
-                cset("crosshairMeleeTextEnabled", v)
-                if EllesmereUI._applyCrosshair then EllesmereUI._applyCrosshair() end
-                EllesmereUI:RefreshPage()
-              end },
-            { type="label", text="" }
-        );  y = y - h
 
         _, h = W:Spacer(parent, y, 20);  y = y - h
 
@@ -2430,20 +2225,14 @@ initFrame:SetScript("OnEvent", function(self)
     EllesmereUI:RegisterModule("EllesmereUIQoL", {
         title       = "Quality of Life",
         description = "Quality of life features and custom cursor.",
-        pages       = { PAGE_QOL, PAGE_CURSOR, PAGE_ADVDEBUFFS, PAGE_PRIVAURAS, PAGE_AUTOLOG, PAGE_UPGCALC, PAGE_SHIFTER },
-        searchTerms = { "brez", "bres", "battle res", "combat res", "cursor", "macro", "fps", "logging", "combat log", "warcraft logs", "upgrade", "ilvl", "item level", "crest", "upgrade calculator", "shifter", "move", "drag", "position", "demodal", "drift", "debuff", "debuffs", "advanced debuffs", "aura", "dispel", "blocklist", "private aura", "private auras", "boss", "mechanic", "anchor", "potion", "combat potion", "potion reminder", "consumable", "mythic", "combat alert", "enter combat", "leave combat", "in combat", "combat text", "combat notification", "transform", "transforms", "costume", "disguise", "chef's hat", "noggenfogger" },
+        pages       = { PAGE_QOL, PAGE_CURSOR, PAGE_AUTOLOG, PAGE_UPGCALC, PAGE_SHIFTER },
+        searchTerms = { "brez", "bres", "battle res", "combat res", "cursor", "macro", "fps", "logging", "combat log", "warcraft logs", "upgrade", "ilvl", "item level", "crest", "upgrade calculator", "shifter", "move", "drag", "position", "demodal", "drift", "combat alert", "enter combat", "leave combat", "in combat", "combat text", "combat notification", "transform", "transforms", "costume", "disguise", "chef's hat", "noggenfogger" },
         buildPage   = function(pageName, parent, yOffset)
             if pageName == PAGE_QOL then
                 return BuildQoLPage(pageName, parent, yOffset)
             end
             if pageName == PAGE_CURSOR and _G._EBS_BuildCursorPage then
                 return _G._EBS_BuildCursorPage(pageName, parent, yOffset)
-            end
-            if pageName == PAGE_ADVDEBUFFS and _G._EUI_BuildAdvancedDebuffsPage then
-                return _G._EUI_BuildAdvancedDebuffsPage(pageName, parent, yOffset)
-            end
-            if pageName == PAGE_PRIVAURAS and _G._EUI_BuildPrivateAurasPage then
-                return _G._EUI_BuildPrivateAurasPage(pageName, parent, yOffset)
             end
             if pageName == PAGE_AUTOLOG and _G._EUI_BuildAutoLoggingPage then
                 return _G._EUI_BuildAutoLoggingPage(pageName, parent, yOffset)
@@ -2482,21 +2271,6 @@ initFrame:SetScript("OnEvent", function(self)
                 EllesmereUIDB.autoRepairGuild = false
                 EllesmereUIDB.shifterEnabled = false
                 EllesmereUIDB.shifterPositions = nil
-                EllesmereUIDB.combatPotionReminder = false
-                EllesmereUIDB.combatPotionColor = nil
-                EllesmereUIDB.combatPotionTextSize = nil
-                EllesmereUIDB.combatPotionYOffset = nil
-                EllesmereUIDB.combatPotionPos = nil
-                EllesmereUIDB.combatPotionSound = nil
-                EllesmereUIDB.combatPotionText = nil
-                EllesmereUIDB.lustReminder = false
-                EllesmereUIDB.lustReminderColor = nil
-                EllesmereUIDB.lustReminderTextSize = nil
-                EllesmereUIDB.lustReminderYOffset = nil
-                EllesmereUIDB.lustReminderPos = nil
-                EllesmereUIDB.lustReminderSound = nil
-                EllesmereUIDB.lustReminderText = nil
-                EllesmereUIDB.lustReminderSelfOnly = nil
                 EllesmereUIDB.hideErrorMessages = false
                 EllesmereUIDB.announceGroupDeaths = false
                 EllesmereUIDB.groupDeathTextSize = nil
@@ -2519,8 +2293,6 @@ initFrame:SetScript("OnEvent", function(self)
             EllesmereUIDB.autoLogging = nil
             if _G._EUI_ResetUpgradeCalc then _G._EUI_ResetUpgradeCalc() end
             if _G._EBS_ResetCursor then _G._EBS_ResetCursor() end
-            if _G._EUI_AdvancedDebuffs_Reset then _G._EUI_AdvancedDebuffs_Reset() end
-            if _G._EUI_PrivateAuras_Reset then _G._EUI_PrivateAuras_Reset() end
             if EllesmereUI._applyHideBlizzardPartyFrame then EllesmereUI._applyHideBlizzardPartyFrame() end
             if EllesmereUI._applyHideErrorMessages then EllesmereUI._applyHideErrorMessages() end
             if EllesmereUI._applyAnnounceGroupDeaths then EllesmereUI._applyAnnounceGroupDeaths() end
@@ -2528,8 +2300,6 @@ initFrame:SetScript("OnEvent", function(self)
             if EllesmereUI._applyHideTransforms then EllesmereUI._applyHideTransforms() end
             if EllesmereUI._applyQuickSignup then EllesmereUI._applyQuickSignup() end
             if EllesmereUI._applyPersistSignupNote then EllesmereUI._applyPersistSignupNote() end
-            if EllesmereUI._combatPotionHidePreview then EllesmereUI._combatPotionHidePreview() end
-            if EllesmereUI._lustReminderHidePreview then EllesmereUI._lustReminderHidePreview() end
             EllesmereUI:InvalidatePageCache()
         end,
     })

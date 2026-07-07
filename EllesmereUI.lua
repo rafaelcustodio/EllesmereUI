@@ -4561,6 +4561,10 @@ EllesmereUI._smTexConsumers = EllesmereUI._smTexConsumers or {}
 function EllesmereUI.AppendSharedMediaTextures(names, order, castBarNames, textures)
     local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
     if not LSM then return end
+    -- A consumer without its name/order/texture tables has nothing to append
+    -- into; `textures` also keys the _smTexConsumers dedup, so a nil here would
+    -- otherwise error on the table-index assignment below.
+    if not (names and order and textures) then return end
 
     -- Icon textures some SM packs wrongly register as statusbar (cached once).
     local blacklist = EllesmereUI._smTexBlacklist
@@ -8732,6 +8736,11 @@ function EllesmereUI:RegisterModule(folderName, config)
             EllesmereUIChat = true,
             EllesmereUIDamageMeters = true,
             EllesmereUIBags = true,
+            -- Fork: features split into their own addon folders
+            EllesmereUIAdvancedDebuffs = true,
+            EllesmereUIPrivateAuras = true,
+            EllesmereUIRaidControl = true,
+            EllesmereUIReminders = true,
         }
         if not ALLOWED[callerFolder] then return end
     end
