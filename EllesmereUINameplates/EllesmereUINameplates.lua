@@ -128,7 +128,7 @@ function ns._appendDisplayPresetKeys(t)
         "tankHasAggroEnabled", "tankHasAggro", "classicTankAggro", "tankHasAggroOverrideMobType",
         "tankHasAggroOverrideBoss",
         "dpsHasAggro", "dpsNearAggro", "offTankAggroEnabled", "offTankAggro",
-        "dpsNoAggroEnabled", "dpsNoAggro",
+        "dpsNoAggroEnabled", "dpsNoAggro", "dpsNoAggroOverrideMiniBoss", "dpsNoAggroOverrideCaster",
         "targetArrowDouble", "targetArrowStyle", "targetArrowColor", "targetArrowClassColor",
         "auraStackTextSize", "auraStackTextColor",
         "auraStackTextPosition", "auraStackTextX", "auraStackTextY",
@@ -212,6 +212,12 @@ local defaults = {
     offTankAggroEnabled = true,
     dpsNoAggro = { r = 0.35, g = 0.75, b = 0.35 },
     dpsNoAggroEnabled = false,
+    -- When on, the DPS/healer No Aggro color overrides the Mini-Boss color
+    -- (promotes it above priority step 7); off (default) = it stays low priority.
+    dpsNoAggroOverrideMiniBoss = false,
+    -- When on, the DPS/healer No Aggro color overrides the Caster color (promotes
+    -- it above priority step 8); off (default) = Casters keep their own color.
+    dpsNoAggroOverrideCaster = false,
     interruptReady = { r = 0.92, g = 0.35, b = 0.20 },  
     castBar = { r = 0.70, g = 0.40, b = 0.90 },
     interruptMidCastEnabled = false,
@@ -3720,7 +3726,8 @@ local CLASS_POWER_MAP = {
     SHAMAN      = { [263] = { "MAELSTROM_WEAPON", 10 } },  -- Enhancement only
     PRIEST      = { [258] = { "INSANITY_BAR", 100 } },     -- Shadow only
     HUNTER      = { [255] = { "TIP_OF_THE_SPEAR", 3 } },   -- Survival only
-    WARRIOR     = { [72]  = { "WHIRLWIND_STACKS", 4 } },    -- Fury only
+    WARRIOR     = { [72]  = { "WHIRLWIND_STACKS", 4 },     -- Fury
+                    [71]  = { "SWEEPING_STRIKES", 12 } },   -- Arms
     DEATHKNIGHT = { [250] = { Enum.PowerType.Runes, 6 },
                     [251] = { Enum.PowerType.Runes, 6 },
                     [252] = { Enum.PowerType.Runes, 6 } },
@@ -4053,6 +4060,15 @@ local function UpdateClassPowerOnPlate(plate)
             end
             return
         end
+    elseif classPowerType == "SWEEPING_STRIKES" then
+        cur, maxP = EllesmereUI.GetSweepingStrikes()
+        if not maxP or maxP <= 0 then
+            for i = 1, #plate._cpPips do
+                plate._cpPips[i]:Hide()
+                if plate._cpPips[i]._bg then plate._cpPips[i]._bg:Hide() end
+            end
+            return
+        end
     elseif classPowerType == "ICICLES" then
         local count = 0
         if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
@@ -4358,6 +4374,9 @@ local function EnableClassPowerWatcher()
                     if EllesmereUI.HandleWhirlwindStacks then
                         EllesmereUI.HandleWhirlwindStacks(event, unit, castGUID, spellID)
                     end
+                    if EllesmereUI.HandleSweepingStrikes then
+                        EllesmereUI.HandleSweepingStrikes(event, unit, castGUID, spellID)
+                    end
                 end
                 RefreshClassPower()
             elseif event == "PLAYER_DEAD" or event == "PLAYER_ALIVE" then
@@ -4368,11 +4387,19 @@ local function EnableClassPowerWatcher()
                     if EllesmereUI.HandleWhirlwindStacks then
                         EllesmereUI.HandleWhirlwindStacks(event)
                     end
+                    if EllesmereUI.HandleSweepingStrikes then
+                        EllesmereUI.HandleSweepingStrikes(event)
+                    end
                 end
                 RefreshClassPower()
             elseif event == "PLAYER_REGEN_ENABLED" then
-                if not _G._ERB_AceDB and EllesmereUI and EllesmereUI.HandleWhirlwindStacks then
-                    EllesmereUI.HandleWhirlwindStacks(event)
+                if not _G._ERB_AceDB and EllesmereUI then
+                    if EllesmereUI.HandleWhirlwindStacks then
+                        EllesmereUI.HandleWhirlwindStacks(event)
+                    end
+                    if EllesmereUI.HandleSweepingStrikes then
+                        EllesmereUI.HandleSweepingStrikes(event)
+                    end
                 end
                 RefreshClassPower()
             else
@@ -4787,6 +4814,17 @@ local function GetReactionColor(unit)
     end
     local unitClass = UnitClassBase and UnitClassBase(unit)
     local _isCaster = (unitClass == "PALADIN")
+    -- DPS/healer No Aggro override state (mirrors the tank has-aggro overrides at
+    -- 6b). Each override independently promotes the No Aggro color above a single
+    -- mob-type step (mini-boss step 7, caster step 8). Only active for a non-tank
+    -- without aggro in a group -- the exact condition the low-priority No Aggro
+    -- step (10) uses. Off by default, so default behavior is unchanged.
+    local dpsNoAggroActive = isThreatUnit and (not _isTankRole) and threatStatus < 2 and IsInGroup()
+    if dpsNoAggroActive then
+        local en = defaults.dpsNoAggroEnabled
+        if db.dpsNoAggroEnabled ~= nil then en = db.dpsNoAggroEnabled end
+        dpsNoAggroActive = en
+    end
     -- 6b. Tank has aggro -- "Override Mini-Boss and Caster colors" option.
     -- Promotes the has-aggro color above the mini-boss/caster steps (but still
     -- below target/focus/enemy-class). Boss units are excluded here -- they are
@@ -4808,6 +4846,16 @@ local function GetReactionColor(unit)
     -- threat colors below, so it is deferred to step 10b (see _isBossUnit);
     -- mini-boss stays here, above threat.
     if _isMiniBoss then
+        -- DPS/healer No Aggro "Override Mini-Boss colors": promotes the No Aggro
+        -- color above the mini-boss color when enabled.
+        if dpsNoAggroActive then
+            local ovr = defaults.dpsNoAggroOverrideMiniBoss
+            if db.dpsNoAggroOverrideMiniBoss ~= nil then ovr = db.dpsNoAggroOverrideMiniBoss end
+            if ovr then
+                local c = _C("dpsNoAggro")
+                return c.r, c.g, c.b
+            end
+        end
         local c = _C("miniboss")
         return MaybeDarken(c.r, c.g, c.b, inCombat)
     end
@@ -4845,6 +4893,17 @@ local function GetReactionColor(unit)
     end
     -- 8. Caster
     if _isCaster then
+        -- DPS/healer No Aggro "Override Caster colors": promotes the No Aggro
+        -- color above the caster color when enabled. Kept separate from the
+        -- mini-boss override so Casters can stay their own color for contrast.
+        if dpsNoAggroActive then
+            local ovr = defaults.dpsNoAggroOverrideCaster
+            if db.dpsNoAggroOverrideCaster ~= nil then ovr = db.dpsNoAggroOverrideCaster end
+            if ovr then
+                local c = _C("dpsNoAggro")
+                return c.r, c.g, c.b
+            end
+        end
         local c = _C("caster")
         return MaybeDarken(c.r, c.g, c.b, inCombat)
     end

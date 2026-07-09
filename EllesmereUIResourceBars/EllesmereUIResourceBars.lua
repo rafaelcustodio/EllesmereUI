@@ -555,6 +555,14 @@ local function GetSecondaryResource()
         return { power = "IGNOREPAIN_BAR", max = mx * IP.CAP, type = "bar" }
     elseif classFile == "WARRIOR" and spec == 2 then
         return { power = "WHIRLWIND_STACKS", max = 4, type = "custom" }
+    elseif classFile == "WARRIOR" and spec == 1
+           and ERB.db and ERB.db.profile and ERB.db.profile.secondary
+           and ERB.db.profile.secondary.armsSweepingStrikesBar then
+        -- Arms: Sweeping Strikes charges (12, or 18 with Improved Sweeping
+        -- Strikes). Base max here; BuildBars refreshes from the tracker.
+        -- Toggle-gated (opt-in, default off); the Unit Frames and personal
+        -- Nameplate readouts show the charges regardless of this toggle.
+        return { power = "SWEEPING_STRIKES", max = 12, type = "custom" }
     end
 
     return nil
@@ -583,6 +591,7 @@ do
         ["MAELSTROM_WEAPON"]         = "MaelstromWeapon",
         ["TIP_OF_THE_SPEAR"]         = "TipOfTheSpear",
         ["WHIRLWIND_STACKS"]         = "WhirlwindStacks",
+        ["SWEEPING_STRIKES"]         = "SweepingStrikes",
     }
     local PKEY = {
         ["LUNAR_POWER_BAR"] = "LUNAR_POWER",
@@ -1154,6 +1163,7 @@ local DEFAULTS = {
             guardianShowHashLines = true,  -- Guardian Ironfur: draw the moving per-cast hash lines
             protIgnorePainBar = true,      -- Prot Warrior: show Ignore Pain bar (total absorbs vs the IP cap = 30% max health; aura stacks are secret). New-user default; existing profiles pinned off via migration "resourcebars_protwar_ignorepain_existing_off_v1".
             protIgnorePainHashLine = true, -- Prot Ignore Pain: draw the moving duration hash line (resets on cast)
+            armsSweepingStrikesBar = false, -- Arms Warrior: show Sweeping Strikes charge pips on the resource bar (opt-in, default off). Unit Frames + personal Nameplate show them regardless. Brand-new key defaulting off, so no migration needed.
             runesSimple = false,  -- DK: treat runes as flat pips (no recharge animation/timer)
             runesCustomRecharge = false,  -- DK: use a custom color for recharging runes instead of a dimmed version of the rune color
             runesRechargeR = 0.5, runesRechargeG = 0.5, runesRechargeB = 0.5, runesRechargeA = 1,
@@ -2849,6 +2859,9 @@ local function BuildBars()
             elseif powerType == "WHIRLWIND_STACKS" and EllesmereUI.GetWhirlwindStacks then
                 local _, realMax = EllesmereUI.GetWhirlwindStacks()
                 if realMax and realMax > 0 then maxPts = realMax end
+            elseif powerType == "SWEEPING_STRIKES" and EllesmereUI.GetSweepingStrikes then
+                local _, realMax = EllesmereUI.GetSweepingStrikes()
+                if realMax and realMax > 0 then maxPts = realMax end
             elseif powerType == "ICICLES" then
                 maxPts = 5
             end
@@ -4512,6 +4525,12 @@ local function UpdateSecondaryResource()
             cur, maxC = EllesmereUI.GetTipOfTheSpear()
         elseif powerType == "WHIRLWIND_STACKS" and EllesmereUI and EllesmereUI.GetWhirlwindStacks then
             cur, maxC = EllesmereUI.GetWhirlwindStacks()
+            if not maxC or maxC <= 0 then
+                for i = 1, #pips do if pips[i] then pips[i]:Hide() end end
+                return
+            end
+        elseif powerType == "SWEEPING_STRIKES" and EllesmereUI and EllesmereUI.GetSweepingStrikes then
+            cur, maxC = EllesmereUI.GetSweepingStrikes()
             if not maxC or maxC <= 0 then
                 for i = 1, #pips do if pips[i] then pips[i]:Hide() end end
                 return
@@ -7050,9 +7069,12 @@ local function OnEvent(self, event, ...)
     elseif event == "PLAYER_REGEN_ENABLED" then
         isInCombat = false
         UpdateVisibility()
-        -- Clean up Whirlwind GUID cache on combat end
+        -- Clean up Whirlwind / Sweeping Strikes GUID caches on combat end
         if EllesmereUI and EllesmereUI.HandleWhirlwindStacks then
             EllesmereUI.HandleWhirlwindStacks(event)
+        end
+        if EllesmereUI and EllesmereUI.HandleSweepingStrikes then
+            EllesmereUI.HandleSweepingStrikes(event)
         end
     elseif event == "PLAYER_TARGET_CHANGED" then
         UpdateVisibility()
@@ -7132,6 +7154,9 @@ local function OnEvent(self, event, ...)
                 if EllesmereUI.HandleWhirlwindStacks then
                     EllesmereUI.HandleWhirlwindStacks(event, unit, castGUID, spellID)
                 end
+                if EllesmereUI.HandleSweepingStrikes then
+                    EllesmereUI.HandleSweepingStrikes(event, unit, castGUID, spellID)
+                end
             end
             if cachedSecondary and (cachedSecondary.type == "custom"
                or cachedSecondary.power == "IRONFUR_BAR") then
@@ -7149,6 +7174,9 @@ local function OnEvent(self, event, ...)
             end
             if EllesmereUI.HandleWhirlwindStacks then
                 EllesmereUI.HandleWhirlwindStacks(event)
+            end
+            if EllesmereUI.HandleSweepingStrikes then
+                EllesmereUI.HandleSweepingStrikes(event)
             end
         end
     elseif event == "PLAYER_ENTERING_WORLD" then

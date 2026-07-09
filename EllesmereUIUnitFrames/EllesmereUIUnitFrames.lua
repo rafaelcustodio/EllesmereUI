@@ -1227,6 +1227,7 @@ local function ApplyDarkTheme(health)
     local isDark = db and db.profile and db.profile.darkTheme
     if isDark then
         health.colorClass = false
+        health.colorClassPet = false
         health.colorReaction = false
         health.colorTapped = false
         health.colorDisconnected = false
@@ -1265,6 +1266,14 @@ local function ApplyDarkTheme(health)
         -- Check for custom fill/bg colors on this unit
         local unitKey = health._euiUnitKey
         local unitSettings = unitKey and db.profile[unitKey]
+        -- Pet class coloring is opt-in. Pets never match oUF's colorClass (that
+        -- path requires a player unit), so the pet frame uses colorClassPet, gated
+        -- on the pet page's Class Colored Fill toggle.
+        if unitKey == "pet" and unitSettings and unitSettings.healthClassColored then
+            health.colorClassPet = true
+        else
+            health.colorClassPet = false
+        end
         local customFill = unitSettings and unitSettings.customFillColor
         local customBg   = unitSettings and unitSettings.customBgColor
         if customFill then
@@ -6776,7 +6785,6 @@ local function StylePetFrame(frame, unit)
     bg:SetColorTexture(0, 0, 0, 0.5)
     health.bg = bg
 
-    health.colorClass = true
     health.colorReaction = true
     health.colorTapped = true
     health.colorDisconnected = true
@@ -7405,7 +7413,8 @@ local CLASS_POWER_TYPES = {
                     [1480] = { "SOUL_FRAGMENTS_DEVOURER", 50, "bar" } },
     SHAMAN      = { [263] = { "MAELSTROM_WEAPON", 10 } },
     HUNTER      = { [255] = { "TIP_OF_THE_SPEAR", 3 } },
-    WARRIOR     = { [72]  = { "WHIRLWIND_STACKS", 4 } },
+    WARRIOR     = { [72]  = { "WHIRLWIND_STACKS", 4 },
+                    [71]  = { "SWEEPING_STRIKES", 12 } },
 }
 
 -- Returns true if the player's current spec has a class resource in CLASS_POWER_TYPES
@@ -7479,6 +7488,8 @@ local function CreateCustomClassPower(playerFrame, style)
         elseif powerType == "TIP_OF_THE_SPEAR" then
             maxPower = customMax
         elseif powerType == "WHIRLWIND_STACKS" then
+            maxPower = customMax
+        elseif powerType == "SWEEPING_STRIKES" then
             maxPower = customMax
         elseif powerType == "ICICLES" then
             maxPower = customMax or 5
@@ -7692,6 +7703,8 @@ local function CreateCustomClassPower(playerFrame, style)
                 cur, max = EllesmereUI.GetTipOfTheSpear()
             elseif powerType == "WHIRLWIND_STACKS" and EllesmereUI and EllesmereUI.GetWhirlwindStacks then
                 cur, max = EllesmereUI.GetWhirlwindStacks()
+            elseif powerType == "SWEEPING_STRIKES" and EllesmereUI and EllesmereUI.GetSweepingStrikes then
+                cur, max = EllesmereUI.GetSweepingStrikes()
             elseif powerType == "ICICLES" then
                 -- Frost Mage Icicles: stack count from the Icicles aura (205473).
                 local count = 0
@@ -7791,7 +7804,8 @@ local function CreateCustomClassPower(playerFrame, style)
         local auraDriven    = (powerType == "MAELSTROM_WEAPON" or powerType == "ICICLES")
         local needsOnUpdate = not auraDriven
         local needsAura     = auraDriven
-        local needsCasts    = (powerType == "TIP_OF_THE_SPEAR" or powerType == "WHIRLWIND_STACKS")
+        local needsCasts    = (powerType == "TIP_OF_THE_SPEAR" or powerType == "WHIRLWIND_STACKS"
+                               or powerType == "SWEEPING_STRIKES")
 
         if needsOnUpdate then
             local elapsed = 0
@@ -7814,7 +7828,7 @@ local function CreateCustomClassPower(playerFrame, style)
             eventFrame:RegisterEvent("PLAYER_DEAD")
             eventFrame:RegisterEvent("PLAYER_ALIVE")
         end
-        if powerType == "WHIRLWIND_STACKS" then
+        if powerType == "WHIRLWIND_STACKS" or powerType == "SWEEPING_STRIKES" then
             eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
         end
 
@@ -7837,6 +7851,9 @@ local function CreateCustomClassPower(playerFrame, style)
                         if EllesmereUI.HandleWhirlwindStacks then
                             EllesmereUI.HandleWhirlwindStacks(event, unit, castGUID, spellID)
                         end
+                        if EllesmereUI.HandleSweepingStrikes then
+                            EllesmereUI.HandleSweepingStrikes(event, unit, castGUID, spellID)
+                        end
                     end
                 end
             elseif event == "PLAYER_DEAD" or event == "PLAYER_ALIVE" then
@@ -7847,10 +7864,18 @@ local function CreateCustomClassPower(playerFrame, style)
                     if EllesmereUI.HandleWhirlwindStacks then
                         EllesmereUI.HandleWhirlwindStacks(event)
                     end
+                    if EllesmereUI.HandleSweepingStrikes then
+                        EllesmereUI.HandleSweepingStrikes(event)
+                    end
                 end
             elseif event == "PLAYER_REGEN_ENABLED" then
-                if not _G._ERB_AceDB and EllesmereUI and EllesmereUI.HandleWhirlwindStacks then
-                    EllesmereUI.HandleWhirlwindStacks(event)
+                if not _G._ERB_AceDB and EllesmereUI then
+                    if EllesmereUI.HandleWhirlwindStacks then
+                        EllesmereUI.HandleWhirlwindStacks(event)
+                    end
+                    if EllesmereUI.HandleSweepingStrikes then
+                        EllesmereUI.HandleSweepingStrikes(event)
+                    end
                 end
             end
             UpdatePips()
