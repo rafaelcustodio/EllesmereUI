@@ -1166,6 +1166,11 @@ initFrame:SetScript("OnEvent", function(self)
                         local sbt = bf:CreateTexture(nil, "OVERLAY", nil, 6)
                         sbt:SetAllPoints(bf)
                         sbt:SetTexture(SHAPE_BORDERS[btnShape])
+                        -- Direct ref for the accent/hover tint sites below. Never
+                        -- locate this texture by scanning GetRegions: a freshly
+                        -- tracked CD's icon region carries secret values, and
+                        -- GetDrawLayer comparisons on it error out mid page-build.
+                        bf._sbt = sbt
                         if brdSize > 0 then
                             local cr, cg, cb = brdColor.r, brdColor.g, brdColor.b
                             if brdClassColor then
@@ -1223,11 +1228,8 @@ initFrame:SetScript("OnEvent", function(self)
                 if isSelected then
                     if isCustomShape then
                         -- Tint shape border to accent color
-                        for _, region in ipairs({bf:GetRegions()}) do
-                            if region:IsObjectType("Texture") and region:GetTexture() and SHAPE_BORDERS and SHAPE_BORDERS[btnShape]
-                               and region:GetDrawLayer() == "OVERLAY" then
-                                region:SetVertexColor(ACCENT.r, ACCENT.g, ACCENT.b, 1)
-                            end
+                        if bf._sbt then
+                            bf._sbt:SetVertexColor(ACCENT.r, ACCENT.g, ACCENT.b, 1)
                         end
                     elseif accentBrd then
                         accentBrd:Show()
@@ -1237,11 +1239,8 @@ initFrame:SetScript("OnEvent", function(self)
                 -- Show white border for assigned buttons (even if not active)
                 if hasAssign and not isSelected then
                     if isCustomShape then
-                        for _, region in ipairs({bf:GetRegions()}) do
-                            if region:IsObjectType("Texture") and region:GetTexture() and SHAPE_BORDERS and SHAPE_BORDERS[btnShape]
-                               and region:GetDrawLayer() == "OVERLAY" then
-                                region:SetVertexColor(1, 1, 1, 0.6)
-                            end
+                        if bf._sbt then
+                            bf._sbt:SetVertexColor(1, 1, 1, 0.6)
                         end
                     elseif accentBrd then
                         accentBrd:Show()
@@ -1262,15 +1261,7 @@ initFrame:SetScript("OnEvent", function(self)
                 -- Hover highlight: switch border to accent on hover
                 -- Active button doesn't need hover (already accent)
                 -- Store shape border ref for hover tinting
-                bf._shapeBorderTex = nil
-                if isCustomShape and SHAPE_BORDERS and SHAPE_BORDERS[btnShape] then
-                    for _, region in ipairs({bf:GetRegions()}) do
-                        if region:IsObjectType("Texture") and region:GetDrawLayer() == "OVERLAY" then
-                            bf._shapeBorderTex = region
-                            break
-                        end
-                    end
-                end
+                bf._shapeBorderTex = isCustomShape and bf._sbt or nil
                 local origBrdR, origBrdG, origBrdB, origBrdA = brdColor.r, brdColor.g, brdColor.b, brdColor.a or 1
                 if isCDMBar and cdmBd then
                     origBrdR = cdmBd.borderR or 0
@@ -1411,7 +1402,16 @@ initFrame:SetScript("OnEvent", function(self)
 
         -- Live-update preview icons when the action bar pages (stance shift,
         -- dragonriding, mount/dismount, vehicle, etc.)
-        do
+        --
+        -- Skipped during a hidden search pre-build: this listener is cleaned
+        -- up via parent:HookScript("OnHide", ...), which depends on the
+        -- pre-build wrapper's OnHide actually firing when hidden -- not
+        -- guaranteed, since the wrapper is parented under an already-hidden
+        -- frame and never becomes effectively visible in between. If it
+        -- doesn't fire, this listener (and the RefreshPage(true) it queues
+        -- on every action-bar-page/mount change) would leak for the rest of
+        -- the session. There's nothing to preview during indexing anyway.
+        if not EllesmereUI._prebuilding then
             local pageListener = CreateFrame("Frame")
             local pagePending = false
             pageListener:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
@@ -1938,11 +1938,27 @@ initFrame:SetScript("OnEvent", function(self)
         return p > 0 and (p + 8) or 0
     end
 
-    local function RefreshTBBPopout()
-        -- Only while the Tracking Bars page is in front
+    -- HARD gate for BOTH Tracking Bars preview systems (popout preview and
+    -- unlock-style placeholders): they must never be visible unless the
+    -- options panel is actually OPEN on the Tracking Bars page. Checking
+    -- activeModule/activePage alone is NOT enough -- both persist after the
+    -- panel closes, and RefreshPage / event-driven refreshes (saved
+    -- positions, spec or instance events) rebuild this page with the panel
+    -- hidden. Every show path funnels through this check.
+    local function TBBPreviewAllowed()
+        if not (EllesmereUI.IsShown and EllesmereUI:IsShown()) then return false end
+        -- nil = mid-build (page state not stamped yet); builders only run for
+        -- the page being shown, so only a definite mismatch blocks.
         local am = EllesmereUI.GetActiveModule and EllesmereUI:GetActiveModule()
         local ap = EllesmereUI.GetActivePage and EllesmereUI:GetActivePage()
         if am and ap and (am ~= "EllesmereUICooldownManager" or ap ~= PAGE_BUFF_BARS) then
+            return false
+        end
+        return true
+    end
+
+    local function RefreshTBBPopout()
+        if not TBBPreviewAllowed() then
             HideTBBPopout()
             return
         end
@@ -1972,8 +1988,8 @@ initFrame:SetScript("OnEvent", function(self)
             local wrap = _tbbPopoutBars[n]
             if not wrap then
                 wrap = ns.CreateTBBBarFrame(oc, "Pv" .. n)
-                -- The live constructor pins MEDIUM strata; lift the preview
-                -- into the popout's strata and re-assert the child levels the
+                -- The live constructor pins HIGH strata; lift the preview into
+                -- the popout's strata and re-assert the child levels the
                 -- constructor established (a parent strata change can reset
                 -- child frame levels).
                 wrap:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -1982,7 +1998,7 @@ initFrame:SetScript("OnEvent", function(self)
                 local sb = wrap._bar
                 if sb then sb:SetFrameLevel(base + 1) end
                 if wrap._sparkOverlay and sb then wrap._sparkOverlay:SetFrameLevel(sb:GetFrameLevel() + 2) end
-                if wrap._textOverlay and sb then wrap._textOverlay:SetFrameLevel(sb:GetFrameLevel() + 6) end
+                if wrap._textOverlay and sb then wrap._textOverlay:SetFrameLevel(sb:GetFrameLevel() + 7) end
                 if wrap._pandemicGlowOverlay then wrap._pandemicGlowOverlay:SetFrameLevel(base + 7) end
                 _tbbPopoutBars[n] = wrap
             end
@@ -2100,6 +2116,17 @@ initFrame:SetScript("OnEvent", function(self)
     -- Pool of unlock placeholders, one per bar (module-scope for cross-page access)
     local _tbbPlaceholders = {}
     local function UpdateTBBPlaceholder()
+        -- Same hard gate as the popout: never show (and never set placeholder
+        -- mode) with the panel closed or another page in front. Inline hide --
+        -- HideTBBPlaceholder is declared below this function.
+        if not TBBPreviewAllowed() then
+            ns._tbbPlaceholderMode = false
+            for _, ph in ipairs(_tbbPlaceholders) do
+                if ph then ph:Hide() end
+            end
+            HideTBBPopout()
+            return
+        end
         ns._tbbPlaceholderMode = true
         local tbb = ns.GetTrackedBuffBars()
         local bars = tbb and tbb.bars
@@ -13046,6 +13073,17 @@ initFrame:SetScript("OnEvent", function(self)
                 if GetTime() - dragEndTime < 0.2 then
                     return
                 end
+                -- Override editing sessions: per-spell settings and spell
+                -- placement are never part of the override system -- refuse
+                -- the interaction with an explanatory tooltip.
+                if EllesmereUI.SpecOverrides_EditSessionActive
+                   and EllesmereUI.SpecOverrides_EditSessionActive() then
+                    if EllesmereUI.ShowWidgetTooltip then
+                        EllesmereUI.ShowWidgetTooltip(self,
+                            "Per-spell settings are not part of the override system.")
+                    end
+                    return
+                end
                 local bd = SelectedCDMBar()
                 if not bd then return end
                 local isDefaultBuffs = (bd.key == "buffs")
@@ -13391,6 +13429,15 @@ initFrame:SetScript("OnEvent", function(self)
 
             slot:SetScript("OnMouseDown", function(self, button)
                 if button ~= "LeftButton" then return end
+                -- Override editing sessions: spell placement never overrides.
+                if EllesmereUI.SpecOverrides_EditSessionActive
+                   and EllesmereUI.SpecOverrides_EditSessionActive() then
+                    if EllesmereUI.ShowWidgetTooltip then
+                        EllesmereUI.ShowWidgetTooltip(self,
+                            "Per-spell settings are not part of the override system.")
+                    end
+                    return
+                end
                 -- Buff-family drag-reorder: extra/custom buff bars reorder via
                 -- assignedSpells (1:1 preview), the default buffs bar via its
                 -- dedicated buffDisplayOrder (stable cooldownID-keyed, reconciled
@@ -14177,6 +14224,14 @@ initFrame:SetScript("OnEvent", function(self)
         local barData = bars[selectedCDMBarIndex]
         if not barData then return math.abs(yOffset) end
 
+        -- Tag every option registered while building this page with the
+        -- currently-selected bar, so a global-search jump to a bar-specific
+        -- setting (e.g. HoverCast/FocusKick-only options) can restore this
+        -- exact bar selection first via EllesmereUI._setCDMBar -- otherwise
+        -- the matched row wouldn't exist under whatever bar happens to be
+        -- selected when the player jumps there.
+        EllesmereUI._buildingSelector = { setter = EllesmereUI._setCDMBar, key = barData.key }
+
         -- Capture the key so closures can always look up the CURRENT bar data
         -- from the profile, avoiding stale-reference bugs when the bars array
         -- is reordered or the page is rebuilt.
@@ -14803,7 +14858,14 @@ initFrame:SetScript("OnEvent", function(self)
         EllesmereUI:SetContentHeader(_cdmHeaderBuilder)
 
         -- Refresh preview icons on mount/dismount (skyriding swaps action bar icons)
-        do
+        --
+        -- Skipped during a hidden search pre-build: same reasoning as the
+        -- pageListener above in BuildBarGlowsPage -- its OnHide-based cleanup
+        -- isn't guaranteed to fire for a wrapper that's never effectively
+        -- visible, which would otherwise leak this listener (and the
+        -- RefreshPage(true) it triggers on every mount/dismount) for the
+        -- rest of the session.
+        if not EllesmereUI._prebuilding then
             local mountListener = CreateFrame("Frame")
             mountListener:RegisterEvent("PLAYER_MOUNT_DISPLAY_CHANGED")
             mountListener:SetScript("OnEvent", function()
@@ -14891,15 +14953,13 @@ initFrame:SetScript("OnEvent", function(self)
         _, h = W:SectionHeader(parent, "BAR LAYOUT", y);  y = y - h
 
         -- Row 1: (Sync) Visibility | Visibility Options (checkbox dropdown)
-        local visRow, visH = W:DualRow(parent, y,
-            { type="dropdown", text="Visibility",
-              values = EllesmereUI.VIS_VALUES_CDM or EllesmereUI.VIS_VALUES,
-              order = EllesmereUI.VIS_ORDER_CDM or EllesmereUI.VIS_ORDER,
-              getValue=function() return BD().barVisibility or "always" end,
-              setValue=function(v)
-                  BD().barVisibility = v
+        -- Mouseover stays structurally absent for CDM bars (noMouseover),
+        -- matching the old VIS_VALUES_CDM list.
+        local visRow, visH = EllesmereUI.BuildVisibilityModeRow(W, parent, y,
+            { getStore = BD, legacyKey = "barVisibility",
+              caps = { partyIncludesRaid = true, noMouseover = true, luaDragonriding = true },
+              onChanged = function()
                   ns.CDMApplyVisibility()
-                  EllesmereUI:RefreshPage()
               end },
             { type="dropdown", text="Visibility Options",
               values={ __placeholder = "..." }, order={ "__placeholder" },
@@ -14926,21 +14986,26 @@ initFrame:SetScript("OnEvent", function(self)
             EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
         end
 
-        -- Sync icon on Visibility (left)
+        -- Sync icon on Visibility (left) -- set-aware so multi-selections
+        -- compare and copy correctly (uniform caps across CDM bars).
         do
             local rgn = visRow._leftRegion
             EllesmereUI.BuildSyncIcon({
                 region  = rgn,
                 tooltip = "Apply Visibility to all Bars",
                 isSynced = function()
-                    local v = BD().barVisibility or "always"
+                    local src = BD()
                     local synced = true
-                    ForEachSyncBar(function(b) if (b.barVisibility or "always") ~= v then synced = false end end)
+                    ForEachSyncBar(function(b)
+                        if not EllesmereUI.VisSelectionEquals(src, "barVisibility", b, "barVisibility") then synced = false end
+                    end)
                     return synced
                 end,
                 onClick = function()
-                    local v = BD().barVisibility or "always"
-                    ForEachSyncBar(function(b) b.barVisibility = v end)
+                    local src = BD()
+                    ForEachSyncBar(function(b)
+                        if b ~= src then EllesmereUI.VisCopySelection(b, src, "barVisibility") end
+                    end)
                     ns.CDMApplyVisibility(); EllesmereUI:RefreshPage()
                 end,
             })
@@ -17301,6 +17366,30 @@ initFrame:SetScript("OnEvent", function(self)
         disabledPages = {},
         disabledPageTooltips = {},
         buildPage   = function(pageName, parent, yOffset)
+            -- ns._tbbPlaceholderMode / ns._cdmBarsPageOpen reflect whatever page
+            -- the player is REALLY looking at, not the pageName this particular
+            -- call happens to be building. During an off-screen search pre-build,
+            -- pageName cycles through all three pages regardless of the player's
+            -- actual page, so the "switched away" cleanup below (buff-bar
+            -- injection/removal, placeholder toggling, the settings tip) would
+            -- otherwise fire against whatever the player is really seeing. Only
+            -- the requested page's content needs to be built here for indexing.
+            --
+            -- PAGE_BUFF_BARS is skipped entirely (not dispatched through): its
+            -- builder unconditionally calls UpdateTBBPlaceholder() at its tail,
+            -- which fetches each REAL tracked-buff-bar frame via
+            -- ns.GetTBBFrame(i) (not scoped to `parent`) and forces it
+            -- :Show() with an unlock-mode placeholder attached -- building it
+            -- here would pop the player's live buff bars onto the screen. It's
+            -- indexed normally the first time the player visits it live.
+            if EllesmereUI._prebuilding then
+                if pageName == PAGE_CDM_BARS then
+                    return BuildCDMBarsPage(pageName, parent, yOffset)
+                elseif pageName == PAGE_BAR_GLOWS then
+                    return BuildBarGlowsPage(pageName, parent, yOffset)
+                end
+                return
+            end
             -- Clear TBB placeholders when switching to any non-Tracking Bars page
             if pageName ~= PAGE_BUFF_BARS and ns._tbbPlaceholderMode then
                 ns._tbbPlaceholderMode = false
@@ -17337,6 +17426,41 @@ initFrame:SetScript("OnEvent", function(self)
             end
             -- Tracking Bars has no content header (popout preview instead)
             return nil
+        end,
+        -- CDM Bars content is gated on whichever bar is currently selected
+        -- (e.g. FocusKick's "Nameplate Anchor"/"Focus Text Reminders" only
+        -- render while barData.key == "focuskick"), and the default selected
+        -- bar is whatever's first in the player's list -- almost never
+        -- FocusKick. Without this, a hidden pre-build only ever sees that one
+        -- default bar's options, so every other bar's unique settings stay
+        -- unsearchable until the player opens the dropdown and picks them
+        -- live. Build once per distinct bar *shape* (cooldowns/utility/buffs/
+        -- custom_buff/focuskick), not once per literal bar instance -- a
+        -- player can have several custom bars of the same shape with
+        -- identical available options, so indexing more than one of a shape
+        -- would just be a wasted rebuild.
+        getPrebuildVariants = function(pageName)
+            if pageName ~= PAGE_CDM_BARS then return nil end
+            local p = DB()
+            local bars = p and p.cdmBars and p.cdmBars.bars
+            if not bars or #bars == 0 then return nil end
+            local seenShapes = {}
+            local keys = {}
+            for _, b in ipairs(bars) do
+                local shape = (b.key == "focuskick") and "focuskick" or b.barType
+                if shape and not seenShapes[shape] then
+                    seenShapes[shape] = true
+                    keys[#keys + 1] = b.key
+                end
+            end
+            if selectedCDMBarIndex < 1 then selectedCDMBarIndex = 1 end
+            if selectedCDMBarIndex > #bars then selectedCDMBarIndex = #bars end
+            local currentBar = bars[selectedCDMBarIndex]
+            return {
+                setter = EllesmereUI._setCDMBar,
+                keys = keys,
+                currentKey = currentBar and currentBar.key,
+            }
         end,
         onPageCacheRestore = function(pageName)
             -- Same flag management as buildPage

@@ -1612,7 +1612,11 @@ ns.RefreshBuffBarGating  = function() end
 -------------------------------------------------------------------------------
 local function CreateTrackedBuffBarFrame(parent, idx)
     local wrapFrame = CreateFrame("Frame", "ECME_TBBWrap" .. idx, parent)
-    wrapFrame:SetFrameStrata("MEDIUM")
+    -- HIGH strata so the whole bar (fill, border, glow, text) renders above
+    -- the buff-icon displays (MEDIUM) -- including their borders and cooldown
+    -- swipes -- when the two elements overlap. Internal ordering stays
+    -- level-based within the wrap (strips +6 < pandemic glow +7 < text +8).
+    wrapFrame:SetFrameStrata("HIGH")
     wrapFrame:SetFrameLevel(10)
 
     local bar = CreateFrame("StatusBar", "ECME_TBB" .. idx, wrapFrame)
@@ -1652,12 +1656,13 @@ local function CreateTrackedBuffBarFrame(parent, idx)
 
     -- Text overlay: parented to wrapFrame (not bar) so bar's SetClipsChildren
     -- doesn't chop text when font size exceeds bar height. Level sits ABOVE the
-    -- border (bar +5 in ApplySettings, whose PP strips draw at +6) so the
-    -- timer/name/stacks text renders on top of the border instead of beneath it.
-    -- Keyed off bar (like the border) so the two track together.
+    -- border (bar +5 in ApplySettings, whose PP strips draw at +6) AND the
+    -- pandemic glow overlay (wrapFrame +7 = bar +6) so the timer/name/stacks
+    -- text renders on top of both. Keyed off bar (like the border) so the two
+    -- track together.
     local textOverlay = CreateFrame("Frame", nil, wrapFrame)
     textOverlay:SetAllPoints(bar)
-    textOverlay:SetFrameLevel(bar:GetFrameLevel() + 6)
+    textOverlay:SetFrameLevel(bar:GetFrameLevel() + 7)
     wrapFrame._textOverlay = textOverlay
 
     -- Timer text
@@ -3253,16 +3258,20 @@ function ns.UpdateTrackedBuffBarTimers()
                 end
             end
 
-            -- Blizzard viewer bind-miss fallback. The buff-bar viewer sometimes
-            -- fails to bind a freshly applied aura to its frame (observed live:
-            -- Avenging Wrath aura up, frame's auraInstanceID never set, IsActive
-            -- stuck false until ANOTHER bar's activation forces a viewer
-            -- refresh). When the assigned frame reads inactive but the player
-            -- demonstrably carries the aura (known-spellID player-aura query,
-            -- no scanning), drive the bar from the aura data directly. Reads
-            -- only; our own frames only -- never pokes the Blizzard frame.
+            -- Blizzard viewer bind-miss / not-tracked-at-all fallback. Covers
+            -- two cases: (1) the buff-bar viewer fails to bind a freshly
+            -- applied aura to its frame (observed live: Avenging Wrath aura
+            -- up, frame's auraInstanceID never set, IsActive stuck false
+            -- until ANOTHER bar's activation forces a viewer refresh), and
+            -- (2) the spell has NO presence in any Blizzard CooldownViewer
+            -- category at all (blzChild permanently nil -- e.g. Essence of
+            -- the Blood Queen, a hero-talent proc buff Blizzard's CDM never
+            -- registers). Either way, when the player demonstrably carries
+            -- the aura (known-spellID player-aura query, no scanning), drive
+            -- the bar from the aura data directly. Reads only; our own
+            -- frames only -- never pokes the Blizzard frame.
             local fbAura
-            if not isActive and blzChild and not cfg.spellIDs
+            if not isActive and not cfg.spellIDs
                and cfg.spellID and cfg.spellID > 0
                and C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
                 fbAura = C_UnitAuras.GetPlayerAuraBySpellID(cfg.spellID)
