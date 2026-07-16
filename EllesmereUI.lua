@@ -270,6 +270,29 @@ local LOCALE_FONT_FALLBACK = _G.EllesmereUI and _G.EllesmereUI._localeFont or ni
 -------------------------------------------------------------------------------
 local ICONS_PATH    = MEDIA_PATH .. "icons\\"
 
+-------------------------------------------------------------------------------
+--  Season M+ Portals -- single source of truth for every portal/teleport
+--  list in the suite (Chat sidebar flyout, Minimap flyout, QoL /keys name
+--  resolver, DataBars travel tooltip). Update ONCE here each season.
+--    spellID     - primary teleport spell id
+--    short       - abbreviated label used by the flyout buttons
+--    dungeonID   - LFG dungeonID (GetLFGDungeonInfo name lookup)
+--    names       - lowercase dungeon names (plus localized aliases) for
+--                  name -> spell resolution
+--    altSpellIDs - optional variant teleport spell ids
+--  Order = flyout grid order (top-left to bottom-right).
+-------------------------------------------------------------------------------
+EllesmereUI.SEASON_PORTALS = {
+    { spellID = 1254400, short = "WRS", dungeonID = 2739, names = { "windrunner spire", "шпиль ветрокрылых" } },
+    { spellID = 1254572, short = "MT",  dungeonID = 3085, names = { "magisters' terrace", "терраса магистров" } },
+    { spellID = 1254563, short = "NPX", dungeonID = 3056, names = { "nexus-point xenas", "нексус-пойнт ксенас", "нексус-поинт ксенас" } },
+    { spellID = 1254559, short = "MC",  dungeonID = 3097, names = { "maisara caverns", "пещеры майсара" } },
+    { spellID = 159898,  short = "SR",  dungeonID = 779,  altSpellIDs = { 1254557 }, names = { "skyreach", "небесный путь" } },
+    { spellID = 1254555, short = "PoS", dungeonID = 3113, names = { "pit of saron", "яма сарона" } },
+    { spellID = 1254551, short = "SoT", dungeonID = 3118, names = { "seat of the triumvirate", "престол триумвирата" } },
+    { spellID = 393273,  short = "AA",  dungeonID = 2366, names = { "algeth'ar academy", "академия алгет'ар", "академия алгетар" } },
+}
+
 local ADDON_ROSTER = {
     { folder = "EllesmereUIActionBars",        display = "Action Bars",          search_name = "EllesmereUI Action Bars"             },
     { folder = "EllesmereUINameplates",        display = "Nameplates",           search_name = "EllesmereUI Nameplates"              },
@@ -290,6 +313,7 @@ local ADDON_ROSTER = {
     { folder = "EllesmereUIChat",              display = "Chat",                 search_name = "EllesmereUI Chat"                    },
     { folder = "EllesmereUIDamageMeters",      display = "Damage Meters",        search_name = "EllesmereUI Damage Meters"           },
     { folder = "EllesmereUIBags",              display = "Bags",                 search_name = "EllesmereUI Bags"                    },
+    { folder = "EllesmereUIDataBars",          display = "DataBars",             search_name = "EllesmereUI DataBars"                },
     { folder = "EllesmereUIPartyMode",         display = "Party Mode",           search_name = "EllesmereUI Party Mode",             alwaysLoaded = true },
 }
 
@@ -322,6 +346,7 @@ EllesmereUI.ADDON_GROUPS = {
         members = {
             "EllesmereUIQoL",
             "EllesmereUIAuraBuffReminders",
+            "EllesmereUIDataBars",
             "EllesmereUIPartyMode",
         },
     },
@@ -2344,8 +2369,15 @@ do
                 local bd = _ppBorderData[f]
                 local ok = pcall(SnapBorderTextures, c, f, bd and bd.borderSize or 1)
                 if not ok then
-                    entry.container = nil
-                    entry.frame = nil
+                    -- Only evict when the failure is real (dead frame). While
+                    -- auras are secret (12.1), rect reads inside engine aura
+                    -- button subtrees are denied -- a transient state that
+                    -- must not permanently drop a live border.
+                    local AKR = EllesmereUI and EllesmereUI.AuraKit
+                    if not (AKR and AKR.AurasRestricted and AKR.AurasRestricted()) then
+                        entry.container = nil
+                        entry.frame = nil
+                    end
                 end
             end
         end
@@ -2357,6 +2389,13 @@ do
     function PP.ResnapBordersUnder(root)
         if not root then return PP.ResnapAllBorders() end
         local count = 0
+        -- Shared method ref for the climb: 12.1 engine aura buttons deny
+        -- access from addon code while auras are secret, and border hosts
+        -- living inside aura button subtrees climb through one. Calling via
+        -- the shared ref under pcall treats a denied step as a chain
+        -- dead-end = not under root (aura button subtrees are never inside
+        -- the options panel, so skipping them is correct, not just safe).
+        local GetParentFn = root.GetParent
         for i = 1, allBordersN do
             local entry = allBorders[i]
             local f = entry.frame
@@ -2365,8 +2404,9 @@ do
                 local parent = f
                 local found = false
                 for _ = 1, 10 do
-                    parent = parent:GetParent()
-                    if not parent then break end
+                    local ok, p = pcall(GetParentFn, parent)
+                    if not ok or not p then break end
+                    parent = p
                     if parent == root then found = true; break end
                 end
                 if found then
@@ -2374,8 +2414,12 @@ do
                     local bd = _ppBorderData[f]
                     local ok = pcall(SnapBorderTextures, entry.container, f, bd and bd.borderSize or 1)
                     if not ok then
-                        entry.container = nil
-                        entry.frame = nil
+                        -- Same transient-vs-dead distinction as ResnapAllBorders.
+                        local AKR = EllesmereUI and EllesmereUI.AuraKit
+                        if not (AKR and AKR.AurasRestricted and AKR.AurasRestricted()) then
+                            entry.container = nil
+                            entry.frame = nil
+                        end
                     end
                 end
             end
@@ -3463,6 +3507,7 @@ EllesmereUI._addonKeyToFolder = {
     mythicTimer  = "EllesmereUIMythicTimer",
     blizzardSkin = "EllesmereUIBlizzardSkin",
     damageMeters = "EllesmereUIDamageMeters",
+    dataBars     = "EllesmereUIDataBars",
     raidFrames   = "EllesmereUIRaidFrames",
     bags         = "EllesmereUIBags",
 }
@@ -7151,7 +7196,8 @@ local function CreateMainFrame()
                 end
             end)
             pwrBtn:SetScript("OnLeave", function(self)
-                self._tex:SetVertexColor(1, 1, 1, 1)
+                local enabled = IsAddonLoaded(self._folder)
+                self._tex:SetVertexColor(1, 1, 1, enabled and 1 or 0.5)
                 if EllesmereUI.HideWidgetTooltip then EllesmereUI.HideWidgetTooltip() end
             end)
             pwrBtn:SetScript("OnClick", function(self)
@@ -9344,6 +9390,7 @@ function EllesmereUI:RegisterModule(folderName, config)
             EllesmereUIChat = true,
             EllesmereUIDamageMeters = true,
             EllesmereUIBags = true,
+            EllesmereUIDataBars = true,
             -- Fork: features split into their own addon folders
             EllesmereUIAdvancedDebuffs = true,
             EllesmereUIPrivateAuras = true,
@@ -9643,6 +9690,17 @@ function EllesmereUI:RefreshPage(force)
         for i = 1, #_widgetRefreshList do _widgetRefreshList[i]() end
         return
     end
+    -- Panel hidden: a rebuild here would run buildPage with nothing on
+    -- screen, firing page-open side effects (preview flags, placeholder
+    -- shows) AFTER the OnHide cleanup already cleared them -- they then
+    -- stick until the next open (e.g. CDM buff previews staying visible
+    -- when an override edit session tears down on panel close). Defer the
+    -- rebuild to the next show instead; the on-show callback below consumes
+    -- the flag before module OnShow handlers run.
+    if not (mainFrame and mainFrame:IsShown()) then
+        EllesmereUI._pendingForceRefresh = true
+        return
+    end
     -- Slow path: full teardown + rebuild
     local savedScroll = scrollFrame and scrollFrame:GetVerticalScroll() or 0
     local savedTarget = scrollTarget
@@ -9720,6 +9778,17 @@ function EllesmereUI:RefreshPage(force)
         UpdateScrollThumb()
     end
 end
+
+-- Consume a rebuild that was requested while the panel was hidden (see the
+-- deferral inside RefreshPage). Registered here, before any module files
+-- load, so it runs ahead of module OnShow callbacks -- they then observe
+-- the freshly rebuilt page.
+EllesmereUI:RegisterOnShow(function()
+    if EllesmereUI._pendingForceRefresh then
+        EllesmereUI._pendingForceRefresh = nil
+        EllesmereUI:RefreshPage(true)
+    end
+end)
 
 -- Public: snap the settings scroll back to the top
 -- (e.g. in resource bars clicking on a simple section
@@ -10211,7 +10280,7 @@ end
 -------------------------------------------------------------------------------
 --  Slash commands
 -------------------------------------------------------------------------------
-EllesmereUI.VERSION = "8.4.3"
+EllesmereUI.VERSION = "8.4.7"
 
 -- Register this addon's version into a shared global table (taint-free at load time)
 if not _G._EUI_AddonVersions then _G._EUI_AddonVersions = {} end
@@ -10367,6 +10436,7 @@ EllesmereUI._RunConflictCheck = function()
             { addon = "UltimateMouseCursor",      label = "Ultimate Mouse Cursor",      targets = { "EllesmereUIQoL" } },
             { addon = "BetterCooldownManager",    label = "Better Cooldown Manager",    targets = { "EllesmereUICooldownManager", "EllesmereUIResourceBars" } },
             { addon = "CooldownManagerCentered",    label = "Cooldown Manager Centered",    targets = { "EllesmereUICooldownManager" } },
+            { addon = "SkironCooldownManager",    label = "Skiron Cooldown Manager",    targets = { "EllesmereUICooldownManager" } },
             { addon = "ArcUI",                    label = "ArcUI",                      targets = { "EllesmereUICooldownManager", } },
             { addon = "Ayije_CDM",                label = "Ayije CDM",                  targets = { "EllesmereUICooldownManager", "EllesmereUIResourceBars" } },
             { addon = "MythicPlusTimer",          label = "Mythic Plus Timer",          targets = { "EllesmereUIMythicTimer" } },
@@ -10381,6 +10451,10 @@ EllesmereUI._RunConflictCheck = function()
             { addon = "BetterCharacterPanel",     label = "Better Character Panel",     targets = { "EllesmereUIBlizzardSkin" },
               moduleCheck = function() return BlizzardSkinSubEnabled("themedCharacterSheet") end,
               message = "Better Character Panel conflicts with the EllesmereUI's Character Sheet. Disable either Better Character Panel or the Character Sheet skin in Blizzard UI Enhanced settings." },
+            -- Old name of EllesmereUIDataBars: a leftover copy of the addon
+            -- from before the rename duplicates the entire bar.
+            { addon = "EllesmereUIWonderBar",     label = "EllesmereUI WonderBar",      targets = { "EllesmereUIDataBars" },
+              message = "EllesmereUI WonderBar was renamed to EllesmereUI DataBars. The old WonderBar addon is still installed and both create the same bar. Please disable or delete the EllesmereUIWonderBar addon." },
             { addon = "EllesmereBarGlows",        label = "Ellesmere's CDM Bar Glows",  targets = "all" },
             { addon = "EllesmereNameplates",        label = "Ellesmere's Nameplates",  targets = "all" },
             { addon = "EllesmereActionBars",        label = "Ellesmere's Action Bars",  targets = "all" },

@@ -1525,10 +1525,12 @@ local function StartPandemicGlow(slot, slotSize)
     if not pg then
         local wrapper = CreateFrame("Frame", nil, slot)
         wrapper:SetAllPoints()
-        -- Sit just above the border (slot+1) so the glow renders beneath the
-        -- cooldown countdown text (slot.cd at +2) and stack count (+3) instead
-        -- of covering them.
-        wrapper:SetFrameLevel(slot:GetFrameLevel() + 1)
+        -- Sit ABOVE the cooldown frame (slot.cd at +2) so the duration swipe
+        -- can't render on top of the pandemic border and dim it. Matches the
+        -- dispel glow (slot+5); the glow is an edge border, so it doesn't
+        -- meaningfully obscure the corner countdown / stack numbers. (At the old
+        -- slot+1 the swipe drew over the glow, making it hard to see.)
+        wrapper:SetFrameLevel(slot:GetFrameLevel() + 5)
         local flipTex = wrapper:CreateTexture(nil, "OVERLAY", nil, 7)
         flipTex:SetPoint("CENTER")
         local animGroup = flipTex:CreateAnimationGroup()
@@ -2239,23 +2241,35 @@ function ns.ResolveOverlayTexPath(key)
     return nil
 end
 
--- Stripe overlays keep their fixed 200px, left-anchored pattern (continuous
--- diagonal across the fill/background split). Bar textures instead fill the full
--- bar width so they render like a normal bar fill; the clip frames still window
--- the filled vs empty portions.
+-- Both overlays span the full bar width (anchored LEFT+RIGHT to the health bar)
+-- so the pattern always covers the whole bar and follows Health Bar Width
+-- changes automatically. Fill and bg share the identical geometry, so a stripe's
+-- diagonal stays continuous across the fill/background split; the clip frames
+-- still window the filled vs empty portions. (Previously stripe overlays used a
+-- fixed 200px width, which left bars wider than 200 uncovered on the right.)
+-- Stripes additionally CROP via texcoord to the bar's share of the pattern's
+-- native 200px span, so the diagonal density stays pixel-identical to the old
+-- fixed-200px look on every bar up to 200 wide. Wider bars stretch the full
+-- pattern (that region was simply blank before the full-width fix, so there is
+-- no legacy look to preserve there). Width comes from settings
+-- (GetHealthBarWidth), never from measuring the plate subtree (12.1 restricted
+-- regions forbid reads there).
+local STRIPE_NATIVE_W = 200
 local function ApplyOverlayGeometry(fillT, bgT, health, isStripe)
     fillT:ClearAllPoints(); bgT:ClearAllPoints()
     fillT:SetPoint("TOPLEFT", health, "TOPLEFT", 0, 0)
     fillT:SetPoint("BOTTOMLEFT", health, "BOTTOMLEFT", 0, 0)
+    fillT:SetPoint("RIGHT", health, "RIGHT", 0, 0)
     bgT:SetPoint("TOPLEFT", health, "TOPLEFT", 0, 0)
     bgT:SetPoint("BOTTOMLEFT", health, "BOTTOMLEFT", 0, 0)
+    bgT:SetPoint("RIGHT", health, "RIGHT", 0, 0)
+    local u = 1
     if isStripe then
-        fillT:SetWidth(200)
-        bgT:SetWidth(200)
-    else
-        fillT:SetPoint("RIGHT", health, "RIGHT", 0, 0)
-        bgT:SetPoint("RIGHT", health, "RIGHT", 0, 0)
+        u = GetHealthBarWidth() / STRIPE_NATIVE_W
+        if u > 1 then u = 1 end
     end
+    fillT:SetTexCoord(0, u, 0, 1)
+    bgT:SetTexCoord(0, u, 0, 1)
 end
 
 -- Alpha for the empty (background) portion of an overlay. The per-state "Full
@@ -2283,12 +2297,13 @@ local function EnsureFocusOverlay(plate)
     plate.focusClipFill:SetPoint("RIGHT", fillTex, "RIGHT", 0, 0)
     plate.focusClipFill:SetFrameLevel(plate.health:GetFrameLevel() + 1)
     plate.focusOverlayFill = plate.focusClipFill:CreateTexture(nil, "ARTWORK", nil, 2)
-    -- Texture: full bar height, fixed width, anchored to the health LEFT so the
-    -- diagonal pattern stays continuous across the fill/background split (both
-    -- overlays share the same origin) and snaps with the clip's vertical edges.
+    -- Texture: full bar height and full bar width (anchored LEFT+RIGHT to the
+    -- health bar) so the diagonal pattern stays continuous across the
+    -- fill/background split (both overlays share the same geometry) and snaps
+    -- with the clip's vertical edges.
     plate.focusOverlayFill:SetPoint("TOPLEFT", plate.health, "TOPLEFT", 0, 0)
     plate.focusOverlayFill:SetPoint("BOTTOMLEFT", plate.health, "BOTTOMLEFT", 0, 0)
-    plate.focusOverlayFill:SetWidth(200)
+    plate.focusOverlayFill:SetPoint("RIGHT", plate.health, "RIGHT", 0, 0)
     plate.focusOverlayFill:SetTexture(STRIPE_TEX)
     plate.focusOverlayFill:SetAlpha(overlayAlpha)
     plate.focusOverlayFill:SetVertexColor(overlayColor.r, overlayColor.g, overlayColor.b)
@@ -2302,10 +2317,13 @@ local function EnsureFocusOverlay(plate)
     plate.focusOverlayBg = plate.focusClipBg:CreateTexture(nil, "ARTWORK", nil, 1)
     plate.focusOverlayBg:SetPoint("TOPLEFT", plate.health, "TOPLEFT", 0, 0)
     plate.focusOverlayBg:SetPoint("BOTTOMLEFT", plate.health, "BOTTOMLEFT", 0, 0)
-    plate.focusOverlayBg:SetWidth(200)
+    plate.focusOverlayBg:SetPoint("RIGHT", plate.health, "RIGHT", 0, 0)
     plate.focusOverlayBg:SetTexture(STRIPE_TEX)
     plate.focusOverlayBg:SetAlpha(OverlayBgAlpha(p and p.focusOverlayFullBgAlpha, overlayAlpha))
     plate.focusOverlayBg:SetVertexColor(overlayColor.r, overlayColor.g, overlayColor.b)
+    -- Creation-time texcoord for the STRIPE_TEX default (the state-gated apply
+    -- re-runs this with the actual texture kind).
+    ApplyOverlayGeometry(plate.focusOverlayFill, plate.focusOverlayBg, plate.health, true)
     plate.focusClipBg:Hide()
 end
 
@@ -2385,7 +2403,7 @@ ns.EnsureHoverOverlay = function(plate)
     plate.hoverOverlayFill = plate.hoverClipFill:CreateTexture(nil, "ARTWORK", nil, 2)
     plate.hoverOverlayFill:SetPoint("TOPLEFT", plate.health, "TOPLEFT", 0, 0)
     plate.hoverOverlayFill:SetPoint("BOTTOMLEFT", plate.health, "BOTTOMLEFT", 0, 0)
-    plate.hoverOverlayFill:SetWidth(200)
+    plate.hoverOverlayFill:SetPoint("RIGHT", plate.health, "RIGHT", 0, 0)
     plate.hoverOverlayFill:SetTexture(STRIPE_TEX)
     plate.hoverOverlayFill:SetAlpha(overlayAlpha)
     plate.hoverOverlayFill:SetVertexColor(overlayColor.r, overlayColor.g, overlayColor.b)
@@ -2399,10 +2417,13 @@ ns.EnsureHoverOverlay = function(plate)
     plate.hoverOverlayBg = plate.hoverClipBg:CreateTexture(nil, "ARTWORK", nil, 1)
     plate.hoverOverlayBg:SetPoint("TOPLEFT", plate.health, "TOPLEFT", 0, 0)
     plate.hoverOverlayBg:SetPoint("BOTTOMLEFT", plate.health, "BOTTOMLEFT", 0, 0)
-    plate.hoverOverlayBg:SetWidth(200)
+    plate.hoverOverlayBg:SetPoint("RIGHT", plate.health, "RIGHT", 0, 0)
     plate.hoverOverlayBg:SetTexture(STRIPE_TEX)
     plate.hoverOverlayBg:SetAlpha(OverlayBgAlpha(p and p.hoverOverlayFullBgAlpha, overlayAlpha))
     plate.hoverOverlayBg:SetVertexColor(overlayColor.r, overlayColor.g, overlayColor.b)
+    -- Creation-time texcoord for the STRIPE_TEX default (the state-gated apply
+    -- re-runs this with the actual texture kind).
+    ApplyOverlayGeometry(plate.hoverOverlayFill, plate.hoverOverlayBg, plate.health, true)
     plate.hoverClipBg:Hide()
 end
 
@@ -2423,12 +2444,13 @@ ns.EnsureTargetOverlay = function(plate)
     plate.targetClipFill:SetPoint("RIGHT", fillTex, "RIGHT", 0, 0)
     plate.targetClipFill:SetFrameLevel(plate.health:GetFrameLevel() + 1)
     plate.targetOverlayFill = plate.targetClipFill:CreateTexture(nil, "ARTWORK", nil, 2)
-    -- Texture: full bar height, fixed width, anchored to the health LEFT so the
-    -- diagonal pattern stays continuous across the fill/background split (both
-    -- overlays share the same origin) and snaps with the clip's vertical edges.
+    -- Texture: full bar height and full bar width (anchored LEFT+RIGHT to the
+    -- health bar) so the diagonal pattern stays continuous across the
+    -- fill/background split (both overlays share the same geometry) and snaps
+    -- with the clip's vertical edges.
     plate.targetOverlayFill:SetPoint("TOPLEFT", plate.health, "TOPLEFT", 0, 0)
     plate.targetOverlayFill:SetPoint("BOTTOMLEFT", plate.health, "BOTTOMLEFT", 0, 0)
-    plate.targetOverlayFill:SetWidth(200)
+    plate.targetOverlayFill:SetPoint("RIGHT", plate.health, "RIGHT", 0, 0)
     plate.targetOverlayFill:SetTexture(STRIPE_TEX)
     plate.targetOverlayFill:SetAlpha(overlayAlpha)
     plate.targetOverlayFill:SetVertexColor(overlayColor.r, overlayColor.g, overlayColor.b)
@@ -2442,10 +2464,13 @@ ns.EnsureTargetOverlay = function(plate)
     plate.targetOverlayBg = plate.targetClipBg:CreateTexture(nil, "ARTWORK", nil, 1)
     plate.targetOverlayBg:SetPoint("TOPLEFT", plate.health, "TOPLEFT", 0, 0)
     plate.targetOverlayBg:SetPoint("BOTTOMLEFT", plate.health, "BOTTOMLEFT", 0, 0)
-    plate.targetOverlayBg:SetWidth(200)
+    plate.targetOverlayBg:SetPoint("RIGHT", plate.health, "RIGHT", 0, 0)
     plate.targetOverlayBg:SetTexture(STRIPE_TEX)
     plate.targetOverlayBg:SetAlpha(OverlayBgAlpha(p and p.targetOverlayFullBgAlpha, overlayAlpha))
     plate.targetOverlayBg:SetVertexColor(overlayColor.r, overlayColor.g, overlayColor.b)
+    -- Creation-time texcoord for the STRIPE_TEX default (the state-gated apply
+    -- re-runs this with the actual texture kind).
+    ApplyOverlayGeometry(plate.targetOverlayFill, plate.targetOverlayBg, plate.health, true)
     plate.targetClipBg:Hide()
 end
 
@@ -3379,10 +3404,58 @@ function ns.RefreshAllSettings()
             plate:SetUnit(plate.unit, plate.nameplate)
         end
     end
+    if ns.NT_RefreshSetting then ns.NT_RefreshSetting() end
     if ns.ApplyClassPowerSetting then ns.ApplyClassPowerSetting() end
     -- 12.1 aura containers: fingerprint-guarded, near-free when no aura
     -- settings changed.
     if ns.NPC_ReloadAll then ns.NPC_ReloadAll() end
+end
+
+-------------------------------------------------------------------------------
+--  Non-Target Opacity: while the player has a target, every skinned plate
+--  that is not the target, the focus, or the player fades to the configured
+--  opacity (profile key nonTargetAlpha, 0-100). 100 = feature OFF: every
+--  hook below reduces to a single numeric compare, and no plate is ever
+--  touched. The alpha rides the plate ROOT (our own frame, parented to the
+--  Blizzard nameplate), so Blizzard's own occlusion fade still multiplies in.
+-------------------------------------------------------------------------------
+ns._ntAlpha = 1   -- cached 0..1 from the profile; 1 = inert
+
+-- Applies the correct root alpha to ONE plate. Value-guarded via
+-- _ntCurAlpha so redundant SetAlpha calls are skipped and pooled frames
+-- reset cheaply (nil = never faded).
+function ns.NT_Apply(plate)
+    local unit = plate.unit
+    if not unit then return end
+    local a = 1
+    local nt = ns._ntAlpha
+    if nt < 1 and UnitExists("target")
+       and not UnitIsUnit(unit, "target")
+       and not UnitIsUnit(unit, "focus")
+       and not UnitIsUnit(unit, "player") then
+        a = nt
+    end
+    if (plate._ntCurAlpha or 1) ~= a then
+        plate._ntCurAlpha = a
+        plate:SetAlpha(a)
+    end
+end
+
+function ns.NT_ApplyAll()
+    for _, plate in pairs(ns.plates) do
+        ns.NT_Apply(plate)
+    end
+end
+
+-- Re-derives the cached opacity from the profile and reapplies every plate
+-- (also un-fades everything when the slider returns to 100). Called from
+-- the options slider, OnInitialize, and RefreshAllSettings -- the latter
+-- covers profile swaps and Spec Overrides applies.
+function ns.NT_RefreshSetting()
+    local v = tonumber(p and p.nonTargetAlpha) or 100
+    if v < 0 then v = 0 elseif v > 100 then v = 100 end
+    ns._ntAlpha = v / 100
+    ns.NT_ApplyAll()
 end
 
 function ns.HideHoverEffect(plate)
@@ -5389,6 +5462,10 @@ function NameplateFrame:ApplyAppearance()
     self.health:SetPoint("CENTER", self, "CENTER", 0, GetNameplateYOffset())
     self.health:SetSize(GetHealthBarWidth(), GetHealthBarHeight())
     self.absorb:SetSize(GetHealthBarWidth(), GetHealthBarHeight())
+    -- Width may have changed: clear the overlay state gates so the next
+    -- overlay apply re-runs geometry (the stripe texcoord crop is derived
+    -- from the settings width, and the gates never watch width).
+    self._ovTgtTex, self._ovFocTex, self._ovHoverTex = nil, nil, nil
     ns.LayoutCastBar(self, ns.GetHealthBarWidth(), castH)
     ns.LayoutCastIcon(self, castH)
     local showIcon = GetShowCastIcon()
@@ -5803,6 +5880,8 @@ function NameplateFrame:SetUnit(unit, nameplate)
     self:RegisterUnitEvent("UNIT_THREAT_LIST_UPDATE", unit)
     -- 12.1: attach a pooled aura-container bundle for this unit.
     if ns.NPC_AttachPlate then ns.NPC_AttachPlate(self, unit) end
+    -- Non-Target Opacity (zero cost while off: one numeric compare).
+    if ns._ntAlpha < 1 then ns.NT_Apply(self) end
     -- Critical: health bar must display immediately
     self:UpdateHealth()
     -- PERF: defer non-critical work 1 frame. Stacking bounds, name, cast bar,
@@ -5892,6 +5971,13 @@ function NameplateFrame:SetUnit(unit, nameplate)
 end
 function NameplateFrame:ClearUnit()
     self:UnregisterAllEvents()
+
+    -- Non-Target Opacity: released pool frames always go back at full
+    -- alpha (nil _ntCurAlpha = never faded, keeps this a no-op).
+    if self._ntCurAlpha and self._ntCurAlpha < 1 then
+        self:SetAlpha(1)
+    end
+    self._ntCurAlpha = nil
 
     if self.isCasting then
         self.isCasting = false
@@ -8812,6 +8898,10 @@ manager:SetScript("OnEvent", function(self, event, unit)
             ns._cachedTargetPlate:ApplyTarget()
             ns._cachedTargetPlate:UpdateHealthColor()
         end
+        -- Non-Target Opacity: gaining/losing a target flips every plate's
+        -- fade state, so this is the one full-iteration site. Zero cost
+        -- while off (single compare); value-guarded SetAlpha when on.
+        if ns._ntAlpha < 1 then ns.NT_ApplyAll() end
     elseif event == "PLAYER_FOCUS_CHANGED" then
         -- PERF: only update old + new focus plates instead of iterating all
         local oldFocus = ns._cachedFocusPlate
@@ -8841,6 +8931,14 @@ manager:SetScript("OnEvent", function(self, event, unit)
         UpdateFocusPlate(oldFocus)
         if ns._cachedFocusPlate and ns._cachedFocusPlate ~= oldFocus then
             UpdateFocusPlate(ns._cachedFocusPlate)
+        end
+        -- Non-Target Opacity: only the old and new focus plates change
+        -- fade state on a focus swap.
+        if ns._ntAlpha < 1 then
+            if oldFocus then ns.NT_Apply(oldFocus) end
+            if ns._cachedFocusPlate and ns._cachedFocusPlate ~= oldFocus then
+                ns.NT_Apply(ns._cachedFocusPlate)
+            end
         end
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
         ns._UpdateMouseover()
@@ -9002,6 +9100,10 @@ function npAddon:OnInitialize()
     ENP.db = EllesmereUI.Lite.NewDB("EllesmereUINameplatesDB", { profile = defaults })
     p = ENP.db.profile
     ns.db = ENP.db
+    -- Non-Target Opacity: derive the cached value at login (no plates exist
+    -- yet, so the apply loop is a no-op; SetUnit fades new plates as they
+    -- spawn).
+    if ns.NT_RefreshSetting then ns.NT_RefreshSetting() end
     -- Append SharedMedia textures to runtime tables so SM texture keys resolve at runtime
     if EllesmereUI.AppendSharedMediaTextures then
         EllesmereUI.AppendSharedMediaTextures(

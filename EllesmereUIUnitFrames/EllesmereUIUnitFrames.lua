@@ -3,6 +3,7 @@ local addonName, ns = ...
 local math_floor, math_ceil, math_max, math_min, math_abs =
     math.floor, math.ceil, math.max, math.min, math.abs
 local string_format = string.format
+local issecretvalue = issecretvalue
 
 local oUF = ns.oUF or oUF
 local PP = EllesmereUI.PP
@@ -1010,6 +1011,7 @@ local defaults = {
         -- Player dispel overlay (player frame only; keys mirror Raid Frames)
         dispelOverlay        = "none",   -- "none", "fill", "full", "gradient", "gradient_sharp"
         dispelOverlayOpacity = 100,
+        dispelOverlayByMe    = false,    -- only debuffs the player can dispel (engine filter token)
         dispelColorMagic   = { r = 0.349, g = 0.475, b = 1.0 },
         dispelColorCurse   = { r = 0.636, g = 0.0,   b = 0.64 },
         dispelColorDisease = { r = 0.671, g = 0.384, b = 0.098 },
@@ -1952,9 +1954,11 @@ end
 -- never compared/concatenated/string.format'd in Lua -- oUF joins the tag returns via
 -- SetFormattedText, where the name is only a %s display arg (exactly how the stock
 -- [name] tag stays safe). ContentToTag maps "nametotarget" to
--- "[name][eui-tgtsep][eui-tgtcol][eui-tgtname]":
+-- "[name][eui-tgtsep(...)][eui-tgtcol][eui-tgtname]":
 --   [name]        -> the unit's own name (zone-colored, stock oUF tag)
---   [eui-tgtsep]  -> " > " only when the unit has a target (a plain literal)
+--   [eui-tgtsep]  -> the indicator between the names, only when the unit has a
+--                    target. Per-slot separator string and indicator color ride
+--                    in the tag ARGS (see BuildTgtSepTag); no args = " > ".
 --   [eui-tgtcol]  -> the target's class/reaction COLOR escape (no name involved)
 --   [eui-tgtname] -> the target's name, returned RAW
 -- The colour escape precedes the raw name and runs to the end of the string, so the
@@ -1967,12 +1971,49 @@ end
 -- PLAYER_TARGET_CHANGED is unitless in oUF (refreshes every frame), covering the
 -- player frame's target; UNIT_TARGET covers target/focus frames' own target.
 
--- " > " separator, shown only when the unit has a target. Plain literal -- no secret.
-oUF.Tags.Methods["eui-tgtsep"] = function(unit)
-    if unit and UnitExists(unit .. "target") then return " > " end
-    return ""
+-- Separator/indicator between the names, shown only when the unit has a target.
+-- Plain literal plus color escapes -- no secret is ever touched. Args:
+--   sepHex    -> the separator string, hex-encoded per byte (any character the
+--                user types is safe inside the tag brackets); rendered with a
+--                space on each side, exactly like the stock " > ".
+--   colorSpec -> "class" = the TARGET's class/reaction color (same resolver as
+--                the target name), else a fixed "rrggbb" hex. The escape is
+--                closed with |r so a missing [eui-tgtcol] cannot inherit it.
+-- Decoded separators and custom escapes are cached: the tag fires on every
+-- target change and must not allocate after warmup.
+do
+    local sepCache = {}   -- sepHex -> " sep " (decoded, space-padded)
+    local escCache = {}   -- rrggbb -> "|cffrrggbb"
+    local function HexToChar(h) return string.char(tonumber(h, 16)) end
+    oUF.Tags.Methods["eui-tgtsep"] = function(unit, _, sepHex, colorSpec)
+        if not (unit and UnitExists(unit .. "target")) then return "" end
+        local sep = " > "
+        if sepHex then
+            sep = sepCache[sepHex]
+            if not sep then
+                sep = " " .. sepHex:gsub("%x%x", HexToChar) .. " "
+                sepCache[sepHex] = sep
+            end
+        end
+        if colorSpec == "class" then
+            local r, g, b = ns.ResolveUnitNameColor(unit .. "target")
+            if r then
+                return string.format("|cff%02x%02x%02x%s|r",
+                    math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5),
+                    math.floor(b * 255 + 0.5), sep)
+            end
+            return sep
+        elseif colorSpec then
+            local esc = escCache[colorSpec]
+            if not esc then esc = "|cff" .. colorSpec; escCache[colorSpec] = esc end
+            return esc .. sep .. "|r"
+        end
+        return sep
+    end
 end
-oUF.Tags.Events["eui-tgtsep"] = "UNIT_TARGET PLAYER_TARGET_CHANGED"
+-- UNIT_FACTION mirrors [eui-tgtcol]: the class-colored indicator must recolor
+-- when the target's reaction flips, exactly like the target name it precedes.
+oUF.Tags.Events["eui-tgtsep"] = "UNIT_TARGET PLAYER_TARGET_CHANGED UNIT_FACTION"
 
 -- The target's class/reaction colour escape (e.g. "|cffc41f3b"), or "" when none. Uses
 -- ns.ResolveUnitNameColor -- the SAME resolver ApplyClassColor uses for the Target of
@@ -2364,12 +2405,38 @@ local function BuildShortNameTag(prefix, settings)
     return "[eui-name(" .. len .. "," .. ellipsis .. ")]"
 end
 
+-- Build the per-slot "Name > Target" indicator tag. The separator string is
+-- hex-encoded per byte so any user-typed character (commas, parens, multibyte
+-- symbols) survives the tag brackets; the indicator color rides as "class" or
+-- a fixed rrggbb hex (default white).
+local function BuildTgtSepTag(prefix, settings)
+    local sep = settings[prefix .. "TargetSep"]
+    if type(sep) ~= "string" or sep == "" then sep = ">" end
+    local hex = sep:gsub(".", function(ch) return string.format("%02x", ch:byte()) end)
+    local col
+    if settings[prefix .. "TargetSepClassColor"] then
+        col = "class"
+    else
+        local c = settings[prefix .. "TargetSepColor"]
+        if type(c) == "table" then
+            col = string.format("%02x%02x%02x",
+                math.floor((c.r or 1) * 255 + 0.5),
+                math.floor((c.g or 1) * 255 + 0.5),
+                math.floor((c.b or 1) * 255 + 0.5))
+        else
+            col = "ffffff"
+        end
+    end
+    return "[eui-tgtsep(" .. hex .. "," .. col .. ")]"
+end
+
 -- Resolve a leftTextContent / rightTextContent value to an oUF tag string.
 -- content: "name", "both", "curhpshort", "perhp", "perhpnosign", "perhpnum", "none"
 local function ContentToTag(content, prefix, settings)
     if content == "name" then return BuildShortNameTag(prefix, settings)
     elseif content == "nametotarget" then
-        return BuildShortNameTag(prefix, settings) .. "[eui-tgtsep][eui-tgtcol][eui-tgtname]"
+        return BuildShortNameTag(prefix, settings)
+            .. BuildTgtSepTag(prefix, settings) .. "[eui-tgtcol][eui-tgtname]"
     elseif content == "both" then return "[curhpshort] | [eui-perhp]%"
     elseif content == "bothdash" then return "[curhpshort] - [eui-perhp]%"
     elseif content == "perhpnum" then return "[eui-perhp]% | [curhpshort]"
@@ -2933,7 +3000,7 @@ local function EnsureBarClip(frame)
     return clip
 end
 
-local function ReparentBarsToClip(frame, powerPosition)
+local function ReparentBarsToClip(frame, powerPosition, settings)
     local clip = EnsureBarClip(frame)
     if frame.Health and frame.Health:GetParent() ~= clip then
         frame.Health:SetParent(clip)
@@ -2962,6 +3029,11 @@ local function ReparentBarsToClip(frame, powerPosition)
             -- Power bar must render above absorb overlay (health level + 1).
             local hpLevel = frame.Health and frame.Health:GetFrameLevel() or clip:GetFrameLevel()
             frame.Power:SetFrameLevel(hpLevel + 2)
+        end
+        -- Reparent/SetFrameLevel leave the border and text overlay at stale
+        -- absolute levels; re-apply after the final level is set.
+        if settings then
+            ns.UpdatePowerBorder(frame.Power, settings)
         end
     end
 end
@@ -3998,9 +4070,24 @@ function ns.UpdatePowerBorder(power, settings)
         settings.powerBorderAlpha or 1, settings.powerBorderStyle or "solid",
         settings.powerBorderOffsetX, settings.powerBorderOffsetY,
         settings.powerBorderShiftX, settings.powerBorderShiftY, "unitframes", size)
-    border:SetFrameLevel(settings.powerBorderBehind
-        and math.max(0, power:GetFrameLevel() - 1) or (power:GetFrameLevel() + 5))
-    if isDet and size > 0 then border:Show() else border:Hide() end
+    local borderLevel = settings.powerBorderBehind
+        and math.max(0, power:GetFrameLevel() - 1) or (power:GetFrameLevel() + 5)
+    border:SetFrameLevel(borderLevel)
+    local showBorder = isDet and size > 0
+    if showBorder then border:Show() else border:Hide() end
+
+    -- Power text overlay must clear the border: it shares the bar's strata and can
+    -- sit above the overlay's default level, so match strata and lift past it.
+    local ovr = power._ppTextOvr
+    if ovr then
+        ovr:SetFrameStrata(power:GetFrameStrata())
+        if showBorder then
+            ovr:SetFrameLevel(borderLevel + 5)
+        else
+            local pf = power:GetParent()
+            ovr:SetFrameLevel((pf and pf:GetFrameLevel() or power:GetFrameLevel()) + 15)
+        end
+    end
 end
 
 local function CreatePowerBar(frame, unit, settings)
@@ -6211,7 +6298,7 @@ local function StyleFullFrame(frame, unit)
 
     CreateUnifiedBorder(frame, unit)
     UpdateBordersForScale(frame, unit)
-    ReparentBarsToClip(frame, settings.powerPosition)
+    ReparentBarsToClip(frame, settings.powerPosition, settings)
 
     -- Raid target marker icon -- oUF's RaidTargetIndicator element manages
     -- visibility via RAID_TARGET_UPDATE. We only assign the element when
@@ -6546,7 +6633,7 @@ local function StyleFocusFrame(frame, unit)
 
     CreateUnifiedBorder(frame, unit)
     UpdateBordersForScale(frame, unit)
-    ReparentBarsToClip(frame, settings.powerPosition)
+    ReparentBarsToClip(frame, settings.powerPosition, settings)
 
     -- Raid target marker icon
     do
@@ -6875,7 +6962,7 @@ local function StyleSimpleFrame(frame, unit)
 
     CreateUnifiedBorder(frame, unit)
     UpdateBordersForScale(frame, unit)
-    ReparentBarsToClip(frame, settings.powerPosition)
+    ReparentBarsToClip(frame, settings.powerPosition, settings)
 
     -- Text overlay frame (parented to frame, not health, to avoid clipping)
     local textOverlay = CreateFrame("Frame", nil, frame)
@@ -7121,7 +7208,7 @@ local function StylePetFrame(frame, unit)
 
     CreateUnifiedBorder(frame, unit)
     UpdateBordersForScale(frame, unit)
-    ReparentBarsToClip(frame, settings.powerPosition)
+    ReparentBarsToClip(frame, settings.powerPosition, settings)
 
     -- Text overlay frame (parented to frame, not health, to avoid clipping)
     local textOverlay = CreateFrame("Frame", nil, frame)
@@ -7352,7 +7439,7 @@ local function StyleBossFrame(frame, unit)
 
     CreateUnifiedBorder(frame, unit)
     UpdateBordersForScale(frame, unit)
-    ReparentBarsToClip(frame, settings.powerPosition)
+    ReparentBarsToClip(frame, settings.powerPosition, settings)
 
     -- Raid target marker icon (boss frames) -- anchored outside the LEFT edge
     do
@@ -9052,7 +9139,7 @@ local function ReloadFrames()
                     end
 
                     UpdateBordersForScale(frame, unit)
-                    ReparentBarsToClip(frame, settings.powerPosition)
+                    ReparentBarsToClip(frame, settings.powerPosition, settings)
 
                 elseif unit == "target" then
                     local pSide = settings.portraitSide or "right"
@@ -9419,7 +9506,7 @@ local function ReloadFrames()
                     end
 
                     UpdateBordersForScale(frame, unit)
-                    ReparentBarsToClip(frame, settings.powerPosition)
+                    ReparentBarsToClip(frame, settings.powerPosition, settings)
                 end
 
                 -- (health tag re-tagging now handled by _applyTextTags above)
@@ -9785,7 +9872,7 @@ local function ReloadFrames()
                 end
 
                 UpdateBordersForScale(frame, unit)
-                ReparentBarsToClip(frame, settings.powerPosition)
+                ReparentBarsToClip(frame, settings.powerPosition, settings)
 
             elseif unit == "pet" or unit == "targettarget" or unit == "focustarget" then
                 -- Pet, ToT and FoT all share the same simple-frame layout:
@@ -9819,7 +9906,7 @@ local function ReloadFrames()
                 end
 
                 UpdateBordersForScale(frame, unit)
-                ReparentBarsToClip(frame, settings.powerPosition)
+                ReparentBarsToClip(frame, settings.powerPosition, settings)
 
             elseif unit:match("^boss%d$") then
                 local bPpPos = settings.powerPosition or "below"
@@ -10216,7 +10303,7 @@ local function ReloadFrames()
                 end
 
                 UpdateBordersForScale(frame, unit)
-                ReparentBarsToClip(frame, settings.powerPosition)
+                ReparentBarsToClip(frame, settings.powerPosition, settings)
             end
 
             -- Determine if this is a mini frame that inherits border/texture/font
@@ -11357,7 +11444,6 @@ function InitializeFrames()
     -- Must run after target frame is spawned (right above) so the texture can
     -- be parented to it.
     do
-        local LEADER_ATLAS = "plunderstorm-glues-icon-leader"
         local _leaderUnits = {}
 
         local function _leaderRefresh(uf)
@@ -11366,8 +11452,13 @@ function InitializeFrames()
             local tex = uf._leaderIndicator
             if s.leaderIndicatorEnabled == false then tex:Hide(); return end
             local unit = uf.unit
-            if unit and UnitExists(unit) and UnitIsGroupLeader(unit) then
-                tex:SetAtlas(LEADER_ATLAS)
+            local isLeader = UnitIsGroupLeader(unit)
+            local isAssist = UnitIsGroupAssistant(unit)
+            if isLeader and not issecretvalue(isLeader) then
+                tex:SetTexture("Interface\\GroupFrame\\UI-Group-LeaderIcon")
+                tex:Show()
+            elseif isAssist and not issecretvalue(isAssist) then
+                tex:SetTexture("Interface\\GroupFrame\\UI-Group-AssistantIcon")
                 tex:Show()
             else
                 tex:Hide()
@@ -12133,12 +12224,27 @@ function InitializeFrames()
     -- this is a cheap no-op unless the user enabled a boss border.
     -- Defined on ns (not a local) to avoid the Lua 200-local cap.
     ns.UpdateBossTargetBorders = function()
+        local s = db.profile.boss
         for i = 1, 5 do
-            local f = frames["boss" .. i]
-            if f and f.unifiedBorder then
-                local isT = UnitIsUnit("boss" .. i, "target")
-                f._isTarget = (isT and not issecretvalue(isT)) and true or false
-                ns.ApplyBossBorderState(f)
+            local bUnit = "boss" .. i
+            local f = frames[bUnit]
+            if f then
+                if f.unifiedBorder then
+                    local isT = UnitIsUnit(bUnit, "target")
+                    f._isTarget = (isT and not issecretvalue(isT)) and true or false
+                    ns.ApplyBossBorderState(f)
+                end
+                if s then
+                    if f.LeftText and s.leftTextClassColor ~= nil then
+                        ApplyClassColor(f.LeftText, bUnit, s.leftTextClassColor, s.leftTextColorR, s.leftTextColorG, s.leftTextColorB)
+                    end
+                    if f.RightText and s.rightTextClassColor ~= nil then
+                        ApplyClassColor(f.RightText, bUnit, s.rightTextClassColor, s.rightTextColorR, s.rightTextColorG, s.rightTextColorB)
+                    end
+                    if f.CenterText and s.centerTextClassColor ~= nil then
+                        ApplyClassColor(f.CenterText, bUnit, s.centerTextClassColor, s.centerTextColorR, s.centerTextColorG, s.centerTextColorB)
+                    end
+                end
             end
         end
     end
@@ -13722,9 +13828,13 @@ do
         -- First harmful aura with a dispel type. dispelName can be SECRET on
         -- the player in raid content: only the nil-test is permitted -- never
         -- index a table with it or branch on its value.
+        -- "Only Dispellable by You" delegates entirely to the engine filter
+        -- token (class/spec/talents evaluated live, no addon tables) -- the
+        -- same token the Raid Frames dispel system uses.
+        local scanFilter = p.dispelOverlayByMe and "HARMFUL|RAID_PLAYER_DISPELLABLE" or "HARMFUL"
         local found
         for i = 1, 40 do
-            local ad = C_UnitAuras.GetAuraDataByIndex("player", i, "HARMFUL")
+            local ad = C_UnitAuras.GetAuraDataByIndex("player", i, scanFilter)
             if not ad then break end
             if ad.dispelName ~= nil then
                 found = ad
@@ -13774,6 +13884,12 @@ do
     ns.UpdatePlayerDispelOverlay = function()
         RebuildCurve()
         Update()
+        -- 12.1: the container dispel slots own the overlay (Update() bails
+        -- above); poke their fingerprinted reload so dropdown/cog edits
+        -- apply live instead of waiting for the next full container pass.
+        if ns.UF_DispelOverlayDisabled and ns.UF_ReloadPlayerDispelSlots then
+            ns.UF_ReloadPlayerDispelSlots()
+        end
     end
 
     -- Debuff dispel-type borders (per-unit debuffDispelBorder, default off):

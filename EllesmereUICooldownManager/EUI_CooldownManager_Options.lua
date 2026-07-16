@@ -208,6 +208,12 @@ initFrame:SetScript("OnEvent", function(self)
     -- glow-assignable: the Bar Glows preview leaves their buttons inert.
     local function IsNonGlowableCDMIcon(frame)
         if not frame then return false end
+        -- Overflow-diverted icons render on this bar only for the session;
+        -- their glow identity (and any slot-index fallback key) belongs to
+        -- the source bar, so they are not listed/assignable while diverted.
+        -- Existing cdm_-keyed glows still RENDER on them (the render pass is
+        -- key-driven, not list-driven).
+        if ns.CdmFrameOverflowBar and ns.CdmFrameOverflowBar(frame) then return true end
         return (frame._isRacialFrame or frame._isTrinketFrame
             or frame._isPresetFrame or frame._isItemPresetFrame
             or frame._isCustomSpellFrame or frame._isCustomBuffFrame) and true or false
@@ -909,10 +915,18 @@ initFrame:SetScript("OnEvent", function(self)
                 barSettings = EAB_ADDON.db.profile.bars[barKeyStr]
             end
 
-            -- CDM bars: count icons dynamically; action bars: always 12
+            -- CDM bars: count icons dynamically; action bars: always 12.
+            -- Overflow-diverted icons are tail-appended to the target's array
+            -- and excluded here, so every native icon keeps its slot index
+            -- (stable glow-assignment fallback keys).
             local NUM_BUTTONS = 12
             if isCDMBar and ns.cdmBarIcons and ns.cdmBarIcons[cdmBarKey] then
-                NUM_BUTTONS = #ns.cdmBarIcons[cdmBarKey]
+                NUM_BUTTONS = 0
+                for _, ic in ipairs(ns.cdmBarIcons[cdmBarKey]) do
+                    if not (ns.CdmFrameOverflowBar and ns.CdmFrameOverflowBar(ic)) then
+                        NUM_BUTTONS = NUM_BUTTONS + 1
+                    end
+                end
                 if NUM_BUTTONS == 0 then NUM_BUTTONS = 1 end
             end
             local prefix = (not isCDMBar) and (BAR_BUTTON_PREFIXES[barIdx] or "ActionButton") or nil
@@ -2423,6 +2437,7 @@ initFrame:SetScript("OnEvent", function(self)
             barCfg.spellIDs       = nil
             barCfg.popularKey     = nil
             barCfg.glowBased      = nil
+            barCfg.trackType      = nil
             barCfg.customDuration = dur
             -- Manually-entered id: no live frame to read the base from. Clear any
             -- stale base; MatchFrameToConfig self-heals it if/when talented.
@@ -2479,7 +2494,7 @@ initFrame:SetScript("OnEvent", function(self)
         local mH = 4
 
         -- "Custom Buff ID" entry at the top
-        local isCustomSelected = barCfg.spellID and barCfg.spellID > 0 and not barCfg.popularKey and not barCfg.spellIDs
+        local isCustomSelected = barCfg.spellID and barCfg.spellID > 0 and not barCfg.popularKey and not barCfg.spellIDs and barCfg.trackType ~= "cooldown"
         local csItem = CreateFrame("Button", nil, inner)
         csItem:SetHeight(ITEM_H)
         csItem:SetPoint("TOPLEFT", inner, "TOPLEFT", 1, -mH)
@@ -2558,6 +2573,7 @@ initFrame:SetScript("OnEvent", function(self)
                 barCfg.customDuration = entry.customDuration
                 barCfg.spellID        = entry.spellIDs and entry.spellIDs[1] or 0
                 barCfg.baseSpellID    = nil
+                barCfg.trackType      = nil
                 barCfg.name           = entry.name
                 Refresh()
                 ns.BuildTrackedBuffBars()
@@ -2591,6 +2607,7 @@ initFrame:SetScript("OnEvent", function(self)
             -- Check if spell is already on another Tracking Bar
             local usedOnBar = ns.SpellUsedOnAnyOtherTBB and ns.SpellUsedOnAnyOtherTBB(sp.spellID, nil)
             local isSelected = not barCfg.popularKey and not barCfg.spellIDs
+                             and barCfg.trackType ~= "cooldown"
                              and barCfg.spellID and barCfg.spellID > 0 and barCfg.spellID == sp.spellID
             local item = CreateFrame("Button", nil, inner)
             item:SetHeight(ITEM_H)
@@ -2662,6 +2679,7 @@ initFrame:SetScript("OnEvent", function(self)
                 barCfg.popularKey     = nil
                 barCfg.glowBased      = nil
                 barCfg.customDuration = nil
+                barCfg.trackType      = nil
                 barCfg.name           = sp.name
                 -- Capture the BASE spell id for hero-talent override spells so
                 -- the bar keeps tracking after the talent is removed. When the
@@ -2683,6 +2701,121 @@ initFrame:SetScript("OnEvent", function(self)
         end
 
         for _, sp in ipairs(trackedBars) do MakeSpellItem(sp) end
+
+        -- "Cooldowns" section: pick a spell COOLDOWN to track instead of a
+        -- buff (cfg.trackType = "cooldown"). Sourced from the Essential +
+        -- Utility pools plus the settings catalog. Skipped entirely when the
+        -- list is empty so the picker stays identical to before.
+        local cdSpells = ns.GetCDMSpellsForBar and ns.GetCDMSpellsForBar("cooldowns") or {}
+        if #cdSpells > 0 then
+            local cdDiv = inner:CreateTexture(nil, "ARTWORK")
+            cdDiv:SetHeight(1); cdDiv:SetColorTexture(1, 1, 1, 0.10)
+            cdDiv:SetPoint("TOPLEFT", inner, "TOPLEFT", 1, -mH - 4)
+            cdDiv:SetPoint("TOPRIGHT", inner, "TOPRIGHT", -1, -mH - 4)
+            mH = mH + 9
+
+            local cdHdr = inner:CreateFontString(nil, "OVERLAY")
+            cdHdr:SetFont(FONT_PATH, 10, GetCDMOptOutline())
+            cdHdr:SetTextColor(1, 1, 1, 0.5)
+            cdHdr:SetPoint("TOPLEFT", inner, "TOPLEFT", 10, -mH - 5)
+            cdHdr:SetText(EllesmereUI.L("Cooldowns"))
+            mH = mH + 20
+
+            local function MakeCooldownItem(sp)
+                -- Gray-out check is scoped to OTHER cooldown-tracking bars:
+                -- a buff bar for the same spell never blocks this pick.
+                local usedOnBar = ns.SpellUsedOnAnyOtherTBB and ns.SpellUsedOnAnyOtherTBB(sp.spellID, nil, "cooldown")
+                local isSelected = barCfg.trackType == "cooldown"
+                                 and not barCfg.popularKey and not barCfg.spellIDs
+                                 and barCfg.spellID and barCfg.spellID > 0 and barCfg.spellID == sp.spellID
+                local item = CreateFrame("Button", nil, inner)
+                item:SetHeight(ITEM_H)
+                item:SetPoint("TOPLEFT", inner, "TOPLEFT", 1, -mH)
+                item:SetPoint("TOPRIGHT", inner, "TOPRIGHT", -1, -mH)
+                item:SetFrameLevel(menu:GetFrameLevel() + 2)
+
+                local ico = item:CreateTexture(nil, "ARTWORK")
+                local icoSz = ITEM_H - 4
+                ico:SetSize(icoSz, icoSz)
+                ico:SetPoint("RIGHT", item, "RIGHT", -6, 0)
+                if sp.icon then ico:SetTexture(sp.icon) end
+                ico:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+                local baseR = isSelected and 1 or tDimR
+                local baseG = isSelected and 1 or tDimG
+                local baseB = isSelected and 1 or tDimB
+                local baseA = isSelected and 1 or tDimA
+
+                local lbl = item:CreateFontString(nil, "OVERLAY")
+                lbl:SetFont(FONT_PATH, 11, GetCDMOptOutline())
+                lbl:SetPoint("LEFT", 8, 0)
+                lbl:SetPoint("RIGHT", ico, "LEFT", -4, 0)
+                lbl:SetJustifyH("LEFT")
+                lbl:SetWordWrap(false); lbl:SetMaxLines(1)
+                lbl:SetText(EllesmereUI.L(sp.name))
+                lbl:SetTextColor(baseR, baseG, baseB, baseA)
+
+                local hl = item:CreateTexture(nil, "ARTWORK", nil, -1)
+                hl:SetAllPoints()
+                hl:SetColorTexture(1, 1, 1, isSelected and 0.12 or 0)
+
+                -- Gray out if already used on another cooldown-tracking bar
+                if usedOnBar and not isSelected then
+                    lbl:SetTextColor(tDimR, tDimG, tDimB, tDimA * 0.4)
+                    ico:SetDesaturated(true); ico:SetAlpha(0.4)
+                    item:SetScript("OnEnter", function()
+                        EllesmereUI.ShowWidgetTooltip(item, EllesmereUI.Lf("Already assigned to %s", EllesmereUI.L(usedOnBar)))
+                        hl:SetColorTexture(1, 1, 1, hlA * 0.3); hl:SetAlpha(1)
+                    end)
+                    item:SetScript("OnLeave", function()
+                        EllesmereUI.HideWidgetTooltip()
+                        hl:SetAlpha(0)
+                    end)
+                    mH = mH + ITEM_H
+                    return
+                end
+
+                -- Untalented catalog spells stay clickable but render
+                -- desaturated with a hint, matching the buff rows above.
+                local notLearned = (sp.isKnown == false)
+                if notLearned then ico:SetDesaturated(true); ico:SetAlpha(0.5) end
+                item:SetScript("OnEnter", function()
+                    lbl:SetTextColor(1,1,1,1); hl:SetColorTexture(1,1,1,hlA)
+                    if notLearned then EllesmereUI.ShowWidgetTooltip(item, EllesmereUI.L("Not currently talented")) end
+                end)
+                item:SetScript("OnLeave", function()
+                    lbl:SetTextColor(baseR, baseG, baseB, baseA)
+                    hl:SetColorTexture(1, 1, 1, isSelected and 0.12 or 0)
+                    if notLearned then EllesmereUI.HideWidgetTooltip() end
+                end)
+                item:SetScript("OnClick", function()
+                    if notLearned then EllesmereUI.HideWidgetTooltip() end
+                    menu:Hide()
+                    barCfg.spellID        = sp.spellID
+                    barCfg.spellIDs       = nil
+                    barCfg.popularKey     = nil
+                    barCfg.glowBased      = nil
+                    barCfg.customDuration = nil
+                    barCfg.trackType      = "cooldown"
+                    barCfg.name           = sp.name
+                    -- Capture the BASE spell id for hero-talent override spells
+                    -- so the bar keeps tracking after the talent is removed.
+                    barCfg.baseSpellID = nil
+                    if sp.cdID and C_CooldownViewer and C_CooldownViewer.GetCooldownViewerCooldownInfo then
+                        local info = C_CooldownViewer.GetCooldownViewerCooldownInfo(sp.cdID)
+                        if info and info.spellID and info.spellID > 0 and info.spellID ~= sp.spellID then
+                            barCfg.baseSpellID = info.spellID
+                        end
+                    end
+                    Refresh()
+                    ns.BuildTrackedBuffBars()
+                    if onChanged then onChanged() end
+                end)
+                mH = mH + ITEM_H
+            end
+
+            for _, sp in ipairs(cdSpells) do MakeCooldownItem(sp) end
+        end
 
         -- "Missing Spells?" footer: centered, accent-colored prompt that opens
         -- Blizzard's CDM and closes EUI options, matching the CD/utility picker.
@@ -4726,6 +4859,44 @@ initFrame:SetScript("OnEvent", function(self)
             })
         end
 
+        -- Smooth Bars: PROFILE-wide checkbox dropdown (all bars, all specs
+        -- -- deliberately NOT per bar or per spec). Buffs = buff mirrors +
+        -- self-timed presets; Cooldowns = cooldown-tracking bars. Read by
+        -- the tick each pass, so changes apply instantly with no rebuild.
+        local SMOOTH_ITEMS = {
+            { key = "buffs",     label = "Buffs" },
+            { key = "cooldowns", label = "Cooldowns" },
+        }
+        local SMOOTH_DEFAULT = { buffs = true, cooldowns = false }
+        local smoothRow
+        smoothRow, h = W:DualRow(parent, y,
+            { type = "dropdown", text = "Smooth Bars",
+              tooltip = "Eases bar movement instead of snapping. Affects all Tracking Bars of that type, in every spec of this profile.",
+              values = { __placeholder = "..." }, order = { "__placeholder" },
+              getValue = function() return "__placeholder" end,
+              setValue = function() end },
+            { type = "label", text = "" });  y = y - h
+        do
+            local rgn = smoothRow._leftRegion
+            if rgn._control then rgn._control:Hide() end
+            local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
+                rgn, 210, rgn:GetFrameLevel() + 2,
+                SMOOTH_ITEMS,
+                function(k)
+                    local s = ns.GetTBBSmoothSettings and ns.GetTBBSmoothSettings()
+                    if not s or s[k] == nil then return SMOOTH_DEFAULT[k] end
+                    return s[k] == true
+                end,
+                function(k, v)
+                    local s = ns.GetTBBSmoothSettings and ns.GetTBBSmoothSettings()
+                    if s then s[k] = v and true or false end
+                end)
+            PP.Point(cbDD, "RIGHT", rgn, "RIGHT", -20, 0)
+            rgn._control = cbDD
+            rgn._lastInline = nil
+            EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
+        end
+
         -------------------------------------------------------------------
         --  DISPLAY
         -------------------------------------------------------------------
@@ -5643,6 +5814,14 @@ initFrame:SetScript("OnEvent", function(self)
                 -- for the same spell (the buff frame's id resolves positive).
                 local _fdLI = ns._hookFrameData and ns._hookFrameData[icon]
                 if icon._isPlaceholderFrame or (_fdLI and _fdLI._isBuffViewerFrame) then
+                    _sid = nil
+                end
+                -- Skip overflow-diverted icons outright: they render on this
+                -- bar only for the session but BELONG to their source bar's
+                -- assignedSpells -- materializing (or advancing the insertion
+                -- cursor on) them would write the diversion into this bar's
+                -- saved list.
+                if _sid and ns.CdmFrameOverflowBar and ns.CdmFrameOverflowBar(icon) then
                     _sid = nil
                 end
                 if _sid and _sid ~= 0 then
@@ -8252,20 +8431,8 @@ initFrame:SetScript("OnEvent", function(self)
                             if not ctx then return end
                             local val = ctx.valueOf and ctx.valueOf()
                             local keys = ctx.keys or {}
-                            -- On an EXCLUDED spell the flyout sits on the bar's own value,
-                            -- so Apply to Bar / All Specs here means "rejoin the bar" -- the
-                            -- same as Include This Spell. Do that instead of re-applying the
-                            -- value already on the bar (which would just toggle it off).
-                            if AB.KeysBarApplied(keys) and AB.SpellHasOwn(keys) then
-                                AB.IncludeSpell(keys)
-                                if ns.RefreshCDMIconAppearance then ns.RefreshCDMIconAppearance(barKey) end
-                                if ns.QueueReanchor then ns.QueueReanchor() end
-                                if ctx.refresh then ctx.refresh() end
-                                if s._updateActive then s._updateActive() end
-                                return
-                            end
-                            -- Simulate the write once: drives the toggle-off check
-                            -- and the replace warning below.
+                            -- Simulate the write once: drives the rejoin match test,
+                            -- the toggle-off check, and the replace warning below.
                             local temp = {}
                             if ctx.write then ctx.write(temp, val) end
                             local scopeT
@@ -8283,6 +8450,25 @@ initFrame:SetScript("OnEvent", function(self)
                                 end
                                 if own ~= nil then scopeActive = true end
                                 if own ~= temp[k] then valuesMatch = false end
+                            end
+                            -- On an EXCLUDED spell the flyout sits on the bar's own value,
+                            -- so Apply to Bar / All Specs here means "rejoin the bar" -- the
+                            -- same as Include This Spell. Do that instead of re-applying the
+                            -- value already on the bar (which would just toggle it off).
+                            -- For a scalar popup value (Threshold Seconds) the flyout item is
+                            -- a fixed identifier, not the bar's number, so "sits on the bar's
+                            -- value" is only true when the entered number actually matches
+                            -- this scope's value -- rejoin then (keeps the bar apply for other
+                            -- spells); otherwise fall through and push the new number, which
+                            -- rejoining would silently discard.
+                            if AB.KeysBarApplied(keys) and AB.SpellHasOwn(keys)
+                               and (not ctx.scalarApply or (scopeActive and valuesMatch)) then
+                                AB.IncludeSpell(keys)
+                                if ns.RefreshCDMIconAppearance then ns.RefreshCDMIconAppearance(barKey) end
+                                if ns.QueueReanchor then ns.QueueReanchor() end
+                                if ctx.refresh then ctx.refresh() end
+                                if s._updateActive then s._updateActive() end
+                                return
                             end
                             -- Toggle OFF: clicking a scope that already holds this
                             -- exact value un-applies it. Binary toggles un-apply on
@@ -8746,7 +8932,13 @@ initFrame:SetScript("OnEvent", function(self)
                                     -- tracks the bar's value, never the spell's override). Settings
                                     -- with no bar apply show it on everything. "+ " toggles are never
                                     -- OR, so they keep it.
-                                    local suppressStrip = canApply and not (isChargeToggle or isActiveBorder or isFnToggle)
+                                    -- A scalar popup value (Threshold Seconds) has only one
+                                    -- item, so "the bar's value differs from this item" is
+                                    -- meaningless -- never suppress it, or Apply-to-Bar
+                                    -- vanishes the moment the entered number differs from the
+                                    -- bar's.
+                                    local suppressStrip = canApply and not item.scalarApply
+                                        and not (isChargeToggle or isActiveBorder or isFnToggle)
                                         and AB.KeysBarApplied(applyKeys) and not itemIsBarApplied()
                                     if suppressStrip then
                                         if menu._applyStrip then menu._applyStrip:Hide() end
@@ -8754,6 +8946,7 @@ initFrame:SetScript("OnEvent", function(self)
                                         AB.ShowApplyStripFor(si, {
                                             keys  = applyKeys,
                                             write = applyWrite,
+                                            scalarApply = item.scalarApply,
                                             isToggle = isChargeToggle or isActiveBorder or isFnToggle,
                                             -- Toggles: "Apply to Bar" ENABLES the feature
                                             -- on the bar (apply true). Disabling is the
@@ -9162,6 +9355,15 @@ initFrame:SetScript("OnEvent", function(self)
                         end
                         local TT_ITEMS = {
                             { val = "seconds", label = "Threshold Seconds",
+                              -- Scalar popup value (not a discrete flyout choice): the
+                              -- number lives in the store, entered via a popup, and
+                              -- applyWrite pushes the spell's current seconds live. The
+                              -- Apply-to-Bar strip must treat it as "always push my
+                              -- value", never as a discrete value item -- otherwise the
+                              -- rejoin shortcut discards the entered number and the
+                              -- suppress-strip rule hides the strip whenever the bar's
+                              -- number differs (see scalarApply guards below).
+                              scalarApply = true,
                               dynamicLabel = function()
                                   local base = EllesmereUI.L("Threshold Seconds")
                                   local s = armedSeconds()
@@ -13247,17 +13449,42 @@ initFrame:SetScript("OnEvent", function(self)
                     end
                     if dragMode == "swap" then
                         if insertIdx ~= dragIdx then
-                            if isDefBuffs then ns.SwapBuffDisplayOrder(dragIdx, insertIdx)
-                            else ns.SwapTrackedSpells(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(insertIdx)) end
-                            didChange = true
+                            if isDefBuffs then
+                                -- Slot -> stable-key translation: buffDisplayOrder
+                                -- keeps absent (talent-gapped) keys in place, so
+                                -- slot indices cannot address it directly.
+                                local sk = pf._buffSlotKeys
+                                if sk and ns.SwapBuffDisplayKeys
+                                   and ns.SwapBuffDisplayKeys(sk[dragIdx], sk[insertIdx]) then
+                                    didChange = true
+                                end
+                            else
+                                ns.SwapTrackedSpells(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(insertIdx))
+                                didChange = true
+                            end
                         end
                     else
                         local toIdx = insertIdx
                         if toIdx > dragIdx then toIdx = toIdx - 1 end
                         if toIdx ~= dragIdx then
-                            if isDefBuffs then ns.MoveBuffDisplayOrder(dragIdx, toIdx)
-                            else ns.MoveTrackedSpell(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(toIdx)) end
-                            didChange = true
+                            if isDefBuffs then
+                                local sk = pf._buffSlotKeys
+                                if sk and ns.MoveBuffDisplayKey then
+                                    -- Final rendered position toIdx = insert before
+                                    -- the key at toIdx among the OTHER rendered keys
+                                    -- (nil past the end = append after everything).
+                                    local rk, n = {}, 0
+                                    for i = 1, #sk do
+                                        if i ~= dragIdx then n = n + 1; rk[n] = sk[i] end
+                                    end
+                                    if ns.MoveBuffDisplayKey(sk[dragIdx], rk[toIdx]) then
+                                        didChange = true
+                                    end
+                                end
+                            else
+                                ns.MoveTrackedSpell(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(toIdx))
+                                didChange = true
+                            end
                         end
                     end
 
@@ -13338,11 +13565,11 @@ initFrame:SetScript("OnEvent", function(self)
                 local sdDrag = ns.GetBarSpellData(bd.key)
                 local si = self._slotIdx
                 if bd.key == "buffs" then
-                    -- Default bar: order lives in buffDisplayOrder (seeded on drop).
-                    -- A slot is draggable if it shows a spell (_previewSpellID set)
-                    -- or already maps to a stored order entry.
-                    local order = sdDrag and sdDrag.buffDisplayOrder
-                    if not self._previewSpellID and not (order and order[si]) then return end
+                    -- Default bar: a slot is draggable if it renders a buff
+                    -- (_previewSpellID / a rendered stable key). buffDisplayOrder
+                    -- is NOT indexed by slot -- it keeps absent keys in place.
+                    if not self._previewSpellID
+                       and not (pf._buffSlotKeys and pf._buffSlotKeys[si]) then return end
                 else
                     local t = sdDrag and sdDrag.assignedSpells or {}
                     local di = BuffDataIdx(si)
@@ -13398,7 +13625,9 @@ initFrame:SetScript("OnEvent", function(self)
                     if tBd then
                         local sdT = ns.GetBarSpellData(tBd.key)
                         if tBd.key == "buffs" then
-                            if sdT and sdT.buffDisplayOrder then tCount = #sdT.buffDisplayOrder end
+                            -- Rendered slot count, NOT #buffDisplayOrder: the stored
+                            -- order keeps absent keys and can exceed what is shown.
+                            if pf._buffSlotKeys then tCount = #pf._buffSlotKeys end
                         elseif sdT and sdT.assignedSpells then
                             tCount = #sdT.assignedSpells
                         end
@@ -13670,6 +13899,7 @@ initFrame:SetScript("OnEvent", function(self)
             -- stable spellID, never the live aura GetSpellID (secret/variant-drift).
             local trackedCd
             pf._buffDispGroups = nil
+            pf._buffSlotKeys = nil
             if bd.key == "buffs" then
                 if ns.ReconcileBuffDisplayOrder then ns.ReconcileBuffDisplayOrder() end
                 local entries = ns.CollectDefaultBuffTrackEntries
@@ -13686,13 +13916,19 @@ initFrame:SetScript("OnEvent", function(self)
                 else
                     for _, e in ipairs(entries) do finalKeys[#finalKeys + 1] = e.key end
                 end
+                -- Rendered slot i <-> stable key map for the drag/reorder code:
+                -- absent (talent-gapped) keys stay in buffDisplayOrder but render
+                -- no slot, so slot indices cannot address the array directly.
+                local slotKeys = {}
                 for _, key in ipairs(finalKeys) do
                     local e = byKey[key]
                     if e then
                         tracked[#tracked + 1] = e.sid
                         trackedCd[#tracked] = e.cdID
+                        slotKeys[#tracked] = key
                     end
                 end
+                pf._buffSlotKeys = slotKeys
                 local snap = {}
                 for i = 1, #finalKeys do snap[i] = finalKeys[i] end
                 pf._buffTrackedOrder = snap
@@ -15393,6 +15629,134 @@ initFrame:SetScript("OnEvent", function(self)
                 },
             })
             MakeCogBtn(rgn, oocCogShow, ctrl, EllesmereUI.COGS_ICON)
+        end
+
+        -- Max Icons + Overflow To: excess icons (beyond Max, the tail of this
+        -- bar's order) render on the target bar for the session. Identity,
+        -- per-spell settings and the options preview stay on this bar.
+        -- Legacy profiles carry nil barType on default bars -- resolve the
+        -- family via the shared helper, never the raw field.
+        local ofBarType = ns.GetBarType and ns.GetBarType(barData) or barData.barType
+        local isOverflowBar = (ofBarType == "cooldowns" or ofBarType == "utility")
+            and not barData.isGhostBar
+            and barData.key ~= (ns.FOCUSKICK_BAR_KEY or "focuskick")
+        if isOverflowBar then
+            local function OverflowShiftBlocked()
+                return (ns.CdmBarHasShiftCdState and ns.CdmBarHasShiftCdState(BD().key)) or false
+            end
+            -- A bar may not BOTH receive overflow and have its own overflow
+            -- config: incoming icons ignore the recipient's cap and never
+            -- chain onward, so a cap on a recipient would promise behavior
+            -- that does not exist. Recipient = ANY bar (enabled or not --
+            -- re-enabling must not create the forbidden state) with an
+            -- active cap+target pair pointing here.
+            local function BarIsOverflowRecipient(key)
+                local pp = DB()
+                if not (pp and pp.cdmBars) then return false end
+                for _, b in ipairs(pp.cdmBars.bars) do
+                    if b.key ~= key and b.maxIcons and b.maxIcons > 0
+                       and b.overflowTarget == key then
+                        return true
+                    end
+                end
+                return false
+            end
+            local ofVals, ofOrder = { [""] = "None" }, { "" }
+            do
+                local pp = DB()
+                if pp and pp.cdmBars then
+                    for _, b in ipairs(pp.cdmBars.bars) do
+                        local bt = ns.GetBarType and ns.GetBarType(b) or b.barType
+                        -- Bars with their own active overflow config are not
+                        -- offered as targets (the recipient rule, other door).
+                        local hasOwnOverflow = b.maxIcons and b.maxIcons > 0 and b.overflowTarget ~= nil
+                        if b.key ~= barData.key and not b.isGhostBar
+                           and b.key ~= (ns.FOCUSKICK_BAR_KEY or "focuskick")
+                           and b.key ~= "buffs"
+                           and bt ~= "buffs" and bt ~= "custom_buff"
+                           and not hasOwnOverflow then
+                            ofVals[b.key] = EllesmereUI.L(b.name or b.key)
+                            ofOrder[#ofOrder + 1] = b.key
+                        end
+                    end
+                    -- A stored target that the filter (or a bar delete) now
+                    -- excludes still displays -- and can be cleared -- rather
+                    -- than masquerading as "None" while active at runtime
+                    -- (pre-rule configs keep working under no-chaining).
+                    local cur = barData.overflowTarget
+                    if cur and not ofVals[cur] then
+                        local curName = cur
+                        for _, b in ipairs(pp.cdmBars.bars) do
+                            if b.key == cur then curName = b.name or cur; break end
+                        end
+                        ofVals[cur] = EllesmereUI.L(curName)
+                        ofOrder[#ofOrder + 1] = cur
+                    end
+                end
+            end
+            _, h = W:DualRow(parent, y,
+                { type="slider", text="Max Icons (0 = Off)",
+                  min=0, max=20, step=1,
+                  -- A blocked bar with a value already set can still lower/
+                  -- clear it -- a disabled control must never trap an
+                  -- existing value on.
+                  disabled=function()
+                      local b = BD()
+                      return (OverflowShiftBlocked() or BarIsOverflowRecipient(b.key))
+                          and not (b.maxIcons and b.maxIcons > 0)
+                  end,
+                  disabledTooltip=function()
+                      if BarIsOverflowRecipient(BD().key) then
+                          return "Not available while another bar overflows into this bar"
+                      end
+                      return "Not available while a spell on this bar uses a Cooldown State Shift Icons setting"
+                  end,
+                  rawTooltip=true,
+                  getValue=function() return BD().maxIcons or 0 end,
+                  setValue=function(v)
+                      if v == 0 then v = nil end
+                      BD().maxIcons = v
+                      ns.BuildAllCDMBars(); Refresh(); UpdateCDMPreviewAndResize()
+                      C_Timer.After(0, function() EllesmereUI:RefreshPage() end)
+                  end },
+                { type="dropdown", text="Overflow To",
+                  values=ofVals, order=ofOrder,
+                  -- Recipient bars cannot pick a fresh target (third door);
+                  -- one with a stale target set stays enabled so it can be
+                  -- cleared back to None.
+                  disabled=function()
+                      local b = BD()
+                      return OverflowShiftBlocked()
+                          or (BarIsOverflowRecipient(b.key) and not b.overflowTarget)
+                          or not (b.maxIcons and b.maxIcons > 0)
+                  end,
+                  -- Tooltip priority: recipient block, then the plain Max
+                  -- Icons requirement. The Shift Icons message only shows
+                  -- when it is the ACTUAL blocker (Max Icons already above 0
+                  -- but a spell carries a shift cooldown-state setting) --
+                  -- most users never touch that setting, so the default
+                  -- tooltip stays basic.
+                  disabledTooltip=function()
+                      local b = BD()
+                      if BarIsOverflowRecipient(b.key) then
+                          return "Not available while another bar overflows into this bar"
+                      end
+                      if not (b.maxIcons and b.maxIcons > 0) then
+                          return "Requires Max Icons to be above 0"
+                      end
+                      return "Not available while a spell on this bar uses a Cooldown State Shift Icons setting"
+                  end,
+                  rawTooltip=true,
+                  getValue=function()
+                      local t = BD().overflowTarget
+                      if t and ofVals[t] then return t end
+                      return ""
+                  end,
+                  setValue=function(v)
+                      if v == "" then v = nil end
+                      BD().overflowTarget = v
+                      ns.BuildAllCDMBars(); Refresh(); UpdateCDMPreviewAndResize()
+                  end });  y = y - h
         end
 
         -- Hide Buffs When Inactive (global setting, applies to all buff bars)

@@ -383,6 +383,25 @@ local playerFriendlySpell = FRIENDLY_SPELL_BY_CLASS[playerClassToken]
 -- Rendered as a white border matching the hover highlight style.
 local THREAT_ACTIVE = { [2] = true, [3] = true }
 
+-- Combat indicator media + class sprite coords (shared with the Unit Frames
+-- combat icon assets). Kept on `ns` to avoid the Lua 5.1 chunk local cap.
+ns._COMBAT_MEDIA = "Interface\\AddOns\\EllesmereUI\\media\\combat\\"
+ns._COMBAT_CLASS_COORDS = {
+    WARRIOR     = { 0,     0.125, 0,     0.125 },
+    MAGE        = { 0.125, 0.25,  0,     0.125 },
+    ROGUE       = { 0.25,  0.375, 0,     0.125 },
+    DRUID       = { 0.375, 0.5,   0,     0.125 },
+    EVOKER      = { 0.5,   0.625, 0,     0.125 },
+    HUNTER      = { 0,     0.125, 0.125, 0.25  },
+    SHAMAN      = { 0.125, 0.25,  0.125, 0.25  },
+    PRIEST      = { 0.25,  0.375, 0.125, 0.25  },
+    WARLOCK     = { 0.375, 0.5,   0.125, 0.25  },
+    PALADIN     = { 0,     0.125, 0.25,  0.375 },
+    DEATHKNIGHT = { 0.125, 0.25,  0.25,  0.375 },
+    MONK        = { 0.25,  0.375, 0.25,  0.375 },
+    DEMONHUNTER = { 0.375, 0.5,   0.25,  0.375 },
+}
+
 -------------------------------------------------------------------------------
 --  Default settings
 -------------------------------------------------------------------------------
@@ -429,6 +448,11 @@ local defaults = {
             players   = {},       -- manually added names (hotkey toggle)
             extraWidth  = 0,      -- size offset on top of the raid frame size
             extraHeight = 0,
+            wrapAfter = 0,        -- Free Move frames per row/column; 0 = single line
+            -- growDirection / wrapDirection / freeRect are optional keys (no
+            -- defaults): unset, growth derives from freeHorizontal, wrap from
+            -- the perpendicular default, and anchoring from freePos. See
+            -- XF.GrowInfo / XF.FreeAnchor.
         },
 
         -- Position (saved by unlock mode)
@@ -461,6 +485,9 @@ local defaults = {
         powerShowForHealer = true,
         powerShowForTank   = true,
         powerShowForDPS    = false,
+        -- Uniform Icon Anchoring: icons/text anchor as if no power bar existed,
+        -- so frames with and without a per-role power bar line up identically.
+        powerUniformAnchors = false,
 
         -- Top Name Bar (reserves height from the TOP of the frame, the way the
         -- power bar reserves from the bottom; shows the unit name in a dedicated
@@ -588,6 +615,15 @@ local defaults = {
         leaderIconSize   = 14,
         leaderIconOffsetX  = 0,
         leaderIconOffsetY  = 0,
+        -- Combat icon: shown on members who are in combat (M+ skip awareness)
+        showCombatIndicator = false,
+        combatIndicatorStyle = "standard",   -- standard/class/combat0..5 (none handled by showCombatIndicator)
+        combatIndicatorColor = "custom",      -- custom/classcolor (standard/class styles only)
+        combatIndicatorCustomColor = { r = 1, g = 0.2, b = 0.2 },
+        combatIndicatorSize  = 16,
+        combatIndicatorPosition = "right",
+        combatIndicatorOffsetX = 0,
+        combatIndicatorOffsetY = 0,
         statusTextPosition = "center",
         statusTextOffsetX  = 0,
         statusTextOffsetY  = 0,
@@ -688,6 +724,7 @@ local defaults = {
         -- simple buff grid (all of the active spec's tracked buffs, in a grid).
         bmSimple = {
             showBuffs       = true,
+            ownOnly         = true,
             maxBuffs        = 8,
             iconsPerRow     = 4,
             position        = "topright",
@@ -810,8 +847,9 @@ local allButtons     = {}   -- flat list of all created buttons
 local unitToButton   = {}   -- unitToken -> button map (rebuilt on roster change)
 ns._raidUnitToButton = unitToButton  -- ns alias for Targeted Spells (same table:
                             -- rebuilds wipe it in place, never replace it)
-ns._xfUnitToButton   = {}   -- unitToken -> Extra Frames duplicate (max 5; owned
-                            -- by XF_Apply, never written by the rebuild paths)
+ns._xfUnitToButton   = {}   -- unitToken -> Extra Frames duplicate (bounded by
+                            -- XF.CAP; owned by XF_Apply, never written by
+                            -- the rebuild paths)
 local separatedHdrs  = {}   -- [1..8] group headers
 local containerFrame = nil  -- top-level positioning frame
 ns._flatButtons      = {}   -- buttons owned by the flat (merged) header
@@ -1189,6 +1227,24 @@ end
 -------------------------------------------------------------------------------
 local function IsPowerBarEnabled(s)
     return s.powerShowForHealer or s.powerShowForTank or s.powerShowForDPS
+end
+
+-- Uniform Icon Anchoring (powerUniformAnchors): decoration anchor host for a
+-- health bar. Returns the full-height reference stamped on the bar at creation
+-- (_euiUniformRef spans where the bar would sit with NO power bar) when the
+-- toggle is on, so per-role power bars never shift icons/text between frames.
+-- Health-bar visuals (fills, absorbs, dispel overlays) keep the real bar.
+function ns.RF_AnchorHost(health, s)
+    local ref = health and health._euiUniformRef
+    if ref and s and s.powerUniformAnchors then return ref end
+    return health
+end
+
+-- Live-render convenience: resolves the button's settings source (party/extra
+-- proxies) before delegating to ns.RF_AnchorHost.
+function ns.RF_AnchorHostFor(d)
+    local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+    return ns.RF_AnchorHost(d.health, s)
 end
 
 -- Resolve a unit's role for POWER-BAR gating. UnitGroupRolesAssigned returns
@@ -2866,6 +2922,18 @@ local function StyleButton(button)
     health:SetValue(100)
     d.health = health
 
+    -- Full-height anchor reference for Uniform Icon Anchoring: top tracks the
+    -- health bar (so the Top Name Bar inset carries over), bottom pins to the
+    -- button, i.e. exactly where the health bar sits when no power bar shows.
+    -- ns.RF_AnchorHost swaps decorations onto it; _euiHealth points back for
+    -- the few sites that must hug the real bar (full-overlay BM bars).
+    d.uniformRef = CreateFrame("Frame", nil, button)
+    d.uniformRef:SetFrameLevel(health:GetFrameLevel())
+    d.uniformRef:SetPoint("TOPLEFT", health, "TOPLEFT", 0, 0)
+    d.uniformRef:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 0, 0)
+    health._euiUniformRef = d.uniformRef
+    d.uniformRef._euiHealth = health
+
     -- Power bar (ALWAYS created, anchored to button bottom for pixel alignment).
     -- Created HIDDEN and decoupled from the role toggles: UpdateButton's per-role
     -- gate shows it + fills it for power-wanting units. Creating it unconditionally
@@ -3044,6 +3112,7 @@ local function StyleButton(button)
 
     local function AnchorDispelIcon()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         dispelIcon:ClearAllPoints()
         local sz = s.dispelIconSize or 16
         dispelIcon:SetSize(sz, sz)
@@ -3097,6 +3166,7 @@ local function StyleButton(button)
 
     local function AnchorHealthText()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         healthFS:ClearAllPoints()
         local pos = s.healthTextPosition or "center"
         local ox = s.healthTextOffsetX or 0
@@ -3145,6 +3215,7 @@ local function StyleButton(button)
     d.healAbsorbText = healAbsorbFS
     local function AnchorHealAbsorbText()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         ns.AnchorRFText(healAbsorbFS, health, s.healAbsorbTextPosition or "center",
             s.healAbsorbTextOffsetX or 0, s.healAbsorbTextOffsetY or 0, (s.frameWidth or 72) * 0.75)
     end
@@ -3162,6 +3233,7 @@ local function StyleButton(button)
 
     local function AnchorStatusText()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         statusFS:ClearAllPoints()
         local pos = s.statusTextPosition or "center"
         local ox = s.statusTextOffsetX or 0
@@ -3203,6 +3275,7 @@ local function StyleButton(button)
 
     local function AnchorRoleIcon()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         roleIcon:ClearAllPoints()
         -- The position key (topleft/top/topright/left/center/right/bottomleft/
         -- bottom/bottomright) uppercases directly to a valid anchor point, so all
@@ -3235,7 +3308,7 @@ local function StyleButton(button)
     local liSz = PixelSnap(s.leaderIconSize or 14)
     leaderIcon:SetSize(liSz, liSz)
     local liPos = (s.leaderIconPosition or "top"):upper()
-    leaderIcon:SetPoint(liPos, health, liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
+    leaderIcon:SetPoint(liPos, ns.RF_AnchorHost(health, s), liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
     leaderIcon:Hide()
     d.leaderIcon = leaderIcon
 
@@ -3249,6 +3322,7 @@ local function StyleButton(button)
 
     local function AnchorRaidMarker()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         raidMarker:ClearAllPoints()
         local pos = s.raidMarkerPosition or "center"
         local ox = s.raidMarkerOffsetX or 0
@@ -3284,6 +3358,7 @@ local function StyleButton(button)
 
     local function AnchorReadyCheck()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         readyCheck:ClearAllPoints()
         local pos = s.readyCheckPosition or "center"
         local ox = s.readyCheckOffsetX or 0
@@ -3310,6 +3385,24 @@ local function StyleButton(button)
     end
     AnchorReadyCheck()
     d.AnchorReadyCheck = AnchorReadyCheck
+
+    -- Combat icon (on the marker carrier, above the border). Shows for members
+    -- currently affecting combat; the 9-position anchor mirrors the role icon.
+    local combatIcon = markerCarrier:CreateTexture(nil, "OVERLAY", nil, 1)
+    local ciSz = PixelSnap(s.combatIndicatorSize or 16)
+    combatIcon:SetSize(ciSz, ciSz)
+    combatIcon:Hide()
+    d.combatIcon = combatIcon
+
+    local function AnchorCombatIcon()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
+        combatIcon:ClearAllPoints()
+        local pos = (s.combatIndicatorPosition or "right"):upper()
+        combatIcon:SetPoint(pos, health, pos, s.combatIndicatorOffsetX or 0, s.combatIndicatorOffsetY or 0)
+    end
+    AnchorCombatIcon()
+    d.AnchorCombatIcon = AnchorCombatIcon
 
     -- Debuff icons (pre-created, anchored dynamically)
     d.debuffIcons = {}
@@ -3442,6 +3535,7 @@ local function StyleButton(button)
     local _dispOpts = {}
     local function AnchorDebuffs(visibleCount)
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         local total = visibleCount or #d.debuffIcons
         local baseSz = s.debuffSize or 18
 
@@ -3556,6 +3650,7 @@ local function StyleButton(button)
     -- to dynamically center the row based on how many are actually shown.
     local function AnchorDefensives(visibleCount)
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         local pos = s.defPosition or "center"
         local ox = s.defOffsetX or 0
         local oy = s.defOffsetY or 0
@@ -3617,6 +3712,7 @@ local function StyleButton(button)
     -- text alignment within the bounded region.
     local function AnchorNameText()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        local health = ns.RF_AnchorHost(health, s)   -- Uniform Icon Anchoring host swap
         -- Text band level, re-applied on every reload; BEFORE the name-hidden
         -- early return because health text shares this carrier. Default sits
         -- under the aura band (ns.LVL_TEXT); the "Show Above Icons" opt-in
@@ -3700,6 +3796,11 @@ local function StyleButton(button)
     -- the old frame layering: hover (highest) > target > normal.
     local function ApplyBorderColor()
         if not (PP and d.borderFrame) then return end
+        -- Re-called on hover/target changes long after StyleButton: resolve
+        -- LIVE (see the LiveS note above) so party overrides and profile
+        -- swaps are honored -- the captured raid `s` goes stale (same fix as
+        -- UpdatePowerBorder below).
+        local s = LiveS()
         if (s.borderSize or 1) <= 0 then return end
         local r, g, b, a
         local raised = false
@@ -3725,6 +3826,9 @@ local function StyleButton(button)
     -- frame; otherwise it sits above at +8 (unchanged from the old layering).
     local function UpdateBorder()
         if not (PP and d.borderFrame) then return end
+        -- Re-called from ReloadFrames/ReloadPartyFrames long after StyleButton:
+        -- resolve LIVE (see the LiveS note above), same fix as UpdatePowerBorder.
+        local s = LiveS()
         local bs = s.borderSize or 1
         local bc = s.borderColor or { r = 0, g = 0, b = 0 }
         local texKey = s.borderTexture or "solid"
@@ -3745,6 +3849,11 @@ local function StyleButton(button)
         -- (StyleButton tail, ReloadFrames, ReloadPartyFrames) must not draw a
         -- border over a hidden bar. UpdateButton calls this AFTER power:Show().
         if not PP or not d.powerBorderFrame or (d.power and not d.power:IsShown()) then return end
+        -- Stored on `d` and re-called long after StyleButton, so resolve the
+        -- settings source LIVE (see the LiveS note above): the captured raid
+        -- `s` never sees party_ overrides on party frames and goes stale the
+        -- moment db.profile is reassigned by a profile swap.
+        local s = LiveS()
         local style = s.powerBorderStyle or "eui"
         if style == "eui" then
             -- EUI style: 1px divider, white at 20% opacity
@@ -4048,6 +4157,56 @@ ns._UpdateLeaderIcon = function(d, s, unit)
 end
 
 -------------------------------------------------------------------------------
+--  Combat icon show/hide decision. Shows for group members who are currently
+--  affecting combat (M+ skip awareness). Driven by UpdateButton and the
+--  lightweight ns._UpdateCombatIcons updater (UNIT_FLAGS / regen transitions).
+--  Texture Show/Hide is combat-legal. (Lives on ns to respect the chunk local
+--  cap.)
+-------------------------------------------------------------------------------
+ns._UpdateCombatIcon = function(d, s, unit)
+    local icon = d.combatIcon
+    if not icon then return end
+    if not s.showCombatIndicator then icon:Hide(); return end
+    local c = UnitAffectingCombat(unit)
+    if issecretvalue(c) or not c then icon:Hide(); return end
+
+    local EllesmereUI = ns.EllesmereUI
+    local style = s.combatIndicatorStyle or "standard"
+    local MEDIA = ns._COMBAT_MEDIA
+    if style:find("^combat%d") then
+        icon:SetTexture(MEDIA .. style .. ".tga")
+        icon:SetTexCoord(0, 1, 0, 1)
+        if icon.SetDesaturated then icon:SetDesaturated(false) end
+        icon:SetVertexColor(1, 1, 1, 1)
+    else
+        local classToken = d.classToken
+        if not classToken then local _, ct = UnitClass(unit); classToken = ct end
+        if classToken and issecretvalue(classToken) then classToken = nil end
+        if style == "class" then
+            icon:SetTexture(MEDIA .. "combat-indicator-class-custom.png")
+            local coords = classToken and ns._COMBAT_CLASS_COORDS[classToken]
+            if coords then
+                icon:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+            else
+                icon:SetTexCoord(0, 1, 0, 1)
+            end
+        else
+            icon:SetTexture(MEDIA .. "combat-indicator-custom.png")
+            icon:SetTexCoord(0, 1, 0, 1)
+        end
+        local colorMode = s.combatIndicatorColor or "custom"
+        if colorMode == "classcolor" then
+            local cc = (classToken and EllesmereUI.GetClassColor and EllesmereUI.GetClassColor(classToken)) or { r = 1, g = 1, b = 1 }
+            icon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+        else
+            local cc = s.combatIndicatorCustomColor or { r = 1, g = 1, b = 1 }
+            icon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+        end
+    end
+    icon:Show()
+end
+
+-------------------------------------------------------------------------------
 --  Update all visual elements for a single button
 -------------------------------------------------------------------------------
 local function UpdateButton(button)
@@ -4281,6 +4440,9 @@ local function UpdateButton(button)
 
     -- Leader/assistant icon (honors the "Show In Combat" cog)
     ns._UpdateLeaderIcon(d, s, unit)
+
+    -- Combat icon (members currently in combat)
+    ns._UpdateCombatIcon(d, s, unit)
 
     -- Raid marker
     if d.raidMarker then
@@ -5287,7 +5449,7 @@ local function RegisterPrivateAuraSlots(button, unit)
     end
 
     local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
-    local health = d.health
+    local health = ns.RF_AnchorHost(d.health, s)
     if not health then return end
     local sz = s.paSize or 18
     local showCD = s.paShowCountdown ~= false
@@ -5893,6 +6055,65 @@ ns._UpdateLeaderIcons = function()
     for unit, btn in pairs(unitToButton) do updateLeader(unit, btn) end
     for unit, btn in pairs(ns._partyUnitToButton) do updateLeader(unit, btn) end
     for unit, btn in pairs(ns._xfUnitToButton) do updateLeader(unit, btn) end
+end
+
+-- Lightweight: only refresh combat icons on each button. Driven by UNIT_FLAGS
+-- (per-unit combat flag flips) and combat transitions. Texture Show/Hide is
+-- combat-legal, so this is safe to run from PLAYER_REGEN_DISABLED.
+ns._UpdateCombatIcons = function()
+    local function updateCombat(unit, btn)
+        local d = GetFFD(btn)
+        if not d.combatIcon then return end
+        local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+        ns._UpdateCombatIcon(d, s, unit)
+    end
+    for unit, btn in pairs(unitToButton) do updateCombat(unit, btn) end
+    for unit, btn in pairs(ns._partyUnitToButton) do updateCombat(unit, btn) end
+    for unit, btn in pairs(ns._xfUnitToButton) do updateCombat(unit, btn) end
+end
+
+-- Single-unit combat icon refresh for UNIT_FLAGS routing (raid + party).
+ns._UpdateCombatIconFor = function(unit, btn)
+    local d = GetFFD(btn)
+    if not d.combatIcon then return end
+    local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+    ns._UpdateCombatIcon(d, s, unit)
+end
+
+-- True when the combat icon is enabled anywhere (raid or effective party). Used
+-- to skip all combat-icon work while the feature is off.
+ns._CombatIconEnabled = function()
+    if not (db and db.profile) then return false end
+    if db.profile.showCombatIndicator then return true end
+    if ns._partyProxy.showCombatIndicator then return true end
+    return false
+end
+
+-- Register UNIT_FLAGS on the per-unit trackers ONLY while the combat icon is
+-- enabled (raid uses its own key; party its effective key). When the option is
+-- off, no tracker listens for UNIT_FLAGS, so the disabled feature runs no event
+-- code at all. Event (un)registration is combat-legal. Extra Frames trackers
+-- are gated separately inside XF_Apply. Called from ReloadFrames and once after
+-- the trackers are built.
+ns.UpdateCombatEventRegistration = function()
+    if not (db and db.profile) then return end
+    local raidWant  = db.profile.showCombatIndicator and true or false
+    local partyWant = ns._partyProxy.showCombatIndicator and true or false
+    for unit, tracker in pairs(unitTrackers) do
+        local want
+        if unit == "player" then
+            want = raidWant or partyWant
+        elseif unit:find("^party%d") then
+            want = partyWant
+        else
+            want = raidWant
+        end
+        if want then
+            tracker:RegisterUnitEvent("UNIT_FLAGS", unit)
+        else
+            tracker:UnregisterEvent("UNIT_FLAGS")
+        end
+    end
 end
 
 -- Lightweight: health-only update for UNIT_HEALTH / UNIT_MAXHEALTH.
@@ -6588,6 +6809,9 @@ FB.Anchor = function(owner)
         -- No usable group header: fall through to the free position.
     end
 
+    -- Owner-specific free anchoring (Extra Frames pins the grid's growth
+    -- corner so the group grows away from it); legacy CENTER pin otherwise.
+    if owner.FreeAnchor and owner.FreeAnchor(c, fb) then return end
     local p = fb.freePos or {}
     c:SetPoint("CENTER", UIParent, "CENTER", p.x or 100, p.y or 0)
 end
@@ -6712,6 +6936,8 @@ FB.SetMoverShown = function(owner, show, frameName, labelText)
                     }
                 end
             end
+            -- Corner-pinned owners also capture the dropped rect
+            if owner.SaveFreeRect then owner.SaveFreeRect(self) end
             FB.Anchor(owner)
         end)
         owner.mover = m
@@ -6723,8 +6949,15 @@ FB.SetMoverShown = function(owner, show, frameName, labelText)
 
     owner.mover:SetSize(owner.container:GetWidth(), owner.container:GetHeight())
     owner.mover:ClearAllPoints()
-    local p = (owner.Settings() or {}).freePos or {}
-    owner.mover:SetPoint("CENTER", UIParent, "CENTER", p.x or 100, p.y or 0)
+    local oset = owner.Settings() or {}
+    if owner.FreeAnchor and oset.freeRect then
+        -- Corner-pinned owners: mirror the container's placement exactly so
+        -- the overlay always covers the live grid (FB.Anchor just ran above).
+        owner.mover:SetPoint("CENTER", owner.container, "CENTER")
+    else
+        local p = oset.freePos or {}
+        owner.mover:SetPoint("CENTER", UIParent, "CENTER", p.x or 100, p.y or 0)
+    end
     owner.mover:Show()
 end
 
@@ -6794,9 +7027,13 @@ end -- FB scope block
 
 -------------------------------------------------------------------------------
 --  Extra Frames (raid only)
---  Up to five 1:1 duplicate frames for chosen raid members: the raid's tanks
---  (Show Tanks toggle) plus players toggled in with a hotkey while hovering
---  their raid frame. Each duplicate is built through the SAME StyleButton
+--  1:1 duplicate frames for chosen raid members: the raid's tanks (Show
+--  Tanks toggle) plus players toggled in with a hotkey while hovering their
+--  raid frame. Holds up to XF.CAP members: attached positions stack them in
+--  group-sized runs of 5 like additional raid groups; Free Move lays them
+--  out on its own grow/wrap axes with optional row/column wrapping and a
+--  growth-corner pin (XF.GrowInfo / XF.FreeAnchor). Each duplicate is built
+--  through the SAME StyleButton
 --  pipeline as the real header children -- power bar, absorbs, auras,
 --  defensives, dispel visuals, private auras, BM indicators, role/leader/
 --  marker icons, click-cast, ping -- and joins allButtons so every bulk
@@ -6809,7 +7046,7 @@ end -- FB scope block
 --  assigned unit, mirroring the central hub's per-unit reactions, and the
 --  duplicates live in ns._xfUnitToButton which the broadcast passes (target
 --  border, raid markers, range seed/refine, ghost-aura sweep) also iterate.
---  Cost is bounded to the <=5 duplicated units and is zero when inactive
+--  Cost is bounded to the duplicated units and is zero when inactive
 --  (no registrations, empty map). Container position via the shared
 --  FB.Anchor; unit assignment is OOC attribute writes, dirty-deferred
 --  through combat. Excluded from preview and unlock mode like FB.
@@ -6831,20 +7068,91 @@ XF.ShouldBeActive = function()
     return set.showTanks or #(set.players or {}) > 0
 end
 
--- Ordered raid units to duplicate (max 5): tanks in roster order first (when
--- Show Tanks is on), then the manually added names that are currently in the
--- raid. Names are stored and matched in GetRaidRosterInfo's format on both
--- sides so realm suffixes always agree; names not in the roster are skipped
--- but kept in the list (they reappear when that player rejoins).
+-- Hard selection bound (internal, no user setting): enough for a full
+-- mythic roster's worth of duplicates while keeping the per-unit event
+-- mirroring bounded.
+XF.CAP = 20
+
+-- Effective growth axes: primary run direction + perpendicular wrap
+-- direction. Attached modes stack group-sized runs of 5 exactly like
+-- additional raid groups: units along the raid unit growth, each full run
+-- slotting further out along the group growth axis, extending AWAY from the
+-- raid ("left" attaches before the first group, so runs extend against the
+-- group growth there). Free Move reads the Grow Direction setting, falling
+-- back to the legacy Horizontal toggle, and wraps new rows/columns along
+-- Wrap Direction. Wrap values that are not perpendicular to the primary run
+-- (stale after a direction change, or a parallel group growth) fall back to
+-- the default.
+XF.GrowInfo = function(set, s)
+    local grow, wrap
+    if set and set.position == "free" then
+        grow = set.growDirection or (set.freeHorizontal and "RIGHT" or "DOWN")
+        wrap = set.wrapDirection
+    else
+        grow = (s and s.unitGrowth) or "DOWN"
+        wrap = (s and s.groupGrowth) or "RIGHT"
+        if set and set.position == "left" then
+            wrap = (wrap == "RIGHT" and "LEFT") or (wrap == "LEFT" and "RIGHT")
+                or (wrap == "DOWN" and "UP") or "DOWN"
+        end
+    end
+    local horizontal = (grow == "LEFT" or grow == "RIGHT")
+    if horizontal then
+        if wrap ~= "UP" and wrap ~= "DOWN" then wrap = "DOWN" end
+    else
+        if wrap ~= "LEFT" and wrap ~= "RIGHT" then wrap = "RIGHT" end
+    end
+    return grow, wrap, horizontal
+end
+
+-- Free Move anchoring: pin the grid's growth corner to the rect captured at
+-- the last mover drag, so the container grows away from that corner and
+-- frame 1 never shifts as players enter or leave the selection (the
+-- container is sized to the live selection, so a CENTER pin would drift).
+-- Falls back to the legacy CENTER anchor (freePos) until the user drags the
+-- mover once. Called by FB.Anchor through the owner hook.
+XF.FreeAnchor = function(c, set)
+    local r = set and set.freeRect
+    if not r then return false end
+    local grow, wrap, horizontal = XF.GrowInfo(set, db and db.profile)
+    local hDir = horizontal and grow or wrap
+    local vDir = horizontal and wrap or grow
+    local corner = (vDir == "UP" and "BOTTOM" or "TOP")
+        .. (hDir == "LEFT" and "RIGHT" or "LEFT")
+    c:SetPoint(corner, UIParent, "CENTER",
+        (hDir == "LEFT") and r.right or r.left,
+        (vDir == "UP") and r.bottom or r.top)
+    return true
+end
+
+-- Called by the shared mover on drag stop: capture the dropped rect
+-- (relative to the UIParent center) for the corner pin above.
+XF.SaveFreeRect = function(mover)
+    local set = XF.Settings()
+    if not set then return end
+    local ux, uy = UIParent:GetCenter()
+    local l, b, mw, mh = mover:GetRect()
+    if not (ux and l) then return end
+    set.freeRect = { left = l - ux, right = l + mw - ux,
+                     bottom = b - uy, top = b + mh - uy }
+end
+
+-- Ordered raid units to duplicate (bounded by XF.CAP): tanks in roster
+-- order first (when Show Tanks is on), then the manually added names that are
+-- currently in the raid. Names are stored and matched in GetRaidRosterInfo's
+-- format on both sides so realm suffixes always agree; names not in the
+-- roster are skipped but kept in the list (they reappear when that player
+-- rejoins).
 XF.ResolveUnits = function()
     local set = XF.Settings()
     local units = {}
     if not set or not IsInRaid() then return units end
+    local cap = XF.CAP
     local seen = {}
     local n = GetNumGroupMembers() or 0
     if set.showTanks then
         for i = 1, n do
-            if #units >= 5 then break end
+            if #units >= cap then break end
             local name = GetRaidRosterInfo(i)
             if name and not seen[name]
                and UnitGroupRolesAssigned("raid" .. i) == "TANK" then
@@ -6854,7 +7162,7 @@ XF.ResolveUnits = function()
         end
     end
     for _, mname in ipairs(set.players or {}) do
-        if #units >= 5 then break end
+        if #units >= cap then break end
         if not seen[mname] then
             for i = 1, n do
                 if (GetRaidRosterInfo(i)) == mname then
@@ -6895,39 +7203,66 @@ XF.Layout = function()
     ns._xfExtraRatio = ratio
     ns._xfBmScale = (ns._bmScale or 1) * ratio
     local sp = s.cellSpacing or 2
-    -- Free Move ignores the raid growth settings entirely (Horizontal cog);
-    -- attached modes stack like a real group (unitGrowth).
-    local grow
+    -- Free Move lays out on its own axes (Grow/Wrap Direction, legacy
+    -- Horizontal fallback); attached modes stack group-sized runs of 5 like
+    -- additional raid groups (unitGrowth within a run, group growth across).
+    local grow, wrap, horizontal = XF.GrowInfo(set, s)
+    -- Grid size = the live selection; when the mover is shown outside a raid
+    -- there is no selection yet, so estimate from the configuration.
+    local count = XF.activeCount or 0
+    if count < 1 then
+        count = ((set and set.showTanks) and 2 or 0)
+            + ((set and set.players) and #set.players or 0)
+        if count < 1 then count = 1 end
+        if count > XF.CAP then count = XF.CAP end
+    end
+    -- Frames per run: attached always uses full group-sized runs of 5 (a
+    -- partially filled run still spans 5, exactly like a real group); Free
+    -- Move wraps at Wrap After (0/unset = one single run).
+    local per
     if set and set.position == "free" then
-        grow = set.freeHorizontal and "RIGHT" or "DOWN"
+        local wa = tonumber(set.wrapAfter) or 0
+        per = (wa > 0) and wa or count
+        if per > count then per = count end
     else
-        grow = s.unitGrowth or "DOWN"
+        per = 5
+    end
+    local lines = math.ceil(count / per)
+
+    -- The container spans the occupied grid. Its anchor corner (FB.Anchor's
+    -- attached slotting, XF.FreeAnchor's free pin) is the corner the grid
+    -- grows away from, so frame 1 holds position as the selection changes.
+    local runW, runH = w * per + sp * (per - 1), h * per + sp * (per - 1)
+    if horizontal then
+        XF.container:SetSize(runW, h * lines + sp * (lines - 1))
+    else
+        XF.container:SetSize(w * lines + sp * (lines - 1), runH)
     end
 
-    local stepW, stepH = 0, 0
-    if grow == "DOWN" or grow == "UP" then
-        XF.container:SetSize(w, h * 5 + sp * 4)
-        stepH = h + sp
-    else
-        XF.container:SetSize(w * 5 + sp * 4, h)
-        stepW = w + sp
-    end
-
+    local stepW, stepH = w + sp, h + sp
     local powerH = IsPowerBarEnabled(s) and PixelSnap(s.powerHeight or 4) or 0
     local topBarH = (s.topNameBarEnabled and PixelSnap(s.topNameBarHeight or 20)) or 0
     for i, b in ipairs(XF.buttons) do
         b:SetSize(w, h)
         b:ClearAllPoints()
         local off = i - 1
-        if grow == "UP" then
-            b:SetPoint("BOTTOMLEFT", XF.container, "BOTTOMLEFT", 0, off * stepH)
-        elseif grow == "LEFT" then
-            b:SetPoint("TOPRIGHT", XF.container, "TOPRIGHT", -off * stepW, 0)
-        elseif grow == "RIGHT" then
-            b:SetPoint("TOPLEFT", XF.container, "TOPLEFT", off * stepW, 0)
-        else -- DOWN
-            b:SetPoint("TOPLEFT", XF.container, "TOPLEFT", 0, -off * stepH)
+        local line = math.floor(off / per)
+        local pos = off - line * per
+        -- Map the (run, wrap) grid coordinate onto screen axes: the primary
+        -- run carries pos, the wrap axis carries line. The anchor corner is
+        -- the one both directions grow away from, so the first frame sits in
+        -- that corner of the container exactly like the legacy single run.
+        local hUnits, vUnits, hDir, vDir
+        if horizontal then
+            hUnits, vUnits, hDir, vDir = pos, line, grow, wrap
+        else
+            hUnits, vUnits, hDir, vDir = line, pos, wrap, grow
         end
+        local corner = (vDir == "UP" and "BOTTOM" or "TOP")
+            .. (hDir == "LEFT" and "RIGHT" or "LEFT")
+        b:SetPoint(corner, XF.container, corner,
+            (hDir == "LEFT" and -hUnits or hUnits) * stepW,
+            (vDir == "UP" and vUnits or -vUnits) * stepH)
         -- The bulk passes size inner elements for the BASE frame size;
         -- correct the height/width-derived pieces for the offset size.
         local d = GetFFD(b)
@@ -6938,7 +7273,7 @@ XF.Layout = function()
         -- Scaled visual pass: re-apply every ratio-affected element through
         -- the extra proxy (mirrors the ReloadFrames per-button styling, so
         -- texts, indicators, auras and BM buffs auto-resize with the custom
-        -- size). Bounded to five buttons; runs after the bulk base pass.
+        -- size). Bounded to the built slots; runs after the bulk base pass.
         local xs = ns._scaledExtraProxy
         if d.nameText then
             ApplyFont(d.nameText, xs.nameSize or 10)
@@ -6969,7 +7304,7 @@ XF.Layout = function()
             d.leaderIcon:SetSize(liSz, liSz)
             d.leaderIcon:ClearAllPoints()
             local liPos = (xs.leaderIconPosition or "top"):upper()
-            d.leaderIcon:SetPoint(liPos, d.health, liPos, xs.leaderIconOffsetX or 0, xs.leaderIconOffsetY or 0)
+            d.leaderIcon:SetPoint(liPos, ns.RF_AnchorHost(d.health, xs), liPos, xs.leaderIconOffsetX or 0, xs.leaderIconOffsetY or 0)
         end
         if d.raidMarker then
             local rmSz = PixelSnap(xs.raidMarkerSize or 16)
@@ -6980,6 +7315,11 @@ XF.Layout = function()
             local rcSz = PixelSnap(xs.readyCheckSize or 20)
             d.readyCheck:SetSize(rcSz, rcSz)
             if d.AnchorReadyCheck then d.AnchorReadyCheck() end
+        end
+        if d.combatIcon then
+            local cciSz = PixelSnap(xs.combatIndicatorSize or 16)
+            d.combatIcon:SetSize(cciSz, cciSz)
+            if d.AnchorCombatIcon then d.AnchorCombatIcon() end
         end
         if d.debuffIcons then
             for _, icon in ipairs(d.debuffIcons) do
@@ -7001,7 +7341,7 @@ XF.Layout = function()
             end
         end
         if d.bmIconPool and d.health and ns.BM_AnchorIndicators then
-            ns.BM_AnchorIndicators(d, d.health, xs)
+            ns.BM_AnchorIndicators(d, ns.RF_AnchorHost(d.health, xs), xs)
         end
     end
 end
@@ -7018,21 +7358,26 @@ XF.EVENTS = {
     "UNIT_NAME_UPDATE", "UNIT_CONNECTION", "UNIT_IN_RANGE_UPDATE",
 }
 
--- One-time construction: container + five buttons through the full real-frame
--- StyleButton pipeline (every visual element, hover, tooltip, click-cast,
--- ping, BM indicators). d._isExtra is set BEFORE StyleButton so the
--- OnAttributeChanged hook it installs never writes the real routing maps.
--- Buttons join allButtons so every bulk restyle/update pass covers them.
-XF.EnsureBuilt = function()
-    if XF.built then return end
-    XF.built = true
+-- Grow-on-demand construction: container + buttons through the full
+-- real-frame StyleButton pipeline (every visual element, hover, tooltip,
+-- click-cast, ping, BM indicators). The base 5 slots build on first
+-- activation; Free Move caps above 5 build the extra slots only when the
+-- selection actually reaches them (callers are all OOC paths). d._isExtra is
+-- set BEFORE StyleButton so the OnAttributeChanged hook it installs never
+-- writes the real routing maps. Buttons join allButtons so every bulk
+-- restyle/update pass covers them.
+XF.EnsureBuilt = function(count)
+    if not XF.built then
+        XF.built = true
+        local container = CreateFrame("Frame", "ERFExtraFramesContainer", UIParent)
+        container:Hide()
+        XF.container = container
+    end
+    local want = count or 5
+    if want < 5 then want = 5 end
 
-    local container = CreateFrame("Frame", "ERFExtraFramesContainer", UIParent)
-    container:Hide()
-    XF.container = container
-
-    for i = 1, 5 do
-        local b = CreateFrame("Button", "ERFExtraFrame" .. i, container, "SecureUnitButtonTemplate")
+    for i = #XF.buttons + 1, want do
+        local b = CreateFrame("Button", "ERFExtraFrame" .. i, XF.container, "SecureUnitButtonTemplate")
         b:Hide()
         GetFFD(b)._isExtra = true
         StyleButton(b)
@@ -7040,7 +7385,7 @@ XF.EnsureBuilt = function()
 
         -- Per-slot tracker: (re)registered for the assigned unit in XF_Apply,
         -- mirroring the central hub's per-unit reactions for this duplicate.
-        -- Bounded to five units; zero registrations while the slot is empty.
+        -- Bounded to the built slots; zero registrations while a slot is empty.
         local t = CreateFrame("Frame")
         t:SetScript("OnEvent", function(_, event, unit, updateInfo)
             if not b:IsVisible() then return end
@@ -7053,7 +7398,7 @@ XF.EnsureBuilt = function()
                     UpdateAbsorb(b, unit)
                 else
                     -- Mirror of the hub's UNIT_AURA branch without the budget
-                    -- spill: at most five duplicated units, work stays bounded.
+                    -- spill: work stays bounded to the duplicated units.
                     UpdateDispelBorder(b, unit, updateInfo)
                     UpdateDebuffs(b, unit, updateInfo)
                     UpdateDefensives(b, unit, updateInfo)
@@ -7104,6 +7449,8 @@ XF.EnsureBuilt = function()
                 end
             elseif event == "UNIT_IN_RANGE_UPDATE" then
                 ns._UpdateButtonRange(unit, b)
+            elseif event == "UNIT_FLAGS" then
+                ns._UpdateCombatIconFor(unit, b)
             elseif event == "READY_CHECK_CONFIRM" then
                 -- Plain registration; filter to this slot's unit here
                 if unit and unit == b:GetAttribute("unit") then
@@ -7139,11 +7486,12 @@ function ns.XF_Apply()
     if InCombatLockdown() then XF.applyDirty = true; return end
 
     local units = XF.ShouldBeActive() and XF.ResolveUnits() or {}
+    XF.activeCount = #units
     if #units == 0 then
         if XF.built then
             for _, b in ipairs(XF.buttons) do b:Hide() end
             XF.container:Hide()
-            for i = 1, 5 do XF.trackers[i]:UnregisterAllEvents() end
+            for i = 1, #XF.trackers do XF.trackers[i]:UnregisterAllEvents() end
         end
         if XF.mover then XF.mover:Hide() end
         wipe(ns._xfUnitToButton)
@@ -7153,12 +7501,12 @@ function ns.XF_Apply()
         return
     end
 
-    XF.EnsureBuilt()
+    XF.EnsureBuilt(#units)
     XF.Layout()
     FB.Anchor(XF)
     XF.container:Show()
     wipe(ns._xfUnitToButton)
-    for i = 1, 5 do
+    for i = 1, #XF.buttons do
         local b = XF.buttons[i]
         local unit = units[i]
         local t = XF.trackers[i]
@@ -7172,6 +7520,10 @@ function ns.XF_Apply()
             ns._xfUnitToButton[unit] = b
             for _, ev in ipairs(XF.EVENTS) do
                 t:RegisterUnitEvent(ev, unit)
+            end
+            -- UNIT_FLAGS is opt-in: extra frames mirror the raid combat-icon toggle.
+            if db.profile.showCombatIndicator then
+                t:RegisterUnitEvent("UNIT_FLAGS", unit)
             end
             t:RegisterEvent("READY_CHECK_CONFIRM")
             t:RegisterEvent("PLAYER_FLAGS_CHANGED")
@@ -7234,7 +7586,7 @@ XF.ToggleHovered = function()
     if set.showTanks and UnitGroupRolesAssigned(unit) == "TANK" then
         return
     end
-    if #XF.ResolveUnits() >= 5 then
+    if #XF.ResolveUnits() >= XF.CAP then
         return
     end
     players[#players + 1] = name
@@ -8058,6 +8410,9 @@ local RangeUpdate  -- forward declaration (defined in Range fading section below
 -------------------------------------------------------------------------------
 local function ReloadFrames()
     local s = ns._scaledProfile
+    -- Keep UNIT_FLAGS registration in lockstep with the combat-icon toggle so a
+    -- disabled option listens for nothing (runs no event code).
+    if ns.UpdateCombatEventRegistration then ns.UpdateCombatEventRegistration() end
     -- Rebuild dispel-color curves so custom-color edits take effect immediately.
     if ns._RebuildDispelCurves then ns._RebuildDispelCurves() end
     -- Recalculate active tier from current group size + overrides
@@ -8171,7 +8526,7 @@ local function ReloadFrames()
             d.leaderIcon:SetSize(liSz, liSz)
             d.leaderIcon:ClearAllPoints()
             local liPos = (s.leaderIconPosition or "top"):upper()
-            d.leaderIcon:SetPoint(liPos, d.health, liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
+            d.leaderIcon:SetPoint(liPos, ns.RF_AnchorHost(d.health, s), liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
             -- Re-assert the host's strata/level above the border
             if d.leaderHost then ns.ApplyLeaderStrata(d.leaderHost) end
         end
@@ -8188,6 +8543,13 @@ local function ReloadFrames()
             local rcSz = PixelSnap(s.readyCheckSize or 20)
             d.readyCheck:SetSize(rcSz, rcSz)
             if d.AnchorReadyCheck then d.AnchorReadyCheck() end
+        end
+
+        -- Combat icon size + position
+        if d.combatIcon then
+            local cciSz = PixelSnap(s.combatIndicatorSize or 16)
+            d.combatIcon:SetSize(cciSz, cciSz)
+            if d.AnchorCombatIcon then d.AnchorCombatIcon() end
         end
 
         -- Border
@@ -8222,7 +8584,7 @@ local function ReloadFrames()
 
         -- Buff manager indicators
         if d.bmIconPool and d.health and ns.BM_AnchorIndicators then
-            ns.BM_AnchorIndicators(d, d.health, s)
+            ns.BM_AnchorIndicators(d, ns.RF_AnchorHost(d.health, s), s)
         end
     end
 
@@ -8385,6 +8747,11 @@ ns._ResizePartyButtons = function(w, h)
                 if d.raidMarker then
                     local rmSz = PixelSnap(pp.raidMarkerSize or 16)
                     d.raidMarker:SetSize(rmSz, rmSz)
+                end
+                if d.combatIcon then
+                    local cciSz = PixelSnap(pp.combatIndicatorSize or 16)
+                    d.combatIcon:SetSize(cciSz, cciSz)
+                    if d.AnchorCombatIcon then d.AnchorCombatIcon() end
                 end
                 if d.debuffIcons then
                     for _, icon in ipairs(d.debuffIcons) do
@@ -8719,6 +9086,69 @@ function EllesmereUI._RF_DumpLayout()
             if b1 then print(("     u1=%s LT=(%s,%s)"):format(tostring(b1:GetAttribute("unit")), r(b1:GetLeft()), r(b1:GetTop()))) end
             if b2 then print(("     u2 LT=(%s,%s)"):format(r(b2:GetLeft()), r(b2:GetTop()))) end
         end
+    end
+end
+
+-- TEMP DEBUG: diagnose per-tier offset application.
+-- /run EllesmereUI._RF_DumpOffset()
+function EllesmereUI._RF_DumpOffset()
+    local s = db.profile
+    local r = function(v) if v then return floor(v + 0.5) else return "nil" end end
+    print("|cff66ccffEUI RF Offset Dump|r")
+    print(("  unlockPos: %s"):format(s.unlockPos and ("%s/%s x=%s y=%s"):format(
+        s.unlockPos.point, s.unlockPos.relPoint, r(s.unlockPos.x), r(s.unlockPos.y)) or "|cffff6666nil|r"))
+    local eff = ns._GetEffectiveRaidSize()
+    local tier, ov = ns._RFResolveTierOverride(eff)
+    print(("  effectiveSize=%s  resolvedTier=%s  hasOverride=%s"):format(
+        tostring(eff), tostring(tier), ov and "yes" or "no"))
+    if ov then
+        print(("  override: w=%s h=%s offsetX=%s offsetY=%s ug=%s gg=%s"):format(
+            tostring(ov.width), tostring(ov.height), tostring(ov.offsetX), tostring(ov.offsetY),
+            tostring(ov.unitGrowth), tostring(ov.groupGrowth)))
+    end
+    print(("  _activeSizeW=%s _activeSizeH=%s _activeTierOv=%s"):format(
+        tostring(ns._activeSizeW), tostring(ns._activeSizeH),
+        ns._activeTierOverride and "yes" or "no"))
+    local bl, bt, bw, bh = ns._RFBaseTopLeft()
+    print(("  baseTL: l=%s t=%s bw=%s bh=%s"):format(r(bl), r(bt), r(bw), r(bh)))
+    if ov then
+        local cs = PixelSnap(s.cellSpacing or 2)
+        local gs = PixelSnap(s.groupSpacing or 8)
+        local fw = ov.width or s.frameWidth or 72
+        local fh = ov.height or s.frameHeight or 46
+        local ug = ov.unitGrowth or s.unitGrowth or "DOWN"
+        local gg = ov.groupGrowth or s.groupGrowth or "RIGHT"
+        local tw, th = ns._RFFootprint(fw, fh, ug, gg, cs, gs)
+        local kx, ky = ns._RFCornerTerms(tw, th, bw or 0, bh or 0, ug, gg)
+        local x, y = ns._RFTierTopLeft(tw, th, ug, gg, ov.offsetX or 0, ov.offsetY or 0)
+        print(("  tierFootprint: tw=%s th=%s  corner=%s kx=%s ky=%s"):format(
+            r(tw), r(th), ns._RFGrowthCorner(ug, gg), r(kx), r(ky)))
+        print(("  computed TL: x=%s y=%s"):format(r(x), r(y)))
+    end
+    if containerFrame then
+        print(("  container actual: L=%s T=%s W=%s H=%s"):format(
+            r(containerFrame:GetLeft()), r(containerFrame:GetTop()),
+            r(containerFrame:GetWidth()), r(containerFrame:GetHeight())))
+        local anchored = EllesmereUI.IsUnlockAnchored
+            and EllesmereUI.IsUnlockAnchored("RF_RaidFrames")
+        print(("  isAnchored=%s"):format(anchored and "yes" or "no"))
+    end
+    local ovs = s.raidSizeOverrides
+    if ovs then
+        local tiers = {}
+        for k, v in pairs(ovs) do
+            if type(v) == "table" then tiers[#tiers + 1] = k end
+        end
+        table.sort(tiers)
+        for _, t in ipairs(tiers) do
+            local o = ovs[t]
+            print(("  tier[%d]: w=%s h=%s ox=%s oy=%s ug=%s gg=%s"):format(
+                t, tostring(o.width), tostring(o.height),
+                tostring(o.offsetX), tostring(o.offsetY),
+                tostring(o.unitGrowth), tostring(o.groupGrowth)))
+        end
+    else
+        print("  raidSizeOverrides: nil")
     end
 end
 
@@ -9131,11 +9561,13 @@ local function OnEvent(self, event, arg1, ...)
         -- Combat starting: hide role/leader icons on frames using the in-combat cogs.
         if ns._UpdateRoleIcons then ns._UpdateRoleIcons() end
         if ns._UpdateLeaderIcons then ns._UpdateLeaderIcons() end
+        if ns._CombatIconEnabled() and ns._UpdateCombatIcons then ns._UpdateCombatIcons() end
     elseif event == "PLAYER_REGEN_ENABLED" then
         inCombat = false
         -- Combat ended: restore any role/leader icons suppressed during combat.
         if ns._UpdateRoleIcons then ns._UpdateRoleIcons() end
         if ns._UpdateLeaderIcons then ns._UpdateLeaderIcons() end
+        if ns._CombatIconEnabled() and ns._UpdateCombatIcons then ns._UpdateCombatIcons() end
         -- Complete any container reparent that was blocked during combat (e.g.
         -- the options panel was closed mid-combat while a preview was active).
         -- Without this, a combat auto-close can leave the real frames orphaned
@@ -9164,6 +9596,9 @@ local function OnEvent(self, event, arg1, ...)
                 else
                     t0 = ns.ProfBegin("LayoutGroups:REGEN"); LayoutGroups(); ns.ProfEnd("LayoutGroups:REGEN", t0)
                 end
+                -- Same-dimension tier changes take the LayoutGroups branch;
+                -- reapply offset so the container lands at the correct tier.
+                if ns._ApplyTierOffset then ns._ApplyTierOffset() end
             end
             if ns._partyFramesVisible then
                 ns._LayoutPartyFrames()
@@ -9198,6 +9633,10 @@ local function OnEvent(self, event, arg1, ...)
             if numMembers > 0 then
                 local newW, newH = ns._GetRaidSizeFrameDimensions(numMembers)
                 if newW ~= ns._activeSizeW or newH ~= ns._activeSizeH then
+                    ns._sizeTierDirtyInCombat = true
+                end
+                local newTier, newOv = ns._RFResolveTierOverride(numMembers)
+                if newOv ~= ns._activeTierOverride then
                     ns._sizeTierDirtyInCombat = true
                 end
             end
@@ -9453,6 +9892,9 @@ local function OnEvent(self, event, arg1, ...)
             end
             ns.ProfEnd("ThreatUpdate", t0)
         end
+    elseif event == "UNIT_FLAGS" then
+        local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
+        if btn then ns._UpdateCombatIconFor(arg1, btn) end
     elseif event == "PLAYER_FLAGS_CHANGED" or event == "UNIT_CONNECTION" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then
@@ -9670,6 +10112,7 @@ do
             "showPowerBar", "powerHeight", "powerBgDarkness", "powerBgColor", "powerBgPowerColored",
             "powerBorderStyle", "powerBorderSize", "powerBorderColor", "powerBorderAlpha",
             "powerShowForHealer", "powerShowForTank", "powerShowForDPS", "smoothPowerBars",
+            "powerUniformAnchors",
         },
         textDisplay = {
             "nameSize", "nameColorMode", "nameCustomColor",
@@ -9687,6 +10130,8 @@ do
             "readyCheckSize", "readyCheckPosition", "readyCheckOffsetX", "readyCheckOffsetY",
             "statusTextPosition", "statusTextOffsetX", "statusTextOffsetY", "statusTextSize", "statusTextColor",
             "showLeaderIcon", "showLeaderIconInCombat", "leaderIconPosition", "leaderIconSize", "leaderIconOffsetX", "leaderIconOffsetY",
+            "showCombatIndicator", "combatIndicatorStyle", "combatIndicatorColor", "combatIndicatorCustomColor",
+            "combatIndicatorSize", "combatIndicatorPosition", "combatIndicatorOffsetX", "combatIndicatorOffsetY",
             "borderSize", "borderColor", "borderAlpha", "borderTexture",
             "borderBehind", "borderTextureOffset", "borderTextureOffsetY",
             "borderTextureShiftX", "borderTextureShiftY",
@@ -9798,7 +10243,7 @@ for _, k in ipairs({
     "nameSize", "healthTextSize", "healAbsorbTextSize", "statusTextSize",
     "debuffStacksTextSize", "debuffDurTextSize", "defDurTextSize",
     -- Icon sizes
-    "roleIconSize", "leaderIconSize", "raidMarkerSize",
+    "roleIconSize", "leaderIconSize", "raidMarkerSize", "combatIndicatorSize",
     "debuffSize", "defSize", "paSize", "dispellableDebuffSize",
     -- Offsets
     "nameOffsetX", "nameOffsetY",
@@ -9808,6 +10253,7 @@ for _, k in ipairs({
     "roleIconOffsetX", "roleIconOffsetY",
     "leaderIconOffsetX", "leaderIconOffsetY",
     "raidMarkerOffsetX", "raidMarkerOffsetY",
+    "combatIndicatorOffsetX", "combatIndicatorOffsetY",
     "debuffOffsetX", "debuffOffsetY",
     "dispellableDebuffOffsetX", "dispellableDebuffOffsetY",
     "debuffStacksOffsetX", "debuffStacksOffsetY",
@@ -10301,6 +10747,10 @@ end
 -- we write party_ values onto db.profile, call the closures, then restore.
 ns.ReloadPartyFrames = function()
     if not ns._partyHeader then return end
+    -- Re-evaluate UNIT_FLAGS registration before the temp-swap below (which
+    -- overwrites db.profile), so a section sync/unsync that flips the party's
+    -- effective combat-icon state turns the party trackers on/off in step.
+    if ns.UpdateCombatEventRegistration then ns.UpdateCombatEventRegistration() end
     local p = ns._partyProxy  -- reads party_ keys with fallthrough
     local raw = db.profile
     -- Scaled reads for everything in INDICATOR_SCALE_KEYS (role/leader/marker
@@ -10412,7 +10862,7 @@ ns.ReloadPartyFrames = function()
             d.leaderIcon:SetSize(liSz, liSz)
             d.leaderIcon:ClearAllPoints()
             local liPos = (raw.leaderIconPosition or "top"):upper()
-            d.leaderIcon:SetPoint(liPos, d.health, liPos, pp.leaderIconOffsetX or 0, pp.leaderIconOffsetY or 0)
+            d.leaderIcon:SetPoint(liPos, ns.RF_AnchorHost(d.health, pp), liPos, pp.leaderIconOffsetX or 0, pp.leaderIconOffsetY or 0)
             -- Re-assert the host's strata/level above the border
             if d.leaderHost then ns.ApplyLeaderStrata(d.leaderHost) end
         end
@@ -10429,6 +10879,13 @@ ns.ReloadPartyFrames = function()
             local rcSz = PixelSnap(pp.readyCheckSize or 20)
             d.readyCheck:SetSize(rcSz, rcSz)
             if d.AnchorReadyCheck then d.AnchorReadyCheck() end
+        end
+
+        -- Combat icon
+        if d.combatIcon then
+            local cciSz = PixelSnap(pp.combatIndicatorSize or 16)
+            d.combatIcon:SetSize(cciSz, cciSz)
+            if d.AnchorCombatIcon then d.AnchorCombatIcon() end
         end
 
         -- Border
@@ -10464,7 +10921,7 @@ ns.ReloadPartyFrames = function()
         -- Buff manager indicators (pass the scaled proxy: BM picks the party
         -- indicator scale by recognizing this exact table)
         if d.bmIconPool and d.health and ns.BM_AnchorIndicators then
-            ns.BM_AnchorIndicators(d, d.health, pp)
+            ns.BM_AnchorIndicators(d, ns.RF_AnchorHost(d.health, pp), pp)
         end
     end
 
@@ -10722,7 +11179,7 @@ local function PvAuraAnchor(icon, f, auraType, slot, totalShown)
         icon:SetSize(sz, sz)
         icon:ClearAllPoints()
         local corner, fx, fy = ns.DebuffGridPoint(s2, slot, totalShown)
-        icon:SetPoint(corner, f._health, corner, fx, fy)
+        icon:SetPoint(corner, ns.RF_AnchorHost(f._health, s2), corner, fx, fy)
         return
     end
 
@@ -10754,15 +11211,16 @@ local function PvAuraAnchor(icon, f, auraType, slot, totalShown)
         local fx = ox + (grow == "CENTER" and centerOff or 0)
         -- All aura icon previews (debuffs, defensives, private auras) anchor flush
         -- to the health bar edge -- no 1px inset -- matching the real frames.
-        if pos == "topleft" then icon:SetPoint("TOPLEFT", f._health, "TOPLEFT", fx, oy)
-        elseif pos == "top" then icon:SetPoint("TOP", f._health, "TOP", fx, oy)
-        elseif pos == "topright" then icon:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", fx, oy)
-        elseif pos == "left" then icon:SetPoint("LEFT", f._health, "LEFT", fx, oy)
-        elseif pos == "center" then icon:SetPoint("CENTER", f._health, "CENTER", fx, oy)
-        elseif pos == "right" then icon:SetPoint("RIGHT", f._health, "RIGHT", fx, oy)
-        elseif pos == "bottomright" then icon:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", fx, oy)
-        elseif pos == "bottom" then icon:SetPoint("BOTTOM", f._health, "BOTTOM", fx, oy)
-        else icon:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", fx, oy)
+        local pvHost = ns.RF_AnchorHost(f._health, s2)
+        if pos == "topleft" then icon:SetPoint("TOPLEFT", pvHost, "TOPLEFT", fx, oy)
+        elseif pos == "top" then icon:SetPoint("TOP", pvHost, "TOP", fx, oy)
+        elseif pos == "topright" then icon:SetPoint("TOPRIGHT", pvHost, "TOPRIGHT", fx, oy)
+        elseif pos == "left" then icon:SetPoint("LEFT", pvHost, "LEFT", fx, oy)
+        elseif pos == "center" then icon:SetPoint("CENTER", pvHost, "CENTER", fx, oy)
+        elseif pos == "right" then icon:SetPoint("RIGHT", pvHost, "RIGHT", fx, oy)
+        elseif pos == "bottomright" then icon:SetPoint("BOTTOMRIGHT", pvHost, "BOTTOMRIGHT", fx, oy)
+        elseif pos == "bottom" then icon:SetPoint("BOTTOM", pvHost, "BOTTOM", fx, oy)
+        else icon:SetPoint("BOTTOMLEFT", pvHost, "BOTTOMLEFT", fx, oy)
         end
     else
         -- Chain from previous icon in same pool
@@ -11295,7 +11753,7 @@ ns.PvBuffAnchor = function(icon, f, spellInfo, prevIcon)
     else
         local pos = spellInfo.position and spellInfo.position:upper() or "BOTTOMLEFT"
         local ox, oy = spellInfo.offsetX or 0, spellInfo.offsetY or 0
-        icon:SetPoint(pos, f._health, pos, ox, oy)
+        icon:SetPoint(pos, ns.RF_AnchorHost(f._health, PvSettings()), pos, ox, oy)
     end
 end
 
@@ -11627,6 +12085,15 @@ local function CreatePreviewFrame(index)
     if PP then PP.DisablePixelSnap(health) end
     health:SetMinMaxValues(0, 100)
     health:SetValue(100)
+
+    -- Full-height anchor reference (mirrors the live buttons' d.uniformRef so
+    -- Uniform Icon Anchoring previews identically; see ns.RF_AnchorHost).
+    f._uniformRef = CreateFrame("Frame", nil, f)
+    f._uniformRef:SetFrameLevel(health:GetFrameLevel())
+    f._uniformRef:SetPoint("TOPLEFT", health, "TOPLEFT", 0, 0)
+    f._uniformRef:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 0)
+    health._euiUniformRef = f._uniformRef
+    f._uniformRef._euiHealth = health
 
     -- Absorb shield preview (dual clip-frame, matching real frames)
     -- Mask: constrains absorb rendering to health bar bounds
@@ -11961,6 +12428,11 @@ local function CreatePreviewFrame(index)
     readyCheck:SetPoint("CENTER", health, "CENTER", 0, 0)
     readyCheck:Hide()
 
+    -- Combat icon (position/size/style re-applied in the preview indicator pass)
+    local combatIcon = markerCarrier:CreateTexture(nil, "OVERLAY", nil, 1)
+    combatIcon:SetSize(PixelSnap(s.combatIndicatorSize or 16), PixelSnap(s.combatIndicatorSize or 16))
+    combatIcon:Hide()
+
     -- Text carrier: text band (above every border incl. the raise, below auras).
     local textCarrier = CreateFrame("Frame", nil, f)
     textCarrier:SetAllPoints(health)
@@ -12012,7 +12484,7 @@ local function CreatePreviewFrame(index)
     local liSz = PixelSnap(s.leaderIconSize or 14)
     leaderIcon:SetSize(liSz, liSz)
     local liPos = (s.leaderIconPosition or "top"):upper()
-    leaderIcon:SetPoint(liPos, health, liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
+    leaderIcon:SetPoint(liPos, ns.RF_AnchorHost(health, s), liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
     leaderIcon:Hide()
 
     -- Top Name Bar (preview; sized/styled by ApplyPreviewData)
@@ -12051,6 +12523,7 @@ local function CreatePreviewFrame(index)
     f._statusText = statusFS
     f._roleIcon = roleIcon
     f._leaderIcon = leaderIcon
+    f._combatIcon = combatIcon
 
     -- Helper: create a preview aura icon with texture, cooldown, border
     local function MakePreviewAuraIcon(parent, level, sz)
@@ -12937,24 +13410,25 @@ local function ApplyPreviewData(f, index)
             local diOY = s.dispelIconOffsetY or 0
             -- Dispel icon anchors flush to the health bar edge (no 1px inset),
             -- matching the debuff/role icon displays.
+            local diHost = ns.RF_AnchorHost(f._health, s)
             if diPos == "topleft" then
-                f._dispelIcon:SetPoint("TOPLEFT", f._health, "TOPLEFT", diOX, diOY)
+                f._dispelIcon:SetPoint("TOPLEFT", diHost, "TOPLEFT", diOX, diOY)
             elseif diPos == "top" then
-                f._dispelIcon:SetPoint("TOP", f._health, "TOP", diOX, diOY)
+                f._dispelIcon:SetPoint("TOP", diHost, "TOP", diOX, diOY)
             elseif diPos == "topright" then
-                f._dispelIcon:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", diOX, diOY)
+                f._dispelIcon:SetPoint("TOPRIGHT", diHost, "TOPRIGHT", diOX, diOY)
             elseif diPos == "left" then
-                f._dispelIcon:SetPoint("LEFT", f._health, "LEFT", diOX, diOY)
+                f._dispelIcon:SetPoint("LEFT", diHost, "LEFT", diOX, diOY)
             elseif diPos == "right" then
-                f._dispelIcon:SetPoint("RIGHT", f._health, "RIGHT", diOX, diOY)
+                f._dispelIcon:SetPoint("RIGHT", diHost, "RIGHT", diOX, diOY)
             elseif diPos == "bottomleft" then
-                f._dispelIcon:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", diOX, diOY)
+                f._dispelIcon:SetPoint("BOTTOMLEFT", diHost, "BOTTOMLEFT", diOX, diOY)
             elseif diPos == "bottom" then
-                f._dispelIcon:SetPoint("BOTTOM", f._health, "BOTTOM", diOX, diOY)
+                f._dispelIcon:SetPoint("BOTTOM", diHost, "BOTTOM", diOX, diOY)
             elseif diPos == "bottomright" then
-                f._dispelIcon:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", diOX, diOY)
+                f._dispelIcon:SetPoint("BOTTOMRIGHT", diHost, "BOTTOMRIGHT", diOX, diOY)
             else -- center
-                f._dispelIcon:SetPoint("CENTER", f._health, "CENTER", diOX, diOY)
+                f._dispelIcon:SetPoint("CENTER", diHost, "CENTER", diOX, diOY)
             end
             f._dispelIcon:Show()
         elseif f._dispelIcon then
@@ -12992,24 +13466,25 @@ local function ApplyPreviewData(f, index)
                 dbOX = s.debuffOffsetX or 0
                 dbOY = s.debuffOffsetY or 0
             end
+            local ddHost = ns.RF_AnchorHost(f._health, s)
             if dbPos == "topleft" then
-                ddi:SetPoint("TOPLEFT", f._health, "TOPLEFT", dbOX, dbOY)
+                ddi:SetPoint("TOPLEFT", ddHost, "TOPLEFT", dbOX, dbOY)
             elseif dbPos == "top" then
-                ddi:SetPoint("TOP", f._health, "TOP", dbOX, dbOY)
+                ddi:SetPoint("TOP", ddHost, "TOP", dbOX, dbOY)
             elseif dbPos == "topright" then
-                ddi:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", dbOX, dbOY)
+                ddi:SetPoint("TOPRIGHT", ddHost, "TOPRIGHT", dbOX, dbOY)
             elseif dbPos == "left" then
-                ddi:SetPoint("LEFT", f._health, "LEFT", dbOX, dbOY)
+                ddi:SetPoint("LEFT", ddHost, "LEFT", dbOX, dbOY)
             elseif dbPos == "center" then
-                ddi:SetPoint("CENTER", f._health, "CENTER", dbOX, dbOY)
+                ddi:SetPoint("CENTER", ddHost, "CENTER", dbOX, dbOY)
             elseif dbPos == "right" then
-                ddi:SetPoint("RIGHT", f._health, "RIGHT", dbOX, dbOY)
+                ddi:SetPoint("RIGHT", ddHost, "RIGHT", dbOX, dbOY)
             elseif dbPos == "bottomleft" then
-                ddi:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", dbOX, dbOY)
+                ddi:SetPoint("BOTTOMLEFT", ddHost, "BOTTOMLEFT", dbOX, dbOY)
             elseif dbPos == "bottom" then
-                ddi:SetPoint("BOTTOM", f._health, "BOTTOM", dbOX, dbOY)
+                ddi:SetPoint("BOTTOM", ddHost, "BOTTOM", dbOX, dbOY)
             else -- bottomright
-                ddi:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", dbOX, dbOY)
+                ddi:SetPoint("BOTTOMRIGHT", ddHost, "BOTTOMRIGHT", dbOX, dbOY)
             end
 
             -- Border (dispel-type colored)
@@ -13059,24 +13534,25 @@ local function ApplyPreviewData(f, index)
             local pos = s.raidMarkerPosition or "center"
             local ox = s.raidMarkerOffsetX or 0
             local oy = s.raidMarkerOffsetY or 0
+            local rmHost = ns.RF_AnchorHost(f._health, s)
             if pos == "topleft" then
-                f._raidMarker:SetPoint("TOPLEFT", f._health, "TOPLEFT", 2 + ox, -2 + oy)
+                f._raidMarker:SetPoint("TOPLEFT", rmHost, "TOPLEFT", 2 + ox, -2 + oy)
             elseif pos == "top" then
-                f._raidMarker:SetPoint("TOP", f._health, "TOP", ox, -2 + oy)
+                f._raidMarker:SetPoint("TOP", rmHost, "TOP", ox, -2 + oy)
             elseif pos == "topright" then
-                f._raidMarker:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", -2 + ox, -2 + oy)
+                f._raidMarker:SetPoint("TOPRIGHT", rmHost, "TOPRIGHT", -2 + ox, -2 + oy)
             elseif pos == "left" then
-                f._raidMarker:SetPoint("LEFT", f._health, "LEFT", 2 + ox, oy)
+                f._raidMarker:SetPoint("LEFT", rmHost, "LEFT", 2 + ox, oy)
             elseif pos == "right" then
-                f._raidMarker:SetPoint("RIGHT", f._health, "RIGHT", -2 + ox, oy)
+                f._raidMarker:SetPoint("RIGHT", rmHost, "RIGHT", -2 + ox, oy)
             elseif pos == "bottomleft" then
-                f._raidMarker:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 2 + ox, 2 + oy)
+                f._raidMarker:SetPoint("BOTTOMLEFT", rmHost, "BOTTOMLEFT", 2 + ox, 2 + oy)
             elseif pos == "bottom" then
-                f._raidMarker:SetPoint("BOTTOM", f._health, "BOTTOM", ox, 2 + oy)
+                f._raidMarker:SetPoint("BOTTOM", rmHost, "BOTTOM", ox, 2 + oy)
             elseif pos == "bottomright" then
-                f._raidMarker:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", -2 + ox, 2 + oy)
+                f._raidMarker:SetPoint("BOTTOMRIGHT", rmHost, "BOTTOMRIGHT", -2 + ox, 2 + oy)
             else -- center
-                f._raidMarker:SetPoint("CENTER", f._health, "CENTER", ox, oy)
+                f._raidMarker:SetPoint("CENTER", rmHost, "CENTER", ox, oy)
             end
             f._raidMarker:Show()
         else
@@ -13103,24 +13579,25 @@ local function ApplyPreviewData(f, index)
             local pos = s.readyCheckPosition or "center"
             local ox = s.readyCheckOffsetX or 0
             local oy = s.readyCheckOffsetY or 0
+            local rcHost = ns.RF_AnchorHost(f._health, s)
             if pos == "topleft" then
-                f._readyCheck:SetPoint("TOPLEFT", f._health, "TOPLEFT", 2 + ox, -2 + oy)
+                f._readyCheck:SetPoint("TOPLEFT", rcHost, "TOPLEFT", 2 + ox, -2 + oy)
             elseif pos == "top" then
-                f._readyCheck:SetPoint("TOP", f._health, "TOP", ox, -2 + oy)
+                f._readyCheck:SetPoint("TOP", rcHost, "TOP", ox, -2 + oy)
             elseif pos == "topright" then
-                f._readyCheck:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", -2 + ox, -2 + oy)
+                f._readyCheck:SetPoint("TOPRIGHT", rcHost, "TOPRIGHT", -2 + ox, -2 + oy)
             elseif pos == "left" then
-                f._readyCheck:SetPoint("LEFT", f._health, "LEFT", 2 + ox, oy)
+                f._readyCheck:SetPoint("LEFT", rcHost, "LEFT", 2 + ox, oy)
             elseif pos == "right" then
-                f._readyCheck:SetPoint("RIGHT", f._health, "RIGHT", -2 + ox, oy)
+                f._readyCheck:SetPoint("RIGHT", rcHost, "RIGHT", -2 + ox, oy)
             elseif pos == "bottomleft" then
-                f._readyCheck:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 2 + ox, 2 + oy)
+                f._readyCheck:SetPoint("BOTTOMLEFT", rcHost, "BOTTOMLEFT", 2 + ox, 2 + oy)
             elseif pos == "bottom" then
-                f._readyCheck:SetPoint("BOTTOM", f._health, "BOTTOM", ox, 2 + oy)
+                f._readyCheck:SetPoint("BOTTOM", rcHost, "BOTTOM", ox, 2 + oy)
             elseif pos == "bottomright" then
-                f._readyCheck:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", -2 + ox, 2 + oy)
+                f._readyCheck:SetPoint("BOTTOMRIGHT", rcHost, "BOTTOMRIGHT", -2 + ox, 2 + oy)
             else -- center
-                f._readyCheck:SetPoint("CENTER", f._health, "CENTER", ox, oy)
+                f._readyCheck:SetPoint("CENTER", rcHost, "CENTER", ox, oy)
             end
             if rcStatus == "ready" then
                 f._readyCheck:SetTexture("Interface\\RaidFrame\\ReadyCheck-Ready")
@@ -13166,32 +13643,33 @@ local function ApplyPreviewData(f, index)
         local oy = s.nameOffsetY or 0
         f._nameText:SetWidth((s.frameWidth or 72) * ns.RF_NAME_WIDTH_FRACTION)
         f._nameText:SetHeight(0)
+        local ntHost = ns.RF_AnchorHost(f._health, s)
         if pos == "topleft" then
-            f._nameText:SetPoint("TOPLEFT", f._health, "TOPLEFT", 2 + ox, -2 + oy)
+            f._nameText:SetPoint("TOPLEFT", ntHost, "TOPLEFT", 2 + ox, -2 + oy)
             f._nameText:SetJustifyH("LEFT"); f._nameText:SetJustifyV("TOP")
         elseif pos == "top" then
-            f._nameText:SetPoint("TOP", f._health, "TOP", ox, -2 + oy)
+            f._nameText:SetPoint("TOP", ntHost, "TOP", ox, -2 + oy)
             f._nameText:SetJustifyH("CENTER"); f._nameText:SetJustifyV("TOP")
         elseif pos == "topright" then
-            f._nameText:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", -2 + ox, -2 + oy)
+            f._nameText:SetPoint("TOPRIGHT", ntHost, "TOPRIGHT", -2 + ox, -2 + oy)
             f._nameText:SetJustifyH("RIGHT"); f._nameText:SetJustifyV("TOP")
         elseif pos == "left" then
-            f._nameText:SetPoint("LEFT", f._health, "LEFT", 2 + ox, oy)
+            f._nameText:SetPoint("LEFT", ntHost, "LEFT", 2 + ox, oy)
             f._nameText:SetJustifyH("LEFT"); f._nameText:SetJustifyV("MIDDLE")
         elseif pos == "right" then
-            f._nameText:SetPoint("RIGHT", f._health, "RIGHT", -2 + ox, oy)
+            f._nameText:SetPoint("RIGHT", ntHost, "RIGHT", -2 + ox, oy)
             f._nameText:SetJustifyH("RIGHT"); f._nameText:SetJustifyV("MIDDLE")
         elseif pos == "bottomleft" then
-            f._nameText:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 2 + ox, 2 + oy)
+            f._nameText:SetPoint("BOTTOMLEFT", ntHost, "BOTTOMLEFT", 2 + ox, 2 + oy)
             f._nameText:SetJustifyH("LEFT"); f._nameText:SetJustifyV("BOTTOM")
         elseif pos == "bottom" then
-            f._nameText:SetPoint("BOTTOM", f._health, "BOTTOM", ox, 2 + oy)
+            f._nameText:SetPoint("BOTTOM", ntHost, "BOTTOM", ox, 2 + oy)
             f._nameText:SetJustifyH("CENTER"); f._nameText:SetJustifyV("BOTTOM")
         elseif pos == "bottomright" then
-            f._nameText:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", -2 + ox, 2 + oy)
+            f._nameText:SetPoint("BOTTOMRIGHT", ntHost, "BOTTOMRIGHT", -2 + ox, 2 + oy)
             f._nameText:SetJustifyH("RIGHT"); f._nameText:SetJustifyV("BOTTOM")
         else -- center
-            f._nameText:SetPoint("CENTER", f._health, "CENTER", ox, oy)
+            f._nameText:SetPoint("CENTER", ntHost, "CENTER", ox, oy)
             f._nameText:SetJustifyH("CENTER"); f._nameText:SetJustifyV("MIDDLE")
         end
         -- Force text re-render (WoW doesn't visually re-layout on JustifyH change alone)
@@ -13236,32 +13714,33 @@ local function ApplyPreviewData(f, index)
         local htW = (s.frameWidth or 72) * 0.75
         f._healthText:SetWidth(htW)
         f._healthText:SetHeight(0)
+        local htHost = ns.RF_AnchorHost(f._health, s)
         if htPos == "topleft" then
-            f._healthText:SetPoint("TOPLEFT", f._health, "TOPLEFT", 2 + htOX, -2 + htOY)
+            f._healthText:SetPoint("TOPLEFT", htHost, "TOPLEFT", 2 + htOX, -2 + htOY)
             f._healthText:SetJustifyH("LEFT"); f._healthText:SetJustifyV("TOP")
         elseif htPos == "top" then
-            f._healthText:SetPoint("TOP", f._health, "TOP", htOX, -2 + htOY)
+            f._healthText:SetPoint("TOP", htHost, "TOP", htOX, -2 + htOY)
             f._healthText:SetJustifyH("CENTER"); f._healthText:SetJustifyV("TOP")
         elseif htPos == "topright" then
-            f._healthText:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", -2 + htOX, -2 + htOY)
+            f._healthText:SetPoint("TOPRIGHT", htHost, "TOPRIGHT", -2 + htOX, -2 + htOY)
             f._healthText:SetJustifyH("RIGHT"); f._healthText:SetJustifyV("TOP")
         elseif htPos == "left" then
-            f._healthText:SetPoint("LEFT", f._health, "LEFT", 2 + htOX, htOY)
+            f._healthText:SetPoint("LEFT", htHost, "LEFT", 2 + htOX, htOY)
             f._healthText:SetJustifyH("LEFT"); f._healthText:SetJustifyV("MIDDLE")
         elseif htPos == "right" then
-            f._healthText:SetPoint("RIGHT", f._health, "RIGHT", -2 + htOX, htOY)
+            f._healthText:SetPoint("RIGHT", htHost, "RIGHT", -2 + htOX, htOY)
             f._healthText:SetJustifyH("RIGHT"); f._healthText:SetJustifyV("MIDDLE")
         elseif htPos == "bottomleft" then
-            f._healthText:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 2 + htOX, 2 + htOY)
+            f._healthText:SetPoint("BOTTOMLEFT", htHost, "BOTTOMLEFT", 2 + htOX, 2 + htOY)
             f._healthText:SetJustifyH("LEFT"); f._healthText:SetJustifyV("BOTTOM")
         elseif htPos == "bottom" then
-            f._healthText:SetPoint("BOTTOM", f._health, "BOTTOM", htOX, 2 + htOY)
+            f._healthText:SetPoint("BOTTOM", htHost, "BOTTOM", htOX, 2 + htOY)
             f._healthText:SetJustifyH("CENTER"); f._healthText:SetJustifyV("BOTTOM")
         elseif htPos == "bottomright" then
-            f._healthText:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", -2 + htOX, 2 + htOY)
+            f._healthText:SetPoint("BOTTOMRIGHT", htHost, "BOTTOMRIGHT", -2 + htOX, 2 + htOY)
             f._healthText:SetJustifyH("RIGHT"); f._healthText:SetJustifyV("BOTTOM")
         else
-            f._healthText:SetPoint("CENTER", f._health, "CENTER", htOX, htOY)
+            f._healthText:SetPoint("CENTER", htHost, "CENTER", htOX, htOY)
             f._healthText:SetJustifyH("CENTER"); f._healthText:SetJustifyV("MIDDLE")
         end
         -- Force text re-render (WoW doesn't visually re-layout on JustifyH change alone)
@@ -13315,7 +13794,7 @@ local function ApplyPreviewData(f, index)
     if f._healAbsorbText then
         local haMode = s.healAbsorbTextMode or "none"
         ApplyFont(f._healAbsorbText, s.healAbsorbTextSize or 9)
-        ns.AnchorRFText(f._healAbsorbText, f._health, s.healAbsorbTextPosition or "center",
+        ns.AnchorRFText(f._healAbsorbText, ns.RF_AnchorHost(f._health, s), s.healAbsorbTextPosition or "center",
             s.healAbsorbTextOffsetX or 0, s.healAbsorbTextOffsetY or 0, (s.frameWidth or 72) * 0.75)
         if haMode ~= "none" and not isDead and not isOffline then
             ns.FormatHealAbsorbInto(f._healAbsorbText, math.floor(healthPct * 3000), haMode)
@@ -13346,24 +13825,25 @@ local function ApplyPreviewData(f, index)
         local stPos = s.statusTextPosition or "center"
         local stOX = s.statusTextOffsetX or 0
         local stOY = s.statusTextOffsetY or 0
+        local stHost = ns.RF_AnchorHost(f._health, s)
         if stPos == "topleft" then
-            f._statusText:SetPoint("TOPLEFT", f._health, "TOPLEFT", 2 + stOX, -2 + stOY)
+            f._statusText:SetPoint("TOPLEFT", stHost, "TOPLEFT", 2 + stOX, -2 + stOY)
         elseif stPos == "top" then
-            f._statusText:SetPoint("TOP", f._health, "TOP", stOX, -2 + stOY)
+            f._statusText:SetPoint("TOP", stHost, "TOP", stOX, -2 + stOY)
         elseif stPos == "topright" then
-            f._statusText:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", -2 + stOX, -2 + stOY)
+            f._statusText:SetPoint("TOPRIGHT", stHost, "TOPRIGHT", -2 + stOX, -2 + stOY)
         elseif stPos == "left" then
-            f._statusText:SetPoint("LEFT", f._health, "LEFT", 2 + stOX, stOY)
+            f._statusText:SetPoint("LEFT", stHost, "LEFT", 2 + stOX, stOY)
         elseif stPos == "right" then
-            f._statusText:SetPoint("RIGHT", f._health, "RIGHT", -2 + stOX, stOY)
+            f._statusText:SetPoint("RIGHT", stHost, "RIGHT", -2 + stOX, stOY)
         elseif stPos == "bottomleft" then
-            f._statusText:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 2 + stOX, 2 + stOY)
+            f._statusText:SetPoint("BOTTOMLEFT", stHost, "BOTTOMLEFT", 2 + stOX, 2 + stOY)
         elseif stPos == "bottom" then
-            f._statusText:SetPoint("BOTTOM", f._health, "BOTTOM", stOX, 2 + stOY)
+            f._statusText:SetPoint("BOTTOM", stHost, "BOTTOM", stOX, 2 + stOY)
         elseif stPos == "bottomright" then
-            f._statusText:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", -2 + stOX, 2 + stOY)
+            f._statusText:SetPoint("BOTTOMRIGHT", stHost, "BOTTOMRIGHT", -2 + stOX, 2 + stOY)
         else
-            f._statusText:SetPoint("CENTER", f._health, "CENTER", stOX, stOY)
+            f._statusText:SetPoint("CENTER", stHost, "CENTER", stOX, stOY)
         end
         if isRezCorpse then
             -- Being resurrected: the rez icon takes this spot, so no DEAD text.
@@ -13426,7 +13906,7 @@ local function ApplyPreviewData(f, index)
                 f._roleIcon:SetSize(riSz, riSz)
                 f._roleIcon:ClearAllPoints()
                 local pos = (s.roleIconPosition or "bottomleft"):upper()
-                f._roleIcon:SetPoint(pos, f._health, pos, s.roleIconOffsetX or 0, s.roleIconOffsetY or 0)
+                f._roleIcon:SetPoint(pos, ns.RF_AnchorHost(f._health, s), pos, s.roleIconOffsetX or 0, s.roleIconOffsetY or 0)
                 f._roleIcon:Show()
             else
                 f._roleIcon:Hide()
@@ -13443,11 +13923,51 @@ local function ApplyPreviewData(f, index)
             f._leaderIcon:SetSize(liSz, liSz)
             f._leaderIcon:ClearAllPoints()
             local liPos = (s.leaderIconPosition or "top"):upper()
-            f._leaderIcon:SetPoint(liPos, f._health, liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
+            f._leaderIcon:SetPoint(liPos, ns.RF_AnchorHost(f._health, s), liPos, s.leaderIconOffsetX or 0, s.leaderIconOffsetY or 0)
             f._leaderIcon:SetTexture("Interface\\GroupFrame\\UI-Group-LeaderIcon")
             f._leaderIcon:Show()
         else
             f._leaderIcon:Hide()
+        end
+    end
+
+    -- Combat icon: on live alive members when the indicators eyeball is on.
+    if f._combatIcon then
+        if indVis and s.showCombatIndicator and not isDead and not isOffline then
+            local cciSz = PixelSnap(s.combatIndicatorSize or 16)
+            f._combatIcon:SetSize(cciSz, cciSz)
+            f._combatIcon:ClearAllPoints()
+            local ciPos = (s.combatIndicatorPosition or "right"):upper()
+            f._combatIcon:SetPoint(ciPos, ns.RF_AnchorHost(f._health, s), ciPos, s.combatIndicatorOffsetX or 0, s.combatIndicatorOffsetY or 0)
+            local style = s.combatIndicatorStyle or "standard"
+            local MEDIA = ns._COMBAT_MEDIA
+            if style:find("^combat%d") then
+                f._combatIcon:SetTexture(MEDIA .. style .. ".tga")
+                f._combatIcon:SetTexCoord(0, 1, 0, 1)
+                if f._combatIcon.SetDesaturated then f._combatIcon:SetDesaturated(false) end
+                f._combatIcon:SetVertexColor(1, 1, 1, 1)
+            else
+                if style == "class" then
+                    f._combatIcon:SetTexture(MEDIA .. "combat-indicator-class-custom.png")
+                    local coords = classToken and ns._COMBAT_CLASS_COORDS[classToken]
+                    if coords then f._combatIcon:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+                    else f._combatIcon:SetTexCoord(0, 1, 0, 1) end
+                else
+                    f._combatIcon:SetTexture(MEDIA .. "combat-indicator-custom.png")
+                    f._combatIcon:SetTexCoord(0, 1, 0, 1)
+                end
+                local colorMode = s.combatIndicatorColor or "custom"
+                if colorMode == "classcolor" then
+                    local cc = (classToken and EllesmereUI.GetClassColor(classToken)) or { r = 1, g = 1, b = 1 }
+                    f._combatIcon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+                else
+                    local cc = s.combatIndicatorCustomColor or { r = 1, g = 1, b = 1 }
+                    f._combatIcon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+                end
+            end
+            f._combatIcon:Show()
+        else
+            f._combatIcon:Hide()
         end
     end
 
@@ -14762,7 +15282,10 @@ local function HidePartyPreview(skipRestore)
     -- is a combat-legal SetAlpha(1) plus dropping the mouse blockers. See
     -- HidePreview. No combat gate, no SetParent/SetPoint, no ns._restorePending.
     ns._SetRealFramesPreviewHidden(false)
-    if not InCombatLockdown() then LayoutGroups() end
+    if not InCombatLockdown() then
+        LayoutGroups()
+        if ns._ApplyTierOffset then ns._ApplyTierOffset() end
+    end
     UpdateVisibility()
     if ns._UpdatePartyVisibility then ns._UpdatePartyVisibility() end
 end
@@ -15137,6 +15660,9 @@ function ERF:OnEnable()
     for i = 1, 4 do MakeUnitTracker("party" .. i) end
     for i = 1, 40 do MakeUnitTracker("raid" .. i) end
     eventFrame:SetScript("OnEvent", OnEvent)
+
+    -- UNIT_FLAGS is opt-in: only registered while the combat icon is enabled.
+    if ns.UpdateCombatEventRegistration then ns.UpdateCombatEventRegistration() end
 
     -- Dynamically register/unregister UNIT_POWER_UPDATE per unit based on
     -- role and power display settings. Called after roster changes and

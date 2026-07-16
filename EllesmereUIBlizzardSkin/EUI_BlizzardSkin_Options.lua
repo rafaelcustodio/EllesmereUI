@@ -1161,6 +1161,29 @@ initFrame:SetScript("OnEvent", function(self)
         return y
     end
 
+    local function BuildMerchantContent(parent, y)
+        local W = EllesmereUI.Widgets
+        local _, h
+
+        _, h = WSCardSection(parent, "QUALITY OF LIFE", y);  y = y - h
+
+        _, h = W:DualRow(parent, y,
+            { type="toggle", text="Show Item Level",
+              tooltip="Shows the item level on weapons and armor a vendor sells.",
+              getValue=function()
+                  return EllesmereUIDB and EllesmereUIDB.merchantShowItemLevel == true
+              end,
+              setValue=function(v)
+                  if not EllesmereUIDB then EllesmereUIDB = {} end
+                  EllesmereUIDB.merchantShowItemLevel = v
+                  if EllesmereUI._Merchant_RefreshItemLevels then EllesmereUI._Merchant_RefreshItemLevels() end
+              end },
+            { type="label", text="" }
+        );  y = y - h
+
+        return y
+    end
+
     ---------------------------------------------------------------------------
     --  Blizzard Window Skins page: one expandable card per reskinned window.
     --  Card headers are custom chrome, but every sub-setting ROW is a standard
@@ -1510,6 +1533,7 @@ initFrame:SetScript("OnEvent", function(self)
                 if not EllesmereUIDB then EllesmereUIDB = {} end
                 EllesmereUIDB.reskinMerchant = v
             end,
+            buildContent = BuildMerchantContent,
         },
         {
             key   = "auctionhouse",
@@ -1671,6 +1695,27 @@ initFrame:SetScript("OnEvent", function(self)
         hdr._sectionName = searchName
         local searchNameLoc = L(win.title) .. " " .. L(win.desc or "")
         if searchNameLoc ~= searchName then hdr._sectionNameLoc = searchNameLoc end
+
+        -- Global (sidebar) search: the card header never goes through
+        -- SectionHeader, so the index would otherwise have no entry for it --
+        -- searching a window's title/description found it inline but not in
+        -- the sidebar results. Register it with the same title + description
+        -- keywords the inline pseudo-section matches (title as the display
+        -- label, description via the tooltip field, which the fuzzy scorer
+        -- also searches). section = the exact joined string stamped above, so
+        -- a jump scrolls to and glows this header; the page's
+        -- NavigateToElementSettings pre-hook expands the cards first.
+        if EllesmereUI._RegisterSearchEntry then
+            local titleLoc = L(win.title)
+            local descSearch = win.desc or ""
+            local descLoc = L(win.desc or "")
+            if descLoc ~= descSearch then descSearch = descSearch .. " " .. descLoc end
+            EllesmereUI._RegisterSearchEntry(win.title,
+                titleLoc ~= win.title and titleLoc or nil,
+                descSearch,
+                EllesmereUI._buildingModule, EllesmereUI._buildingPage,
+                searchName, nil, nil, true)
+        end
 
         -- Hover wash (transparent when idle; the card bg below provides the fill)
         local hbg = EllesmereUI.SolidTex(hdr, "BACKGROUND", 0, 0, 0, 0)

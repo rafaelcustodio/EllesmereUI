@@ -213,7 +213,6 @@ local StartNativeGlow, StopNativeGlow
 -- Keybind cache: built once out-of-combat, looked up per tick
 local _cdmKeybindCache       = {}   -- [spellID] -> formatted key string
 local _cdmKeybindFromMacro   = {}   -- [key] -> true if the cached bind came from a macro
-local _keybindRebuildPending = false
 local _keybindCacheReady     = false  -- true after first successful build
 local _keybindDebounceTimer  = nil   -- cancellable timer for debounced keybind updates
 
@@ -613,6 +612,21 @@ function ns.GetActiveTBBBroadcastSet()
     if not bucket then return {} end
     if not bucket.tbbBroadcast then bucket.tbbBroadcast = {} end
     return bucket.tbbBroadcast
+end
+
+-- Smooth-fill switches for Tracking Bars (Bar Layout > Smooth Bars). ONE
+-- setting for ALL bars in EVERY spec: lives on the profile bucket OUTSIDE
+-- specProfiles (same home as the broadcast set), so it applies across spec
+-- switches and forks with the profile. Keys: buffs / cooldowns; absent
+-- buffs reads ENABLED, absent cooldowns reads DISABLED (the defaults).
+function ns.GetTBBSmoothSettings()
+    local name = ns.GetActiveProfileName()
+    ns.GetSpecProfilesForProfile(name)
+    local sa = SpellStore.Get()
+    local bucket = sa.profiles and sa.profiles[name]
+    if not bucket then return nil end
+    if not bucket.tbbSmooth then bucket.tbbSmooth = {} end
+    return bucket.tbbSmooth
 end
 
 -- Active SPELL LAYOUT name. Layouts are a shared, account-wide library
@@ -4403,7 +4417,11 @@ function ns.SetCdStateShiftHidden(fc, shiftHidden)
     shiftHidden = shiftHidden or false
     if (fc._cdStateShiftHidden or false) == shiftHidden then return end
     fc._cdStateShiftHidden = shiftHidden
-    local bk = fc.barKey
+    -- Overflow-diverted frames render on the target bar, so the gap-close
+    -- relayout must hit the bar the frame is actually laid out on. Normally
+    -- unreachable for diverted frames (Phase 3b's no-op rule), but there is
+    -- a one-reanchor window after a shift effect is first configured.
+    local bk = fc._overflowLayoutBar or fc.barKey
     if not bk or ns._cdShiftLayoutPending[bk] then return end
     ns._cdShiftLayoutPending[bk] = true
     C_Timer.After(0, function()
@@ -5422,9 +5440,18 @@ local function RefreshCDMIconAppearance(barKey)
                             ifd._cdStateGlowOn = true
                         end
                     end
-                    -- Event-driven re-evaluation for Resource Aware glows only
-                    -- (inert unless watched).
-                    if glowUsable and ns.CDGlowWatch then ns.CDGlowWatch(icon) end
+                    -- Event-driven re-evaluation: Resource Aware glows always,
+                    -- plus plain glows on EUI custom frames (their SetDesaturation
+                    -- never fires the SetDesaturated hook that would re-evaluate
+                    -- them). Fake-Active-owned frames (PresetHasCdState) excluded.
+                    local watchGlow = glowUsable
+                    if not watchGlow
+                        and (icon._isRacialFrame or icon._isTrinketFrame or icon._isPresetFrame
+                             or icon._isItemPresetFrame or icon._isCustomSpellFrame)
+                        and not (ns.PresetHasCdState and ns.PresetHasCdState(icon)) then
+                        watchGlow = true
+                    end
+                    if watchGlow and ns.CDGlowWatch then ns.CDGlowWatch(icon) end
                 end
             end
         elseif glowOv then
@@ -5506,8 +5533,21 @@ local function RefreshCDMIconAppearance(barKey)
                             end
                         end
                     end
-                    if (cse == "pixelGlowReadyUsable" or cse == "buttonGlowReadyUsable")
-                       and glowOv and ns.CDGlowWatch then
+                    -- Resource Aware glows always watch cooldown events. Plain
+                    -- glows normally re-evaluate through the SetDesaturated hook,
+                    -- but EUI's custom frames (racial / trinket / potion / custom)
+                    -- drive desaturation via SetDesaturation(float), which never
+                    -- fires that hook -- without a watch their glow stays lit for
+                    -- the whole cooldown. Frames owned by the Fake-Active preset
+                    -- path (PresetHasCdState) are excluded; that engine glows them.
+                    local watchGlow = cse == "pixelGlowReadyUsable" or cse == "buttonGlowReadyUsable"
+                    if not watchGlow and (cse == "pixelGlowReady" or cse == "buttonGlowReady")
+                        and (icon._isRacialFrame or icon._isTrinketFrame or icon._isPresetFrame
+                             or icon._isItemPresetFrame or icon._isCustomSpellFrame)
+                        and not (ns.PresetHasCdState and ns.PresetHasCdState(icon)) then
+                        watchGlow = true
+                    end
+                    if watchGlow and glowOv and ns.CDGlowWatch then
                         ns.CDGlowWatch(icon)
                     end
                 end
@@ -6575,9 +6615,9 @@ ns.GetBarData = GetBarData
 
 -------------------------------------------------------------------------------
 --  Keybind cache for CDM icons
---  Reads HotKey text directly from action button frames -- the same source
---  the action bar itself uses, so it's always correct regardless of bar addon.
---  Deferred if called during combat; fires on PLAYER_REGEN_ENABLED instead.
+--  Resolves binding keys per action slot (main bar paged via the EAB bar's
+--  actionpage attribute, else client page APIs). Read-only + text writes on
+--  our own frames, so it is safe to run in combat (debounced upstream).
 -------------------------------------------------------------------------------
 
 -- Action bar slot -> binding name map. Non-bar-1 entries listed first so that
@@ -6638,8 +6678,23 @@ local function RebuildKeybindCache()
             if key then
                 local slot = def.startSlot + i - 1
                 if def.prefix == "ACTIONBUTTON" then
-                    local btn = _G["ActionButton" .. i]
-                    if btn and btn.action then slot = btn.action end
+                    -- Main bar pages with forms/vehicles. Prefer the EAB main
+                    -- bar's actionpage attribute (set by its secure page
+                    -- handler, covers override/vehicle pages too). Without it
+                    -- (Action Bars module disabled), derive the page from the
+                    -- client: bonus bars (forms) map to pages 7+, else the
+                    -- manually selected page.
+                    local mbf = _G["EABBar_MainBar"]
+                    local pg = mbf and tonumber(mbf:GetAttribute("actionpage"))
+                    if not pg then
+                        local bonus = GetBonusBarOffset and GetBonusBarOffset() or 0
+                        if bonus > 0 then
+                            pg = 6 + bonus
+                        else
+                            pg = (GetActionBarPage and GetActionBarPage()) or 1
+                        end
+                    end
+                    slot = i + (pg - 1) * 12
                 end
                 local slotType, id = GetActionInfo(slot)
                 local spellID
@@ -6719,13 +6774,7 @@ local function ApplyCachedKeybinds()
     end
 end
 
--- Public entry point: rebuild cache then apply. Defers if in combat.
 local function UpdateCDMKeybinds()
-    if _inCombat then
-        _keybindRebuildPending = true
-        return
-    end
-    _keybindRebuildPending = false
     RebuildKeybindCache()
     _keybindCacheReady = true
     -- Defer apply by one frame so the Blizzard tick has populated FC(icon).spellID
@@ -6815,8 +6864,17 @@ BuildAllCDMBars = function()
     -- Build each bar and populate fast lookup
     local hookActive = ns.IsViewerHooked and ns.IsViewerHooked()
     wipe(barDataByKey)
+    ns._cdmAnyOverflowCfg = nil
     for i, barData in ipairs(p.cdmBars.bars) do
         barDataByKey[barData.key] = barData
+        -- Max Icons overflow: cheap session gate. Validity of the target is
+        -- checked at reanchor time (Phase 3b); this only answers "is it
+        -- worth looking" so the feature is two nil-checks when unused.
+        if not ns._cdmAnyOverflowCfg and barData.enabled
+           and barData.maxIcons and barData.maxIcons > 0
+           and barData.overflowTarget then
+            ns._cdmAnyOverflowCfg = true
+        end
         BuildCDMBar(i)
         local frame = cdmBarFrames[barData.key]
         if frame then frame._prevVisibleCount = nil end
@@ -7235,6 +7293,12 @@ function ns.ReseedAssignedSpellsFromLiveIcons()
                     local fdRS = ns._hookFrameData and ns._hookFrameData[icon]
                     if (fc and fc.isHostedBuff) or icon._isPlaceholderFrame
                        or (fdRS and fdRS._isBuffViewerFrame) then
+                        sid = nil
+                    end
+                    -- Skip overflow-diverted icons: they render on this bar
+                    -- only for the session but belong to their source bar's
+                    -- assignedSpells (mirrors the EnsureAssignedSpells skip).
+                    if sid and fc and fc._overflowLayoutBar then
                         sid = nil
                     end
                     if type(sid) == "number" and sid ~= 0 then
@@ -8055,11 +8119,19 @@ local function UpdateRotationHighlights()
 
     local newSet = {}
     if suggestedSpell then
+        -- Icons store BASE spell ids while GetNextCastSpell returns the
+        -- OVERRIDE (e.g. Maul stored, Raze suggested). Resolve the
+        -- suggestion's base ONCE per pass instead of querying an override
+        -- per icon -- this runs every assisted-highlight change in combat.
+        local suggestedBase = C_Spell and C_Spell.GetBaseSpell
+            and C_Spell.GetBaseSpell(suggestedSpell)
+        if suggestedBase == suggestedSpell then suggestedBase = nil end
         for _, icons in pairs(cdmBarIcons) do
             for _, icon in ipairs(icons) do
                 local ifc = _ecmeFC[icon]
                 local sid = ifc and ifc.spellID
-                if sid and sid == suggestedSpell and icon:IsShown() then
+                if sid and (sid == suggestedSpell or (suggestedBase and sid == suggestedBase))
+                   and icon:IsShown() then
                     _rotShow(icon)
                     newSet[icon] = true
                 end
@@ -8385,10 +8457,6 @@ eventFrame:SetScript("OnEvent", function(_, event, unit, updateInfo, arg3)
         if event == "PLAYER_REGEN_ENABLED" and ns.IsTBBRebuildPending and ns.IsTBBRebuildPending() then
             if ns.BuildTrackedBuffBars then ns.BuildTrackedBuffBars() end
         end
-        -- Flush deferred keybind rebuild that was blocked during combat
-        if event == "PLAYER_REGEN_ENABLED" and _keybindRebuildPending then
-            UpdateCDMKeybinds()
-        end
         -- Flush deferred roster reanchor that was blocked during combat
         if event == "PLAYER_REGEN_ENABLED" and _rosterRebuildPending then
             _rosterRebuildPending = false
@@ -8398,27 +8466,27 @@ eventFrame:SetScript("OnEvent", function(_, event, unit, updateInfo, arg3)
     end
     if event == "PLAYER_ENTERING_WORLD" then
         _inCombat = InCombatLockdown and InCombatLockdown() or false
-        -- Arena exit backstop: leaving an arena reverts PvP talents and
-        -- spell overrides, and Blizzard re-evaluates the viewer's tracked
-        -- cooldown set. If PLAYER_PVP_TALENT_UPDATE did not fire across the
-        -- zone-out, nothing re-claims the new pool frames and the
-        -- unclaimed-frame cleanup blanks them (arena-exit empty-CDM bug).
-        -- Schedule the same debounced rebuild a talent change gets; the
-        -- token debounce collapses this with the event-driven trigger when
-        -- both fire, so at most one rebuild runs.
+        -- PvP instance transition backstop: entering or leaving a PvP
+        -- instance rebuilds viewer pools (PvP talents activate/deactivate).
+        -- Rebuild + reanchor so the new pool frames are claimed.
         local _, instType = IsInInstance()
-        if ns._cdmWasInArena and instType ~= "arena" then
+        local wasPvP = ns._cdmWasInPvP
+        local isPvP = (instType == "arena" or instType == "pvp")
+        if wasPvP and not isPvP then
             ScheduleTalentRebuild()
         end
-        ns._cdmWasInArena = (instType == "arena") or nil
+        ns._cdmWasInPvP = isPvP or nil
+        if isPvP and not wasPvP then
+            if ns.QueueReanchor then ns.QueueReanchor() end
+        end
         -- Install rotation helper hook after CDM frames have been built
         C_Timer.After(1, function()
             InstallRotationHook()
         end)
-        -- Safety: re-apply visibility after rebuild settles. Blizzard may
-        -- hide/re-show CDM viewers during loading screens (PvP scoreboard,
-        -- barbershop) and the timing race can leave viewer alpha at 0.
+        -- Safety: re-apply visibility after loading screen settles.
+        -- Two passes to catch both fast and late viewer pool rebuilds.
         C_Timer.After(1.5, _CDMApplyVisibility)
+        C_Timer.After(3, _CDMApplyVisibility)
     end
     if event == "SPELLS_CHANGED" then
         CheckSpecChange()
@@ -8434,6 +8502,12 @@ eventFrame:SetScript("OnEvent", function(_, event, unit, updateInfo, arg3)
         -- (CheckSpecChange's reconcile also rebuilds the map, but a
         -- same-key fire means the data changed again after that rebuild.)
         if ns.RebuildSpellRouteMap then ns.RebuildSpellRouteMap() end
+        -- The tracked-buff catalog can change in the same churn, and the
+        -- login-pass reconcile may have consumed its dirty flag against a
+        -- still-empty viewer pool (the flag is cleared before the call and
+        -- an empty catalog no-ops). Re-arm so the queued reanchor
+        -- reconciles the buff display order against the populated catalog.
+        ns._cdmBuffOrderDirty = true
         if ns.QueueReanchor then ns.QueueReanchor() end
         return
     end

@@ -31,6 +31,7 @@ local PRELOADED = {
     "BankFrame",
     "MailFrame",
     "GossipFrame",
+    "QuestFrame",
     "MerchantFrame",
     "AddonList",
     "ChatConfigFrame",
@@ -94,8 +95,15 @@ local ADDON_FRAMES = {
 -- For these frames the drag target is a child header element, not the frame
 -- itself (avoids fighting model-rotate or interior click regions).
 local DRAG_HEADERS = {
-    ["AchievementFrame"] = "AchievementFrameHeader",
-    ["WorldMapFrame"]    = "WorldMapTitleButton",
+    ["WorldMapFrame"] = "WorldMapTitleButton",
+}
+
+-- Extra drag handles layered ON TOP of the frame body. Used when a
+-- mouse-enabled child sits over the frame and would otherwise swallow the
+-- drag (e.g. the Achievement frame's floating points header). Values resolve
+-- to a child frame: either a global name or a function(frame) -> child.
+local EXTRA_DRAG_TARGETS = {
+    ["AchievementFrame"] = function(frame) return frame.Header or _G["AchievementFrameHeader"] end,
 }
 
 -- Blizzard windows that normally dock beside CharacterFrame (Item Upgrade,
@@ -103,6 +111,17 @@ local DRAG_HEADERS = {
 -- Exchange -- plus Friends, Guild/Communities, and Professions, which
 -- normally sit to CharacterFrame's left with CharacterFrame staying put).
 -- See the docking hook in HookFrame for why and how.
+--
+-- PVEFrame is deliberately NOT here: EllesmereUIBlizzardSkin_GroupFinder.lua
+-- owns that pairing instead, docking CharacterFrame beside PVEFrame (rather
+-- than the reverse) with room-detection that also accounts for third-party
+-- companion panels bolted onto PVEFrame (e.g. RaiderIO's Mythic+ panel).
+-- Having both mechanisms active fought each other: this one's plain room
+-- check has no idea RaiderIO's panel exists, so it could re-dock PVEFrame
+-- right back on top of it the moment CharacterFrame got any saved/temp
+-- Shifter position at all. PVEFrame being protected already skipped this
+-- module's strata/Raise writes too (see the `else` branch below), so
+-- dropping it here leaves it entirely to GroupFinder.lua, with nothing lost.
 local DOCKING_COMPANIONS = {
     ItemUpgradeFrame = true,
     TransmogFrame = true,
@@ -114,7 +133,6 @@ local DOCKING_COMPANIONS = {
     ProfessionsBookFrame = true,
     WorldMapFrame = true,
     HousingDashboardFrame = true,
-    PVEFrame = true,
 }
 
 -------------------------------------------------------------------------------
@@ -453,6 +471,32 @@ local function StartSecureDrag(frame, name, mode)
 end
 
 -------------------------------------------------------------------------------
+--  Companion re-dock on CharacterFrame changes.
+--
+--  Each DOCKING_COMPANIONS frame only re-evaluates its own docked position
+--  when ITS OWN OnShow/SetPoint fires -- never when CharacterFrame itself
+--  moves or rescales. So a companion (WorldMap, Guild/Communities, PVEFrame,
+--  etc.) that's already open and correctly docked goes stale the moment
+--  CharacterFrame is scaled or repositioned afterward, since nothing tells
+--  it to re-check. Every companion registers its ShouldDock/DockToCharacter-
+--  Frame closures here as it's hooked; CharacterFrame's own SetPoint/SetScale
+--  (hooked separately below) walks this list and re-docks anything that
+--  should currently be docked, closing that gap.
+-------------------------------------------------------------------------------
+local dockedCompanions = {}
+
+local function RedockCompanions()
+    for i = 1, #dockedCompanions do
+        local c = dockedCompanions[i]
+        if c.frame:IsShown() and c.shouldDock() then
+            if not c.frame:IsProtected() then c.frame:SetFrameStrata("DIALOG") end
+            c.dock()
+            if not c.frame:IsProtected() then c.frame:Raise() end
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
 --  Hook a single frame
 -------------------------------------------------------------------------------
 local function HookFrame(frame, name)
@@ -471,55 +515,64 @@ local function HookFrame(frame, name)
         frame:SetClampedToScreen(true)
     end
 
-    -- Determine drag target (header child or the frame itself)
-    local headerName = DRAG_HEADERS[name]
-    local dragTarget = (headerName and _G[headerName]) or frame
-
     local dragging  -- non-protected only: "save" | "temp" | nil
 
-    dragTarget:HookScript("OnMouseDown", function(_, button)
-        if not IsEnabled() then return end
-        if button ~= "LeftButton" then return end
-        if InCombatLockdown() and frame:IsProtected() then return end
-        local noShift = EllesmereUIDB and EllesmereUIDB.shifterNoShift
-        local mode
-        if IsShiftKeyDown() or noShift then
-            mode = "save"
-        elseif IsControlKeyDown() then
-            mode = "temp"
-        else
-            return
-        end
-        if frame:IsProtected() then
-            StartSecureDrag(frame, name, mode)
-        else
-            dragging = mode
-            frame:StartMoving()
-        end
-    end)
-
-    dragTarget:HookScript("OnMouseUp", function(_, button)
-        if button ~= "LeftButton" then return end
-        if frame:IsProtected() then
-            if secureDrag.frame == frame then StopSecureDrag() end
-            return
-        end
-        if not dragging then return end
-        frame:StopMovingOrSizing()
-        frame:SetUserPlaced(false)
-        local p, _, rp, x, y = frame:GetPoint(1)
-        if p then
-            if dragging == "save" then
-                SavePos(name, p, rp, x, y)
-                tempPos[frame] = nil
+    local function AttachDrag(dragTarget)
+        if not dragTarget or not dragTarget.HookScript then return end
+        dragTarget:HookScript("OnMouseDown", function(_, button)
+            if not IsEnabled() then return end
+            if button ~= "LeftButton" then return end
+            if InCombatLockdown() and frame:IsProtected() then return end
+            local noShift = EllesmereUIDB and EllesmereUIDB.shifterNoShift
+            local mode
+            if IsShiftKeyDown() or noShift then
+                mode = "save"
+            elseif IsControlKeyDown() then
+                mode = "temp"
             else
-                tempPos[frame] = {
-                    point = p, relPoint = rp, x = x, y = y,
-                }
+                return
             end
-        end
-        dragging = nil
-    end)
+            if frame:IsProtected() then
+                StartSecureDrag(frame, name, mode)
+            else
+                dragging = mode
+                frame:StartMoving()
+            end
+        end)
+
+        dragTarget:HookScript("OnMouseUp", function(_, button)
+            if button ~= "LeftButton" then return end
+            if frame:IsProtected() then
+                if secureDrag.frame == frame then StopSecureDrag() end
+                return
+            end
+            if not dragging then return end
+            frame:StopMovingOrSizing()
+            frame:SetUserPlaced(false)
+            local p, _, rp, x, y = frame:GetPoint(1)
+            if p then
+                if dragging == "save" then
+                    SavePos(name, p, rp, x, y)
+                    tempPos[frame] = nil
+                else
+                    tempPos[frame] = {
+                        point = p, relPoint = rp, x = x, y = y,
+                    }
+                end
+            end
+            dragging = nil
+        end)
+    end
+
+    -- Primary drag target (header child or the frame itself)
+    local headerName = DRAG_HEADERS[name]
+    AttachDrag((headerName and _G[headerName]) or frame)
+
+    -- Extra handles layered on top of the frame body
+    local extra = EXTRA_DRAG_TARGETS[name]
+    if extra then
+        AttachDrag(type(extra) == "function" and extra(frame) or _G[extra])
+    end
 
     frame:HookScript("OnShow", function()
         if not IsEnabled() then return end
@@ -628,7 +681,18 @@ local function HookFrame(frame, name)
                 if not frame:IsProtected() then frame:Raise() end
             end
         end)
-    elseif name ~= "CharacterFrame" then
+        dockedCompanions[#dockedCompanions + 1] = { frame = frame, shouldDock = ShouldDock, dock = DockToCharacterFrame }
+    elseif name == "CharacterFrame" then
+        -- CharacterFrame itself isn't a companion, but every companion's dock
+        -- is relative to IT -- so a scale or position change here is exactly
+        -- what leaves already-open companions stale (see RedockCompanions).
+        hooksecurefunc(frame, "SetPoint", function()
+            if IsEnabled() then RedockCompanions() end
+        end)
+        hooksecurefunc(frame, "SetScale", function()
+            if IsEnabled() then RedockCompanions() end
+        end)
+    else
         -- Any other Shifter-managed window can end up rendered underneath a
         -- Shifter-pinned CharacterFrame purely because CharacterFrame's skin
         -- forces it to "HIGH" strata -- not because it's meant to dock
