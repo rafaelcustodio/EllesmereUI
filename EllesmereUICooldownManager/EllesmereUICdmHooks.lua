@@ -338,6 +338,28 @@ local function ResolveSpellSettings(frame, sid2, sd2, barKey)
 
     local ChainSettings = ns.ChainSettings
 
+    -- Per-cooldownID buff override: two buff-viewer slots can share one
+    -- canonical spellID (Diabolist Demonic Art vs Diabolic Ritual) but be
+    -- configured independently under a "c"..cooldownID key. Gated so the hot
+    -- path is untouched for every store WITHOUT such a key (BuffFamHasCdKey is
+    -- a cheap store-identity-cached bool), and scoped to buff-viewer frames so
+    -- no cooldown/utility icon ever pays the string build.
+    if frame then
+        local fdC = ns._hookFrameData and ns._hookFrameData[frame]
+        -- Buff-viewer frames AND their inactive-buff placeholders (Always Show /
+        -- Keep in Same Place) both carry the viewer cooldownID and must resolve
+        -- the same per-slot entry, else a collided slot's styling would revert
+        -- whenever the placeholder shows. type(cdID) == "number" still excludes
+        -- preset placeholders, which nil the cooldownID.
+        if (fdC and fdC._isBuffViewerFrame) or frame._isPlaceholderFrame then
+            local cdID = frame.cooldownID
+            if type(cdID) == "number" and ns.BuffFamHasCdKey and ns.BuffFamHasCdKey(settings) then
+                local cd = settings["c" .. cdID]
+                if cd then ChainSettings(cd, tier); return cd end
+            end
+        end
+    end
+
     -- Fast path: direct hit on the primary id (the common, non-override case).
     -- Returns before building the identity set / addId closure below, so the hot
     -- SetSwipeColor path stays allocation-free for spells without an override.
@@ -1586,7 +1608,7 @@ local function DecorateFrame(frame, barData)
             brdR, brdG, brdB, barData.borderA or 1,
             textureKey, barData.borderTextureOffset, barData.borderTextureOffsetY,
             barData.borderTextureShiftX, barData.borderTextureShiftY,
-            "cdm", barData.borderThickness or "thin")
+            "cdm", barData.borderThickness or "thin", true)
         -- ApplyBorderStyle above always paints the bar's BASE color. If this
         -- spell's active-state tint is currently engaged (ns.ApplyActiveOverlays
         -- drives fd._activeBorderOn independently of DecorateFrame, via Blizzard's
@@ -5480,6 +5502,25 @@ local function CollectAndReanchor()
             if added and added > 0 then
                 if ns.RebuildSpellRouteMap then ns.RebuildSpellRouteMap() end
                 if ns.QueueReanchor then ns.QueueReanchor() end
+            end
+        end
+        -- Automatic base-bar materialization (once per spec per session):
+        -- untouched default-bar spells render through the frames-as-truth
+        -- fallback without ever being recorded in assignedSpells, so export
+        -- strings shipped incomplete stores and the import ghost pass hid
+        -- exactly those spells on every recipient. Reseed from the live
+        -- icons -- ONLY after the one-shot migration has stamped (a legacy
+        -- un-migrated store must migrate first or old-model spillovers
+        -- would materialize), never while an import's ghosting is pending
+        -- (Reseed self-guards too), and buff-family bars excluded
+        -- (cdUtilOnly: picker-authoritative). The session flag is wiped on
+        -- talent/loadout changes so newly learned spells re-materialize.
+        if ns.ReseedAssignedSpellsFromLiveIcons and prof
+           and prof._barFilterModelV6 and not prof._importGhostMode then
+            ns._reseededSpecsSession = ns._reseededSpecsSession or {}
+            if not ns._reseededSpecsSession[specKey] then
+                ns._reseededSpecsSession[specKey] = true
+                ns.ReseedAssignedSpellsFromLiveIcons(true)
             end
         end
     end

@@ -1764,9 +1764,9 @@ end
 ns.NICK_ADDON = addonName:find("Standalone") and addonName or "EllesmereUI"
 
 -- Resolve a unit's display name, consulting nickname providers in order: NSRT
--- (NSAPI) -> Timeline Reminders (TimelineReminders) -> Liquid (LiquidAPI), then
--- the raw unit name. Each provider is gated entirely by its OWN addon (no EUI-side
--- toggle) and pcall-wrapped so a misbehaving external API can never break names.
+-- (NSAPI) -> MethodInternal (EasyNicknameAPI) -> Timeline Reminders
+-- (TimelineReminders) -> Liquid (LiquidAPI), then the raw unit name. Each provider
+-- is pcall-wrapped so a misbehaving external API can never break names.
 --
 -- SECRET-SAFE for target/focus/etc.: an enemy unit's UnitName is a secret value
 -- in protected content, and any Lua op on it (==, .., format) throws. Nicknames
@@ -1791,6 +1791,13 @@ function ns.ResolveUnitNickname(unit)
     local display
     if not nameSecret and NSAPI and NSAPI.GetName then
         local ok, dn = pcall(NSAPI.GetName, NSAPI, name, "EUI")
+        if ok and type(dn) == "string"
+           and not (issecretvalue and issecretvalue(dn)) and dn ~= "" and dn ~= name then
+            display = dn
+        end
+    end
+    if not display and not nameSecret and EasyNicknameAPI and EasyNicknameAPI.GetNicknameForUnit then
+        local ok, dn = pcall(EasyNicknameAPI.GetNicknameForUnit, unit)
         if ok and type(dn) == "string"
            and not (issecretvalue and issecretvalue(dn)) and dn ~= "" and dn ~= name then
             display = dn
@@ -11354,16 +11361,22 @@ function InitializeFrames()
             combat:SetSize(sz, sz)
             combat:ClearAllPoints()
 
-            -- Determine anchor element
-            local anchor = pf
-            if pos == "healthbar" and pf.Health then
-                anchor = pf.Health
-            elseif pos == "textbar" and pf._btb then
-                anchor = pf._btb
-            elseif pos == "portrait" and pf.Portrait then
-                anchor = pf.Portrait
+            -- "healthbar" is the stored value shown as "Center" in the dropdown;
+            -- "center" is a render alias for it.
+            if pos == "portrait" and pf.Portrait then
+                combat:SetPoint("CENTER", pf.Portrait, "CENTER", ox, oy)
+            elseif pos == "textbar" then
+                combat:SetPoint("CENTER", pf._btb or pf, "CENTER", ox, oy)
+            elseif pos == "healthbar" or pos == "center" then
+                combat:SetPoint("CENTER", pf.Health or pf, "CENTER", ox, oy)
+            else
+                local anchor =
+                    (pos == "topright"    and "TOPRIGHT")    or
+                    (pos == "bottomleft"  and "BOTTOMLEFT")  or
+                    (pos == "bottomright" and "BOTTOMRIGHT") or
+                    "TOPLEFT"
+                combat:SetPoint(anchor, pf.Health or pf, anchor, ox, oy)
             end
-            combat:SetPoint("CENTER", anchor, "CENTER", ox, oy)
 
             -- Determine texture file (always use -custom / white base).
             -- Class theming resolves the FRAME's unit (player class on the

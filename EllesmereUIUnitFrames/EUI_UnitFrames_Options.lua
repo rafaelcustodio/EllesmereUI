@@ -3588,12 +3588,22 @@ initFrame:SetScript("OnEvent", function(self)
                     local ciPos = s.combatIndicatorPosition or "healthbar"
                     combatInd:SetSize(ciSz, ciSz)
                     combatInd:ClearAllPoints()
-                    local ciAnchor = pf
-                    if ciPos == "healthbar" then ciAnchor = health
-                    elseif ciPos == "textbar" and btbFrame then ciAnchor = btbFrame
-                    elseif ciPos == "portrait" and portraitFrame and sp then ciAnchor = portraitFrame
+                    -- "healthbar" is the stored value shown as "Center" in the dropdown;
+                    -- "center" is a render alias for it.
+                    if ciPos == "portrait" and portraitFrame and sp then
+                        combatInd:SetPoint("CENTER", portraitFrame, "CENTER", ciOx, ciOy)
+                    elseif ciPos == "textbar" then
+                        combatInd:SetPoint("CENTER", btbFrame or pf, "CENTER", ciOx, ciOy)
+                    elseif ciPos == "healthbar" or ciPos == "center" then
+                        combatInd:SetPoint("CENTER", health, "CENTER", ciOx, ciOy)
+                    else
+                        local anchor =
+                            (ciPos == "topright"    and "TOPRIGHT")    or
+                            (ciPos == "bottomleft"  and "BOTTOMLEFT")  or
+                            (ciPos == "bottomright" and "BOTTOMRIGHT") or
+                            "TOPLEFT"
+                        combatInd:SetPoint(anchor, health, anchor, ciOx, ciOy)
                     end
-                    combatInd:SetPoint("CENTER", ciAnchor, "CENTER", ciOx, ciOy)
                     local _, classToken = UnitClass("player")
                     -- All custom combat icons (combat0..5) are shown as-is (no tint).
                     -- Standard/Class Theme are tinted by the colour mode below.
@@ -4143,21 +4153,6 @@ initFrame:SetScript("OnEvent", function(self)
             if not sup then return true end
             return sup[selectedUnit] == true
         end
-        -- Only show "Applies to:" tooltip for leader indicator settings
-        local SHOW_APPLIES_TO = {
-            leaderIndicatorEnabled = true, leaderIndicatorSize = true,
-            leaderIndicatorPosition = true, leaderIndicatorX = true, leaderIndicatorY = true,
-        }
-        local function SSupportTooltip(key)
-            if not SHOW_APPLIES_TO[key] then return nil end
-            local sup = UNIT_SUPPORTS[key]
-            if not sup then return nil end
-            local names = {}
-            for _, k in ipairs(GROUP_UNIT_ORDER) do
-                if sup[k] then names[#names+1] = UNIT_LABELS_SUP[k] end
-            end
-            return "Applies to: " .. table.concat(names, ", ")
-        end
         -- Dim a row region and add tooltip when no checked unit supports the
         -- setting. unsupportedTip (optional) is shown over the dimmed row when
         -- the current unit doesn't support the key.
@@ -4167,7 +4162,7 @@ initFrame:SetScript("OnEvent", function(self)
                 region:SetAlpha(0.35)
                 if region._control and region._control.Disable then region._control:Disable() end
             end
-            local tip = SSupportTooltip(key) or (not visible and unsupportedTip) or nil
+            local tip = not visible and unsupportedTip or nil
             if tip then
                 local function MakeSupportHit(anchor)
                     if not anchor then return end
@@ -9669,7 +9664,7 @@ initFrame:SetScript("OnEvent", function(self)
         -- Row 3: Bar Spacing + Background Color (with alpha)
         local sharedClassResRow3
         sharedClassResRow3, h = W:DualRow(parent, y,
-            { type="slider", text="Bar Spacing", min=0, max=10, step=1,
+            { type="slider", pixel=true, text="Bar Spacing", min=0, max=10, step=1,
               disabled=function() return SValSupported("classPowerStyle", "none") ~= "modern" end,
               disabledTooltip="Class Resource must be set to Modern", rawTooltip=true,
               getValue=function() return SValSupported("classPowerSpacing", 2) end,
@@ -9899,10 +9894,10 @@ initFrame:SetScript("OnEvent", function(self)
                       get=function() return SValSupported("buffOffsetY", 0) end,
                       set=function(v) SSetSupported("buffOffsetY", v) end },
                     -- Physical-pixel-perfect gaps between buff icons (X = columns, Y = rows).
-                    { type="slider", label="Spacing X", min=-1, max=10, step=1,
+                    { type="slider", pixel=true, label="Spacing X", min=-1, max=10, step=1,
                       get=function() return SValSupported("buffSpacingX", 1) end,
                       set=function(v) SSetSupported("buffSpacingX", v) end },
-                    { type="slider", label="Spacing Y", min=-1, max=10, step=1,
+                    { type="slider", pixel=true, label="Spacing Y", min=-1, max=10, step=1,
                       get=function() return SValSupported("buffSpacingY", 1) end,
                       set=function(v) SSetSupported("buffSpacingY", v) end },
                 },
@@ -10026,10 +10021,10 @@ initFrame:SetScript("OnEvent", function(self)
                       get=function() return SValSupported("debuffOffsetY", 0) end,
                       set=function(v) SSetSupported("debuffOffsetY", v) end },
                     -- Physical-pixel-perfect gaps between debuff icons (X = columns, Y = rows).
-                    { type="slider", label="Spacing X", min=-1, max=10, step=1,
+                    { type="slider", pixel=true, label="Spacing X", min=-1, max=10, step=1,
                       get=function() return SValSupported("debuffSpacingX", 1) end,
                       set=function(v) SSetSupported("debuffSpacingX", v) end },
-                    { type="slider", label="Spacing Y", min=-1, max=10, step=1,
+                    { type="slider", pixel=true, label="Spacing Y", min=-1, max=10, step=1,
                       get=function() return SValSupported("debuffSpacingY", 1) end,
                       set=function(v) SSetSupported("debuffSpacingY", v) end },
                 },
@@ -10411,7 +10406,7 @@ initFrame:SetScript("OnEvent", function(self)
 
         -- Row 3: Spacing | Show Countdown Text
         _, h = W:DualRow(parent, y,
-            { type="slider", text="Spacing", min=-1, max=10, step=1,
+            { type="slider", pixel=true, text="Spacing", min=-1, max=10, step=1,
               getValue=function() return PrivGet("paSpacing", 0) end,
               setValue=function(v) PrivSet("paSpacing", v) end },
             { type="toggle", text="Show Countdown Text",
@@ -10998,8 +10993,10 @@ initFrame:SetScript("OnEvent", function(self)
             end)
 
             -- Cog popup for combat indicator settings
-            local combatPosValues = { ["portrait"]="Portrait", ["healthbar"]="Health Bar", ["textbar"]="Text Bar" }
-            local combatPosOrder = { "portrait", "healthbar", "textbar" }
+            -- "healthbar" is the long-standing stored value for centered-on-health-bar,
+            -- shown as "Center". "center" (briefly stored by 8.4.9-era builds) maps to it.
+            local combatPosValues = { ["topleft"]="Top Left", ["topright"]="Top Right", ["healthbar"]="Center", ["bottomleft"]="Bottom Left", ["bottomright"]="Bottom Right", ["textbar"]="Text Bar", ["portrait"]="Portrait" }
+            local combatPosOrder = { "topleft", "topright", "healthbar", "bottomleft", "bottomright", "textbar", "portrait" }
 
             local _, combatCogShowRaw = EllesmereUI.BuildCogPopup({
                 title = "Combat Indicator Settings",
@@ -11016,15 +11013,19 @@ initFrame:SetScript("OnEvent", function(self)
                       get=function() return SValSupported("combatIndicatorColor", "custom") == "classcolor" end,
                       set=function(v) SSetSupported("combatIndicatorColor", v and "classcolor" or "custom"); ReloadAndUpdate(); UpdatePreview() end },
                     { type="dropdown", label="Position", values=combatPosValues, order=combatPosOrder,
-                      get=function() return SValSupported("combatIndicatorPosition", "healthbar") end,
+                      get=function()
+                          local pos = SValSupported("combatIndicatorPosition", "healthbar")
+                          if pos == "center" then pos = "healthbar" end
+                          return combatPosValues[pos] and pos or "healthbar"
+                      end,
                       set=function(v) SSetSupported("combatIndicatorPosition", v); ReloadAndUpdate(); UpdatePreview() end },
                     { type="slider", label="Size", min=8, max=64, step=1,
                       get=function() return SValSupported("combatIndicatorSize", 22) end,
                       set=function(v) SSetSupported("combatIndicatorSize", v); ReloadAndUpdate(); UpdatePreview() end },
-                    { type="slider", label="X Offset", min=-100, max=100, step=1,
+                    { type="slider", label="X Offset", min=-200, max=200, step=1,
                       get=function() return SValSupported("combatIndicatorX", 0) end,
                       set=function(v) SSetSupported("combatIndicatorX", v); ReloadAndUpdate(); UpdatePreview() end },
-                    { type="slider", label="Y Offset", min=-100, max=100, step=1,
+                    { type="slider", label="Y Offset", min=-200, max=200, step=1,
                       get=function() return SValSupported("combatIndicatorY", 0) end,
                       set=function(v) SSetSupported("combatIndicatorY", v); ReloadAndUpdate(); UpdatePreview() end },
                 },
@@ -11198,22 +11199,18 @@ initFrame:SetScript("OnEvent", function(self)
             return selectedUnit == "player" or selectedUnit == "target"
         end
         if leaderIndSupported() then
-            local function SetLeaderBoth(key, val)
-                UNIT_DB_MAP["player"]()[key] = val
-                UNIT_DB_MAP["target"]()[key] = val
-                ReloadAndUpdate(); UpdatePreview()
-            end
+            local leaderSyncUnits = { "player", "target" }
             sharedAddRow5, h = W:DualRow(parent, y,
                 { type="toggle", text="Leader Indicator",
                   getValue=function() return SValSupported("leaderIndicatorEnabled", true) end,
                   setValue=function(v)
-                      SetLeaderBoth("leaderIndicatorEnabled", v)
+                      SSetSupported("leaderIndicatorEnabled", v)
                       EllesmereUI:RefreshPage()
                   end },
                 { type="slider", text="Leader Icon Size", min=8, max=48, step=1,
                   disabled=leaderIndOff, disabledTooltip="Leader Indicator",
                   getValue=function() return SValSupported("leaderIndicatorSize", 16) end,
-                  setValue=function(v) SetLeaderBoth("leaderIndicatorSize", v) end });  y = y - h
+                  setValue=function(v) SSetSupported("leaderIndicatorSize", v) end });  y = y - h
             SApplySupport(sharedAddRow5._leftRegion, "leaderIndicatorEnabled")
             SApplySupport(sharedAddRow5._rightRegion, "leaderIndicatorSize")
             do
@@ -11225,13 +11222,13 @@ initFrame:SetScript("OnEvent", function(self)
                     rows = {
                         { type="dropdown", label="Position", values=leaderPosValues, order=leaderPosOrder,
                           get=function() return SValSupported("leaderIndicatorPosition", "topleft") end,
-                          set=function(v) SetLeaderBoth("leaderIndicatorPosition", v) end },
+                          set=function(v) SSetSupported("leaderIndicatorPosition", v) end },
                         { type="slider", label="X Offset", min=-200, max=200, step=1,
                           get=function() return SValSupported("leaderIndicatorX", 0) end,
-                          set=function(v) SetLeaderBoth("leaderIndicatorX", v) end },
+                          set=function(v) SSetSupported("leaderIndicatorX", v) end },
                         { type="slider", label="Y Offset", min=-200, max=200, step=1,
                           get=function() return SValSupported("leaderIndicatorY", 0) end,
-                          set=function(v) SetLeaderBoth("leaderIndicatorY", v) end },
+                          set=function(v) SSetSupported("leaderIndicatorY", v) end },
                     },
                 })
                 local leaderCogBtn = MakeCogBtn(rgn, leaderCogShow)
@@ -11257,6 +11254,44 @@ initFrame:SetScript("OnEvent", function(self)
                 EllesmereUI.RegisterWidgetRefresh(UpdateLeaderCogState)
                 UpdateLeaderCogState()
             end
+            local function BuildLeaderSync(rgn, key, default, tooltip)
+                local function GetValue(unit)
+                    local v = UNIT_DB_MAP[unit]()[key]
+                    if v == nil then return default end
+                    return v
+                end
+                EllesmereUI.BuildSyncIcon({
+                    region = rgn,
+                    tooltip = tooltip,
+                    onClick = function()
+                        local v = GetValue(selectedUnit)
+                        for _, unit in ipairs(leaderSyncUnits) do UNIT_DB_MAP[unit]()[key] = v end
+                        ReloadAndUpdate(); EllesmereUI:RefreshPage()
+                    end,
+                    isSynced = function()
+                        local v = GetValue(selectedUnit)
+                        for _, unit in ipairs(leaderSyncUnits) do
+                            if GetValue(unit) ~= v then return false end
+                        end
+                        return true
+                    end,
+                    flashTargets = function() return { rgn } end,
+                    multiApply = {
+                        elementKeys = leaderSyncUnits,
+                        elementLabels = SHORT_LABELS,
+                        getCurrentKey = function() return selectedUnit end,
+                        onApply = function(checkedKeys)
+                            local v = GetValue(selectedUnit)
+                            for _, unit in ipairs(checkedKeys) do UNIT_DB_MAP[unit]()[key] = v end
+                            ReloadAndUpdate(); EllesmereUI:RefreshPage()
+                        end,
+                    },
+                })
+            end
+            BuildLeaderSync(sharedAddRow5._leftRegion, "leaderIndicatorEnabled", true,
+                "Apply Leader Indicator to all Frames")
+            BuildLeaderSync(sharedAddRow5._rightRegion, "leaderIndicatorSize", 16,
+                "Apply Leader Icon Size to all Frames")
         end
 
         -------------------------------------------------------------------
@@ -13053,7 +13088,7 @@ initFrame:SetScript("OnEvent", function(self)
                     { type="dropdown", text="Stack Direction", values={ up="Up", down="Down" }, order={ "up", "down" },
                       getValue=function() return db.profile.boss.bossStackDirection or "down" end,
                       setValue=function(v) db.profile.boss.bossStackDirection = v; ReloadAndUpdate() end },
-                    { type="slider", text="Vertical Spacing", min=-200, max=200, step=1,
+                    { type="slider", pixel=true, text="Vertical Spacing", min=-200, max=200, step=1,
                       getValue=function() return db.profile.bossSpacing or 80 end,
                       setValue=function(v) db.profile.bossSpacing = v; ReloadAndUpdate() end })
                 total = total + ch
@@ -13170,7 +13205,7 @@ initFrame:SetScript("OnEvent", function(self)
                           get=function() local _, y = ns.GetBossSimpleBuffOffset(db.profile.boss); return y end,
                           set=function(v) db.profile.boss.simpleBuffOffsetY = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                         -- Physical-pixel-perfect gap between the simple buff icons.
-                        { type="slider", label="Spacing", min=-1, max=10, step=1,
+                        { type="slider", pixel=true, label="Spacing", min=-1, max=10, step=1,
                           get=function() return db.profile.boss.simpleBuffSpacing or 1 end,
                           set=function(v) db.profile.boss.simpleBuffSpacing = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                     },
@@ -13304,7 +13339,7 @@ initFrame:SetScript("OnEvent", function(self)
                           get=function() local _, y = ns.GetBossSimpleDebuffOffset(db.profile.boss); return y end,
                           set=function(v) db.profile.boss.simpleDebuffOffsetY = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                         -- Physical-pixel-perfect gap between the simple debuff icons.
-                        { type="slider", label="Spacing", min=-1, max=10, step=1,
+                        { type="slider", pixel=true, label="Spacing", min=-1, max=10, step=1,
                           get=function() return db.profile.boss.simpleDebuffSpacing or 1 end,
                           set=function(v) db.profile.boss.simpleDebuffSpacing = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                     },
@@ -13476,7 +13511,7 @@ initFrame:SetScript("OnEvent", function(self)
                       get=function() return db.profile.boss.buffOffsetY or 0 end,
                       set=function(v) db.profile.boss.buffOffsetY = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                     -- Physical-pixel-perfect gap between the boss buff icons.
-                    { type="slider", label="Spacing", min=-1, max=10, step=1,
+                    { type="slider", pixel=true, label="Spacing", min=-1, max=10, step=1,
                       get=function() return db.profile.boss.buffSpacing or 1 end,
                       set=function(v) db.profile.boss.buffSpacing = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                 } })
@@ -13501,7 +13536,7 @@ initFrame:SetScript("OnEvent", function(self)
                       get=function() return db.profile.boss.debuffOffsetY or 0 end,
                       set=function(v) db.profile.boss.debuffOffsetY = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                     -- Physical-pixel-perfect gap between the boss debuff icons.
-                    { type="slider", label="Spacing", min=-1, max=10, step=1,
+                    { type="slider", pixel=true, label="Spacing", min=-1, max=10, step=1,
                       get=function() return db.profile.boss.debuffSpacing or 1 end,
                       set=function(v) db.profile.boss.debuffSpacing = v; ReloadAndUpdate(); if ns.RefreshBossPreviewDebuffs then ns.RefreshBossPreviewDebuffs() end end },
                 } })

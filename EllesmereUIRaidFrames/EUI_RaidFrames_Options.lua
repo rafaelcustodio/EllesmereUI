@@ -587,6 +587,46 @@ initFrame:SetScript("OnEvent", function(self)
     -- All preview mode dropdowns across tabs (refresh all when one changes)
     local pvModeDropdowns = {}
 
+    -- Preview Mode controls carrying override-preview chrome (gold border
+    -- host + tooltip), one entry per built row across tabs/rebuilds.
+    local pvModeCtrls = {}
+
+    -- Gold border + tooltip on every Preview Mode control when the REAL
+    -- preview is rendering an override's effective values (spec group or
+    -- applied conditional). State computed from the runtime resolvers --
+    -- never the panel's view flags -- so it always matches what the real
+    -- preview actually shows. Recomputed at row build time and from
+    -- ns._RebuildPvOverlay (view/spec/conditional changes).
+    function ns._UpdatePvModeChrome()
+        if #pvModeCtrls == 0 then return end
+        local text
+        if (db.profile.previewMode or "overlay") == "real" then
+            -- Editing-as session: the preview shows THAT session's values
+            -- (the effective overlay is off there by design), so the chrome
+            -- names the session being edited.
+            local sessName = EllesmereUI.SpecOverrides_EditSessionName
+                and EllesmereUI.SpecOverrides_EditSessionName()
+            if sessName then
+                text = EllesmereUI.Lf("Previewing Override: %1$s", sessName)
+            elseif EllesmereUI.SpecOverrides_PeekEffectiveValues then
+                local _, specSrc, condSrc =
+                    EllesmereUI.SpecOverrides_PeekEffectiveValues("EllesmereUIRaidFrames")
+                if specSrc and condSrc then
+                    text = EllesmereUI.Lf("Previewing Overrides: %1$s, %2$s", specSrc, condSrc)
+                elseif specSrc or condSrc then
+                    text = EllesmereUI.Lf("Previewing Override: %1$s", specSrc or condSrc)
+                end
+            end
+        end
+        for _, e in ipairs(pvModeCtrls) do
+            if e.gold then e.gold:SetShown(text ~= nil) end
+            if e.ctrl then
+                e.ctrl._ttText = text
+                e.ctrl._ttOpts = nil
+            end
+        end
+    end
+
     -- Shared helper: true when preview is disabled (eyeball toggles should gray out)
     local function IsPreviewOff()
         return (db.profile.previewMode or "overlay") == "none"
@@ -647,6 +687,20 @@ initFrame:SetScript("OnEvent", function(self)
 
         pvModeDropdowns[#pvModeDropdowns + 1] = ddLbl
 
+        -- Override-preview chrome: a separate gold border host (the control's
+        -- own border is re-asserted by its hover scripts, so it is never
+        -- recolored directly -- same pattern as the overrides UI slot marks).
+        do
+            local gold = EllesmereUI._SPECOV_GOLD or { 199 / 255, 166 / 255, 90 / 255 }
+            local host = CreateFrame("Frame", nil, ddCtrl)
+            host:SetAllPoints(ddCtrl)
+            host:SetFrameLevel(ddCtrl:GetFrameLevel() + 30)
+            EllesmereUI.PP.CreateBorder(host, gold[1], gold[2], gold[3], 0.9, 1, "OVERLAY", 7)
+            host:Hide()
+            pvModeCtrls[#pvModeCtrls + 1] = { ctrl = ddCtrl, gold = host }
+        end
+        if ns._UpdatePvModeChrome then ns._UpdatePvModeChrome() end
+
         ns._previewMode = db.profile.previewMode or "overlay"
         return y
     end
@@ -706,7 +760,7 @@ initFrame:SetScript("OnEvent", function(self)
                 wipe(ns._healthAnimState)
 
                 local frames = ns.PvActiveFrames()
-                local s = db.profile
+                local s = (ns.PvEffectiveProfile and ns.PvEffectiveProfile()) or db.profile
                 for i = 1, 20 do
                     local f = frames[i]
                     if f and f._health then
@@ -724,7 +778,9 @@ initFrame:SetScript("OnEvent", function(self)
                     and Enum.StatusBarInterpolation.ExponentialEaseOut
                 ns._healthAnimTicker = C_Timer.NewTicker(0.1, function()
                     if not ns._healthAnimActive then return end
-                    local s = db.profile
+                    -- Effective overlay: preview ticks must never render the
+                    -- panel view's swapped values (real preview contract).
+                    local s = (ns.PvEffectiveProfile and ns.PvEffectiveProfile()) or db.profile
                     local smooth = s.smoothBars
 
                     for i, st in ipairs(ns._healthAnimState) do
@@ -1717,7 +1773,9 @@ initFrame:SetScript("OnEvent", function(self)
                     and Enum.StatusBarInterpolation.ExponentialEaseOut
                 ns._powerAnimTicker = C_Timer.NewTicker(0.1, function()
                     if not ns._powerAnimActive then return end
-                    local smooth = db.profile.smoothPowerBars
+                    -- Effective overlay: see the health ticker note above.
+                    local smooth = ((ns.PvEffectiveProfile and ns.PvEffectiveProfile())
+                        or db.profile).smoothPowerBars
 
                     for i, st in pairs(ns._powerAnimState) do
                         local f = st.frame
@@ -3006,7 +3064,7 @@ initFrame:SetScript("OnEvent", function(self)
             moreBtn:SetFrameLevel(parent:GetFrameLevel() + 5)
             local moreFS = EllesmereUI.MakeFont(moreBtn, 13, nil, 1, 1, 1)
             moreFS:SetPoint("LEFT")
-            moreFS:SetText("+ Show Less Common Indicator Options")
+            moreFS:SetText("+ " .. EllesmereUI.L("Show Less Common Indicator Options"))
             moreBtn:SetWidth(math.max((moreFS:GetStringWidth() or 0) + 8, 120))
             local EG = EllesmereUI.ELLESMERE_GREEN or { r = 0.05, g = 0.82, b = 0.62 }
             moreBtn:SetScript("OnEnter", function() moreFS:SetTextColor(EG.r, EG.g, EG.b) end)
@@ -4652,10 +4710,10 @@ initFrame:SetScript("OnEvent", function(self)
 
         -- Row 2: Frame Spacing | Group Spacing
         _, h = W:DualRow(parent, y,
-            { type="slider", text="Frame Spacing", min=-1, max=15, step=1,
+            { type="slider", pixel=true, text="Frame Spacing", min=-1, max=15, step=1,
               getValue=function() return SVal("cellSpacing", 2) end,
               setValue=function(v) SSet("cellSpacing", v) end },
-            { type="slider", text="Group Spacing", min=-1, max=15, step=1,
+            { type="slider", pixel=true, text="Group Spacing", min=-1, max=15, step=1,
               getValue=function() return SVal("groupSpacing", 8) end,
               setValue=function(v) SSet("groupSpacing", v) end });  y = y - h
 
@@ -5317,7 +5375,7 @@ initFrame:SetScript("OnEvent", function(self)
               values={ __placeholder = "All" }, order={ "__placeholder" },
               getValue=function() return "__placeholder" end,
               setValue=function() end },
-            { type="slider", text="Frame Spacing", min=-1, max=15, step=1,
+            { type="slider", pixel=true, text="Frame Spacing", min=-1, max=15, step=1,
               getValue=function() return SVal("partyCellSpacing", db.profile.cellSpacing or 2) end,
               setValue=function(v) PSSet("partyCellSpacing", v) end });  y = y - h
         -- Overlay the checkbox dropdown onto the LEFT region (Auto Resize Icons
@@ -5783,7 +5841,7 @@ initFrame:SetScript("OnEvent", function(self)
         -- Row 3: Spacing | Border Size (+ swatch)
         local defBdrRow
         defBdrRow, h = W:DualRow(parent, y,
-            { type="slider", text="Spacing", min=-1, max=10, step=1,
+            { type="slider", pixel=true, text="Spacing", min=-1, max=10, step=1,
               disabled=DefDisabled, disabledTooltip="Show Defensives & Externals",
               getValue=function() return SVal("defSpacing", 1) end,
               setValue=function(v) SSet("defSpacing", v) end },
@@ -5998,7 +6056,7 @@ initFrame:SetScript("OnEvent", function(self)
             { type="slider", text="Icon Size", min=10, max=40, step=1,
               getValue=function() return SVal("paSize", 20) end,
               setValue=function(v) SSet("paSize", v) end },
-            { type="slider", text="Spacing", min=-1, max=10, step=1,
+            { type="slider", pixel=true, text="Spacing", min=-1, max=10, step=1,
               getValue=function() return SVal("paSpacing", 0) end,
               setValue=function(v) SSet("paSpacing", v) end });  y = y - h
 
@@ -6258,7 +6316,7 @@ initFrame:SetScript("OnEvent", function(self)
         -- Row 2: Spacing | Show Stacks (+ swatch + cog)
         local dbStacksRow
         dbStacksRow, h = W:DualRow(parent, y,
-            { type="slider", text="Spacing", min=-1, max=10, step=1,
+            { type="slider", pixel=true, text="Spacing", min=-1, max=10, step=1,
               disabled=function() return SVal("debuffFilter", "all") == "none" end,
               disabledTooltip="Show Debuffs",
               getValue=function() return SVal("debuffSpacing", 1) end,

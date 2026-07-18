@@ -59,6 +59,37 @@ if not EllesmereUI.UnregisterUnlockElement then
     end
 end
 
+-- Cross-addon integration: listeners receive real session open/close changes.
+-- Close notifications include "exit", "save", or "discard" as the second argument.
+-- Combat suspension does not end the session and therefore does not fire them.
+if not EllesmereUI._unlockModeListeners then
+    EllesmereUI._unlockModeListeners = {}
+end
+
+if not EllesmereUI.RegisterUnlockModeListener then
+    function EllesmereUI:RegisterUnlockModeListener(owner, listener)
+        self._unlockModeListeners[owner] = listener
+        if self._unlockModeSessionActive then
+            pcall(listener, true)
+        end
+    end
+
+    function EllesmereUI:UnregisterUnlockModeListener(owner)
+        self._unlockModeListeners[owner] = nil
+    end
+
+    function EllesmereUI:IsUnlockModeActive()
+        return self._unlockModeSessionActive == true
+    end
+
+    function EllesmereUI:_NotifyUnlockModeListeners(active, closeAction)
+        self._unlockModeSessionActive = active == true
+        for _, listener in pairs(self._unlockModeListeners) do
+            pcall(listener, self._unlockModeSessionActive, closeAction)
+        end
+    end
+end
+
 -- If this file was already fully loaded by another addon, bail out.
 -- The registration API above is safe to re-run (idempotent), but the
 -- rest of the file (state, frames, animations) must only exist once.
@@ -836,6 +867,17 @@ local function IsAnchored(barKey)
     if info ~= nil then return true end
     local elem = registeredElements[barKey]
     return elem and elem.isAnchored and elem.isAnchored() or false
+end
+
+-- Element anchored through a module option (e.g. ERB "Anchor To") while opting
+-- into keepMoverWhenAnchored: the mover exists but is position-locked -- the
+-- module's anchor owns the position, so drag/nudge/anchor-link are disabled
+-- while resize and width/height matching stay available. Lives on ns (not a
+-- local) -- the deferred body is at the 200-local limit.
+function ns.IsMoverPosLocked(barKey)
+    local elem = registeredElements[barKey]
+    if not (elem and elem.keepMoverWhenAnchored) then return false end
+    return elem.isAnchored and elem.isAnchored() or false
 end
 
 -- Width/Height match persistent links
@@ -5290,6 +5332,7 @@ end
 local function NudgeMover(dx, dy, targetMover, skipCollapse)
     local m = targetMover or selectedMover
     if not m or InCombatLockdown() then return end
+    if ns.IsMoverPosLocked(m._barKey) then return end
 
     -- Read bar's current position, add dx/dy, reposition.
     local bar = GetBarFrame(m._barKey)
@@ -5764,8 +5807,10 @@ local function CreateMover(barKey)
     local elem = registeredElements[barKey]
     local existing = movers[barKey]
 
-    -- Skip elements that are intentionally hidden or currently anchored.
-    if elem and ((elem.isHidden and elem.isHidden()) or (elem.isAnchored and elem.isAnchored())) then
+    -- Skip elements that are intentionally hidden or currently anchored
+    -- (keepMoverWhenAnchored elements keep a position-locked mover instead).
+    if elem and ((elem.isHidden and elem.isHidden())
+        or (elem.isAnchored and elem.isAnchored() and not elem.keepMoverWhenAnchored)) then
         if existing then existing:Hide() end
         return nil
     end
@@ -5955,7 +6000,7 @@ local function CreateMover(barKey)
             t[#t + 1] = { btn = wmBtn, fs = wmFS, fb = 50 }
             t[#t + 1] = { btn = hmBtn, fs = hmFS, fb = 55 }
         end
-        if canAnchorTo then
+        if canAnchorTo and not ns.IsMoverPosLocked(barKey) then
             t[#t + 1] = { btn = atBtn, fs = atFS, fb = 45 }
         end
         if canGrow then
@@ -6103,7 +6148,7 @@ local function CreateMover(barKey)
     -- Update the name label color based on anchor state
     local function RefreshAnchoredIdle()
         local ai = GetAnchorInfo(barKey)
-        isAnchored = ai ~= nil
+        isAnchored = ai ~= nil or ns.IsMoverPosLocked(barKey)
         nameFS:SetText(EllesmereUI.L(label))
         if isAnchored then
             nameFS:SetTextColor(1, 0.7, 0.3, 0.85)
@@ -6516,6 +6561,7 @@ local function CreateMover(barKey)
 
     atBtn:SetScript("OnClick", function()
         EllesmereUI.HideWidgetTooltip()
+        if ns.IsMoverPosLocked(barKey) then return end
         if GetAnchorInfo(barKey) then
             ClearAnchorInfo(barKey)
             -- Capture current screen position so Save & Exit persists it.
@@ -6875,7 +6921,7 @@ local function CreateMover(barKey)
         -- bars resolve elem == nil (they live in BAR_LOOKUP), so this is a no-op
         -- for them; isHidden is read live, so an un-hidden element still syncs.
         if elem and ((elem.isHidden and elem.isHidden())
-                  or (elem.isAnchored and elem.isAnchored())) then
+                  or (elem.isAnchored and elem.isAnchored() and not elem.keepMoverWhenAnchored)) then
             self:Hide()
             return
         end
@@ -7039,6 +7085,8 @@ local function CreateMover(barKey)
     -- Drag handlers: manual cursor-based positioning for live snap + live bar movement
     mover:SetScript("OnDragStart", function(self)
         if InCombatLockdown() then return end
+        -- Position-locked: the module's anchor option owns this bar's position
+        if ns.IsMoverPosLocked(self._barKey) then SelectMover(self); return end
         -- Anchored bars can be dragged -- the offset from parent is updated on drop
         SelectMover(self)
         self:SetAlpha(darkOverlaysEnabled and 1 or MOVER_DRAG)
@@ -9108,6 +9156,11 @@ local BANNER_PX_H = 120
 
 local hudFrame
 
+-- Stable visible-height anchor for other addons that stack controls below the banner.
+function EllesmereUI:GetUnlockModeTopBarAnchor()
+    return hudFrame and hudFrame._hoverZone
+end
+
 local function CreateHUD(parent)
     if hudFrame then return hudFrame end
 
@@ -9976,9 +10029,10 @@ local function CommitPositions()
 
     -- Bank the freshly-saved live layout into its owning spec-override
     -- layer (the active group layer, else the stored baseline). Wholesale
-    -- harvest -- no per-aspect routing exists anymore.
+    -- harvest -- no per-aspect routing exists anymore. true = user commit:
+    -- banks even inside the post-import suppression window (and closes it).
     if EllesmereUI.SpecOverrides_HarvestUnlockLayout then
-        local okH, errH = pcall(EllesmereUI.SpecOverrides_HarvestUnlockLayout)
+        local okH, errH = pcall(EllesmereUI.SpecOverrides_HarvestUnlockLayout, true)
         if not okH then
             print("|cffff6060[EllesmereUI]|r Unlock layer harvest failed: "
                 .. tostring(errH))
@@ -10168,17 +10222,16 @@ local function RevertPositions()
 end
 
 -- Internal close (actually hides everything and returns to options)
-local function DoClose()
+local function DoClose(closeAction)
     if not isUnlocked then return end
     isUnlocked = false
     EllesmereUI._unlockActive = false
     EllesmereUI._unlockModeActive = false
+    EllesmereUI:_NotifyUnlockModeListeners(false, closeAction or "exit")
     if EllesmereUI._HideFallbackGhosts then EllesmereUI._HideFallbackGhosts() end
 
     -- Notify action bars to restore Blizzard-owned frame anchors
     if _G._EAB_UnlockModeClose then pcall(_G._EAB_UnlockModeClose) end
-    -- Notify damage meters
-    if _G._EDM_UnlockModeClose then pcall(_G._EDM_UnlockModeClose) end
 
     -- Recalculate action bar flyout directions after positions are finalized
     if _G._EAB_RecalcFlyouts then pcall(_G._EAB_RecalcFlyouts) end
@@ -10366,12 +10419,12 @@ function ns.RequestClose(save, afterFn)
     if afterFn then pendingAfterClose = afterFn end
     if save then
         CommitPositions()
-        DoClose()
+        DoClose("save")
         return
     end
     -- No changes → just exit
     if not hasChanges then
-        DoClose()
+        DoClose("exit")
         return
     end
     -- Has unsaved changes → show confirm popup
@@ -10382,11 +10435,11 @@ function ns.RequestClose(save, afterFn)
         confirmText = "Save & Exit",
         onCancel = function()
             RevertPositions()
-            DoClose()
+            DoClose("exit")
         end,
         onConfirm = function()
             CommitPositions()
-            DoClose()
+            DoClose("save")
         end,
         -- Dismiss (ESC / click-off) does nothing -- user stays in unlock mode,
         -- and any pending close callback is cleared since the close was abandoned
@@ -10409,7 +10462,7 @@ function EllesmereUI.ForceCloseUnlockDiscard()
         EllesmereUI.SpecOverrides_UnlockValueSnapDiscard()
     end
     if hasChanges then pcall(RevertPositions) end
-    pcall(DoClose)
+    pcall(DoClose, "discard")
 end
 
 -------------------------------------------------------------------------------
@@ -10874,6 +10927,20 @@ function ns.OpenUnlockMode()
         end
         EllesmereUI._specialUnlockGroup = g
     end
+    -- Close any panel-side editing session/view BEFORE taking the value
+    -- snapshot: the options panel does not hide until much later in this
+    -- flow, so with the Default view (or an editing-as session) still
+    -- holding SWAPPED values live, the snapshot captured the view's values
+    -- while the panel's eventual OnHide restored the SPEC's values -- and
+    -- Save & Exit then diffed spec-vs-default and banked every difference
+    -- into values.default (defaults silently flipping to a group's values;
+    -- 2026-07-16 field data: Show Power Bar, Ignore Pain Bar, Resource
+    -- Text). Exiting the sessions here banks them properly and restores
+    -- canonical spec values, so the snapshot below is clean. No-op when
+    -- the panel is closed (no session can be live then).
+    if EllesmereUI.SpecOverrides_CloseEditSessions then
+        EllesmereUI.SpecOverrides_CloseEditSessions()
+    end
     -- Value-edit banking baseline: captured settings edited from unlock mode
     -- (cog size inputs) are Default-baseline edits; Save & Exit diffs against
     -- this snapshot and banks them into values.default (special sessions are
@@ -10893,8 +10960,6 @@ function ns.OpenUnlockMode()
 
     -- Notify action bars to flip Blizzard-owned frame anchors for drag
     if _G._EAB_UnlockModeOpen then pcall(_G._EAB_UnlockModeOpen) end
-    -- Notify damage meters
-    if _G._EDM_UnlockModeOpen then pcall(_G._EDM_UnlockModeOpen) end
     -- Notify raid frames to fade out overlay previews
     if _G._ERF_UnlockModeOpen then pcall(_G._ERF_UnlockModeOpen) end
 
@@ -10997,6 +11062,7 @@ function ns.OpenUnlockMode()
     CreateUnlockFrame()
     CreateGrid(unlockFrame)
     CreateHUD(unlockFrame)
+    EllesmereUI:_NotifyUnlockModeListeners(true)
     CreateOpenAnimFrame(unlockFrame)
 
     -- Special (spec-override) sessions swap the unlock art for the override
@@ -11564,6 +11630,9 @@ ns.CloseUnlockMode = ns.CloseUnlockMode
 -- Expose on the global EllesmereUI so SelectPage can intercept "Unlock Mode"
 if EllesmereUI then
     EllesmereUI._openUnlockMode = ns.OpenUnlockMode
+    function EllesmereUI:OpenUnlockMode()
+        ns.OpenUnlockMode()
+    end
 end
 
 -- Toggle helper + active flag alias used by options pages
@@ -11754,5 +11823,41 @@ do
             C_Timer.After(0.5, ResumeAfterCombat)
         end
     end)
+end
+
+-------------------------------------------------------------------------------
+--  /euicdmdbg -- TEMPORARY CDM anchor-chain diagnostic (2026-07-16): prints
+--  the runtime state of the CDM viewer anchor chain (ERB_ClassResource ->
+--  utility -> cooldowns -> buffs) so a screenshot pinpoints where anchor
+--  resolution fails. Read-only. Remove after the incident.
+-------------------------------------------------------------------------------
+SLASH_EUICDMDBG1 = "/euicdmdbg"
+SlashCmdList.EUICDMDBG = function()
+    local function P(msg) print("|cff0cd29fEUI CDMDBG|r " .. msg) end
+    local act = EllesmereUI.SpecOverrides_UnlockActive
+        and EllesmereUI.SpecOverrides_UnlockActive() or "?"
+    P("s.active=" .. tostring(act) .. "  unlockActive=" .. tostring(EllesmereUI._unlockModeActive))
+    local anchors = EllesmereUIDB and EllesmereUIDB.unlockAnchors or {}
+    for _, key in ipairs({ "ERB_ClassResource", "CDM_utility", "CDM_cooldowns", "CDM_buffs" }) do
+        local elem = registeredElements[key]
+        local f = GetBarFrame and GetBarFrame(key) or nil
+        if not f and elem and elem.getFrame then f = elem.getFrame() end
+        local a = anchors[key]
+        local hidden = elem and elem.isHidden and elem.isHidden(key)
+        P(("%s: reg=%s hidden=%s frame=%s shown=%s L=%s B=%s W=%s H=%s -> anchor=%s side=%s"):format(
+            key, tostring(elem ~= nil), tostring(hidden),
+            tostring(f ~= nil), tostring(f and f:IsShown()),
+            tostring(f and f.GetLeft and f:GetLeft() and math.floor(f:GetLeft() + 0.5)),
+            tostring(f and f.GetBottom and f:GetBottom() and math.floor(f:GetBottom() + 0.5)),
+            tostring(f and math.floor((f:GetWidth() or 0) + 0.5)),
+            tostring(f and math.floor((f:GetHeight() or 0) + 0.5)),
+            tostring(a and a.target), tostring(a and a.side)))
+    end
+    local cdmp = EllesmereUI._cdmBarPositions
+    for _, bk in ipairs({ "cooldowns", "utility", "buffs" }) do
+        local p = cdmp and cdmp[bk]
+        P(("cdmPos[%s]: point=%s x=%s y=%s"):format(bk,
+            tostring(p and p.point), tostring(p and p.x), tostring(p and p.y)))
+    end
 end
 end  -- end deferred init
