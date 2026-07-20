@@ -590,6 +590,12 @@ local _cdidRouteMap = {}
 
 local _divertedSpellsBuff = {}
 local _divertedSpellsCD   = {}
+-- cooldownID-level buff diversions: a collided buff (two viewer slots sharing
+-- one canonical spellID, e.g. Diabolist Demonic Art vs Diabolic Ritual) is
+-- tracked on a custom bar by its cooldownID (sd.assignedBuffCdIDs), routing
+-- exactly one slot there. Checked by ResolveCDIDToBar BEFORE the sid-level
+-- map so the cd-level claim outranks a whole-pair sid claim.
+local _divertedBuffCdIDs  = {}
 ns._divertedSpellsBuff = _divertedSpellsBuff
 ns._divertedSpellsCD   = _divertedSpellsCD
 
@@ -632,6 +638,7 @@ function ns.RebuildSpellRouteMap()
     wipe(_cdidRouteMap)
     wipe(_divertedSpellsBuff)
     wipe(_divertedSpellsCD)
+    wipe(_divertedBuffCdIDs)
     _routeMapBuilt = false
 
     local p = ECME.db and ECME.db.profile
@@ -666,6 +673,14 @@ function ns.RebuildSpellRouteMap()
                 for _, sid in ipairs(sd.assignedSpells) do
                     if type(sid) == "number" and sid > 0 then
                         SVV(_divertedSpellsBuff, sid, bd.key, false)
+                    end
+                end
+            end
+            -- cooldownID-level claims (collided buffs tracked by slot)
+            if sd and sd.assignedBuffCdIDs then
+                for cdID in pairs(sd.assignedBuffCdIDs) do
+                    if type(cdID) == "number" then
+                        _divertedBuffCdIDs[cdID] = bd.key
                     end
                 end
             end
@@ -756,6 +771,16 @@ local function ResolveCDIDToBar(cdID, viewerDefaultBar)
     if not cdID then return viewerDefaultBar end
     local cached = _cdidRouteMap[cdID]
     if cached then return cached end
+
+    -- cooldownID-level claim first (collided buffs tracked by slot). Needs no
+    -- cooldownInfo read, so it also works while every sid field is secret.
+    if viewerDefaultBar == "buffs" then
+        local cdRoute = _divertedBuffCdIDs[cdID]
+        if cdRoute then
+            _cdidRouteMap[cdID] = cdRoute
+            return cdRoute
+        end
+    end
 
     local RVV = ns.ResolveVariantValue
     local gci = C_CooldownViewer and C_CooldownViewer.GetCooldownViewerCooldownInfo
@@ -2530,7 +2555,7 @@ local function DecorateFrame(frame, barData)
                     if fc2 and fc2._cdStateHidden then
                         fc2._cdStateHidden = false
                         local bd2 = barDataByKey and barDataByKey[bk2]
-                        frame:SetAlpha(ns.EffectiveBarAlpha(bd2))
+                        frame:SetAlpha(ns.IconShownAlpha(fc2, bd2))
                     end
                     -- (cse is already normalized, so Shift variants never land here.)
                     if fc2 and ns.SetCdStateShiftHidden then
@@ -2568,12 +2593,14 @@ local function DecorateFrame(frame, barData)
                         local onCD = cseInfo and cseInfo.isActive and not cseInfo.isOnGCD
                         local myCse = self.cse
                         local bd3 = barDataByKey and barDataByKey[bk3]
-                        local baseA = ns.EffectiveBarAlpha(bd3)
+                        local baseA = ns.IconShownAlpha(fc3, bd3)
                         if myCse == "lowerAlphaOnCD" then
                             -- Lowered (not hidden): reuse _cdStateHidden as the
                             -- "cd-state owns this alpha" flag so the opacity appliers
                             -- leave the lowered value in place, exactly like hiddenOnCD.
-                            frame:SetAlpha(onCD and (self.lowAlpha or 0.5) or baseA)
+                            -- A visibility-hidden bar (baseA 0) stays at 0 in both states.
+                            frame:SetAlpha(baseA == 0 and 0
+                                or (onCD and (self.lowAlpha or 0.5) or baseA))
                             if fc3 then
                                 fc3._cdStateHidden = onCD or false
                                 if ns.SetCdStateShiftHidden then

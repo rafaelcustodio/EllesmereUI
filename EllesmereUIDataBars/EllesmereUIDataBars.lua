@@ -101,6 +101,11 @@ local L = {
     DELVE_JOURNEY        = "Delver's Journey",
     COMPANION_LEVEL      = "Companion Level",
     SELECT_CURRENCY      = "Select a currency",
+    WHISPER              = "Whisper",
+    WHISPER_BNET         = "Whisper BNet",
+    INVITE               = "Invite",
+    NO_FRIENDS_ONLINE    = "No friends online",
+    NOT_IN_GUILD         = "Not in a guild",
 }
 ns.L = L
 
@@ -152,6 +157,7 @@ ns.BLOCK_TYPES = {
     { key = "travel",     label = "Travel Cooldowns" },
     { key = "micromenu",  label = "Micro Menu" },
     { key = "currency",   label = "Currency" },
+    { key = "greatvault", label = "Great Vault" },
     { key = "spacer",     label = "Spacer" },
 }
 
@@ -166,10 +172,11 @@ ns.BLOCK_DEFAULTS = {
     profession = {},
     profession2 = {},
     travel     = { randomizeHs = true },
-    micromenu  = { disableBlizzardMicroMenu = false, hideSocialText = false, charStatsTooltip = false, mainMenuSpacing = 4, iconSpacing = 2,
+    micromenu  = { disableBlizzardMicroMenu = false, hideSocialText = false, charStatsTooltip = false, socialTooltip = false, mainMenuSpacing = 4, iconSpacing = 2,
                    menu = true, guild = true, social = true, char = true, spell = true, ach = true, quest = true, lfg = true,
                    pvp = true, housing = true, journal = true, pet = true, shop = true, help = true },
     currency   = { currencyId = nil, showIcon = true },
+    greatvault = {},
     spacer     = {},
 }
 
@@ -621,12 +628,14 @@ end
 do
     local tip
     local owner
-    local rows = {}       -- rows[i] = { left = fs, right = fs }
+    local rows = {}       -- rows[i] = { left = fs, right = fs, cols = { fs, ... } }
     local data = {}       -- data[i] = { l, r, lr, lg, lb, rr, rg, rb }
     local dataCount = 0
+    local colW = {}       -- per-Tip_Show widest token per sub-column
     local PAD = 10
     local ROW_GAP = 3
     local COL_GAP = 18
+    local TOKEN_GAP = 8
     local FONT_SIZE = 12
 
     -- Interactive rows: a pool of secure spell buttons overlaid on rows that
@@ -645,6 +654,14 @@ do
     local actionsDirty = false -- a teardown landed in combat; regen finishes it
     local interactive = false
     local keepAlive
+
+    -- Plain clickable rows: an insecure Button overlay running a Lua callback
+    -- on click (Tip_AddClickable). Used by the social/guild member lists, whose
+    -- actions -- whisper, invite, BNet whisper -- are all UNPROTECTED, so unlike
+    -- the spell pool above these buttons need no secure host and no combat
+    -- handling: they are created and configured freely, in or out of combat.
+    local clickPool = {}
+    local activeClicks = 0
 
     local function EnsureTip()
         if tip then return tip end
@@ -667,9 +684,25 @@ do
             row = {}
             row.left = tip:CreateFontString(nil, "OVERLAY")
             row.right = tip:CreateFontString(nil, "OVERLAY")
+            row.cols = {}
             rows[i] = row
         end
         return row
+    end
+
+    local function EnsureCol(row, c)
+        local fs = row.cols[c]
+        if not fs then
+            fs = tip:CreateFontString(nil, "OVERLAY")
+            row.cols[c] = fs
+        end
+        return fs
+    end
+
+    -- Rows are pooled across shows: a row reused with fewer (or no) sub-columns
+    -- must not leave the previous show's token FontStrings on screen.
+    local function HideCols(row, from)
+        for c = from, #row.cols do row.cols[c]:Hide() end
     end
 
     -- Hide/detach every overlay button. The buttons are PROTECTED
@@ -756,6 +789,37 @@ do
         return b
     end
 
+    -- Insecure clickable pool (social/guild rows). No secure host, no combat
+    -- gymnastics: the callbacks call unprotected functions only, so the buttons
+    -- can be built and clicked in any lockdown state.
+    local function HideClickButtons()
+        if activeClicks == 0 then return end
+        for i = 1, #clickPool do
+            local b = clickPool[i]
+            b:Hide()
+            b:ClearAllPoints()
+            b:SetScript("OnClick", nil)
+            b:SetScript("OnEnter", nil)
+            b:SetScript("OnLeave", nil)
+        end
+        activeClicks = 0
+    end
+
+    -- Grow-only pool; buttons parent to the tip (riding its strata/clamping)
+    -- and sit above its FontStrings so the overlay wins hit testing.
+    local function AcquireClickButton()
+        activeClicks = activeClicks + 1
+        local b = clickPool[activeClicks]
+        if not b then
+            b = CreateFrame("Button", nil, EnsureTip())
+            b:SetFrameLevel(tip:GetFrameLevel() + 5)
+            b:EnableMouse(true)
+            b:RegisterForClicks("AnyUp")
+            clickPool[activeClicks] = b
+        end
+        return b
+    end
+
     local function StopKeepAlive()
         if keepAlive then keepAlive:Cancel(); keepAlive = nil end
     end
@@ -802,6 +866,10 @@ do
     function ns.Tip_AddLine(text, r, g, b)
         if not tip then return end
         if text ~= nil and issecretvalue(text) then return end
+        -- Localize: fixed UI strings (click hints, labels) resolve through the
+        -- shared EllesmereUI locale; dynamic content (names, numbers, strings
+        -- the game already localized) has no key and falls back unchanged.
+        text = EllesmereUI.L(text)
         dataCount = dataCount + 1
         local d = data[dataCount]
         if not d then d = {}; data[dataCount] = d end
@@ -810,6 +878,8 @@ do
         d.r = nil
         d.wrap = nil
         d.action = nil
+        d.onClick = nil
+        d.ncols = nil
         return true
     end
 
@@ -826,6 +896,7 @@ do
         if not tip then return end
         if (left ~= nil and issecretvalue(left))
         or (right ~= nil and issecretvalue(right)) then return end
+        left = EllesmereUI.L(left); right = EllesmereUI.L(right)   -- see Tip_AddLine
         dataCount = dataCount + 1
         local d = data[dataCount]
         if not d then d = {}; data[dataCount] = d end
@@ -835,6 +906,42 @@ do
         d.rr = rr; d.rg = rg; d.rb = rb
         d.wrap = nil
         d.action = nil
+        d.onClick = nil
+        d.ncols = nil
+        return true
+    end
+
+    -- Like Tip_AddDouble, but the right side is a series of tokens laid out in
+    -- pixel-aligned sub-columns instead of one right-aligned string. A single
+    -- string cannot line up vertically across rows: the game font is
+    -- proportional, so "+10" and "0/4" are different widths and every token
+    -- left of the last one drifts. Tokens carry their own inline color codes.
+    -- The array is copied, so callers may reuse one buffer for every row.
+    function ns.Tip_AddColumns(left, tokens, lr, lg, lb)
+        if not tip then return end
+        if left ~= nil and issecretvalue(left) then return end
+        local n = (tokens and #tokens) or 0
+        for i = 1, n do
+            if issecretvalue(tokens[i]) then return end
+        end
+        dataCount = dataCount + 1
+        local d = data[dataCount]
+        if not d then d = {}; data[dataCount] = d end
+        d.l = left or " "
+        d.lr = lr; d.lg = lg; d.lb = lb
+        d.r = nil
+        d.wrap = nil
+        d.action = nil
+        d.onClick = nil
+        -- nil, never 0: Tip_Show tests `if d.ncols`, and 0 is true in Lua, so a
+        -- token-less row would reserve the right column and pad the tip by
+        -- COL_GAP for content that never renders.
+        d.ncols = n > 0 and n or nil
+        if n > 0 then
+            local c = d.cols
+            if not c then c = {}; d.cols = c end
+            for i = 1, n do c[i] = tokens[i] end
+        end
         return true
     end
 
@@ -849,10 +956,23 @@ do
         end
     end
 
+    -- Click-to-act row: like Tip_AddDouble, but Tip_Show overlays an insecure
+    -- button that runs onClick(mouseButton) and keeps the tip alive while
+    -- hovered. onClick MUST call unprotected functions only (whisper/invite) --
+    -- never a protected call. Unlike Tip_AddActionDouble this stays live in
+    -- combat.
+    function ns.Tip_AddClickable(left, right, onClick, lr, lg, lb, rr, rg, rb)
+        if ns.Tip_AddDouble(left, right, lr, lg, lb, rr, rg, rb) and onClick then
+            data[dataCount].onClick = onClick
+        end
+    end
+
     function ns.Tip_Show()
         if not tip or not owner then return end
         local maxLeft, maxRight, totalH = 0, 0, 0
         local anyRight = false
+        local colCount = 0
+        wipe(colW)
         for i = 1, dataCount do
             local d = data[i]
             local row = EnsureRow(i)
@@ -887,18 +1007,48 @@ do
                 row.right:SetText("")
                 row.right:Hide()
             end
+            local colH = 0
+            if d.ncols then
+                anyRight = true
+                if d.ncols > colCount then colCount = d.ncols end
+                for c = 1, d.ncols do
+                    local fs = EnsureCol(row, c)
+                    ns.SetFont(fs, FONT_SIZE)
+                    fs:SetWordWrap(false)
+                    fs:SetWidth(0)
+                    fs:SetText(d.cols[c])
+                    fs:Show()
+                    local tw = fs:GetStringWidth() or 0
+                    if tw > (colW[c] or 0) then colW[c] = tw end
+                    local th = fs:GetStringHeight() or 0
+                    if th > colH then colH = th end
+                end
+            end
+            HideCols(row, (d.ncols or 0) + 1)
+            -- Row height covers whichever of the three shapes the row uses, so
+            -- a token taller than its label cannot bleed into the next row.
             local h = row.left:GetStringHeight() or FONT_SIZE
             if d.r then
                 local rh = row.right:GetStringHeight() or 0
                 if rh > h then h = rh end
             end
+            if colH > h then h = colH end
             totalH = totalH + h + (i > 1 and ROW_GAP or 0)
             d._h = h
         end
         for i = dataCount + 1, #rows do
             rows[i].left:Hide()
             rows[i].right:Hide()
+            HideCols(rows[i], 1)
         end
+
+        -- The sub-column block is as wide as its widest token per column plus
+        -- the gaps, and shares the right column with plain right strings.
+        local colsW = 0
+        for c = 1, colCount do
+            colsW = colsW + (colW[c] or 0) + (c > 1 and TOKEN_GAP or 0)
+        end
+        if colsW > maxRight then maxRight = colsW end
 
         local innerW = maxLeft
         if anyRight then innerW = maxLeft + COL_GAP + maxRight end
@@ -915,6 +1065,21 @@ do
             if d.r then
                 row.right:ClearAllPoints()
                 row.right:SetPoint("TOPRIGHT", tip, "TOPRIGHT", -PAD, y)
+            end
+            if d.ncols then
+                -- Walk the columns right to left so the block ends flush with
+                -- the tip's right edge, exactly where a plain right string
+                -- lands. Each token is anchored by its own right edge and keeps
+                -- its natural width, so nothing can clip.
+                local off = PAD
+                for c = colCount, 1, -1 do
+                    local fs = c <= d.ncols and row.cols[c]
+                    if fs then
+                        fs:ClearAllPoints()
+                        fs:SetPoint("TOPRIGHT", tip, "TOPRIGHT", -off, y)
+                    end
+                    off = off + (colW[c] or 0) + (c > 1 and TOKEN_GAP or 0)
+                end
             end
             d._y = y
             y = y - d._h - ROW_GAP
@@ -953,6 +1118,35 @@ do
                 end
             end
         end
+
+        -- Insecure clickable overlay (social/guild rows). No combat guard --
+        -- the callbacks are unprotected -- and rebuilt from scratch each show
+        -- so a reused tip never carries stale buttons.
+        HideClickButtons()
+        local car, cag, cab
+        for i = 1, dataCount do
+            local d = data[i]
+            if d.onClick then
+                interactive = true
+                if not car then car, cag, cab = ns.GetAccent() end
+                local b = AcquireClickButton()
+                b:ClearAllPoints()
+                b:SetPoint("TOPLEFT", tip, "TOPLEFT", PAD, d._y)
+                b:SetSize(max(1, innerW), max(1, d._h))
+                -- Hover affordance: recolor the row's left text to the accent,
+                -- exactly like the M+ teleport rows. For this to show, the row
+                -- text must NOT embed its own |c..|r codes -- callers pass the
+                -- normal color through the left-color args instead.
+                local row = rows[i]
+                local lr, lg, lb = d.lr or 1, d.lg or 1, d.lb or 1
+                local cb = d.onClick
+                b:SetScript("OnEnter", function() row.left:SetTextColor(car, cag, cab, 1) end)
+                b:SetScript("OnLeave", function() row.left:SetTextColor(lr, lg, lb, 1) end)
+                b:SetScript("OnClick", function(_, mouseButton) cb(mouseButton) end)
+                b:Show()
+            end
+        end
+
         tip:EnableMouse(interactive)
         if interactive then StartKeepAlive() else StopKeepAlive() end
 
@@ -1013,6 +1207,7 @@ do
         if ownerFrame and owner ~= ownerFrame then return end
         owner = nil
         HideActionButtons()
+        HideClickButtons()
         StopKeepAlive()
         interactive = false
         tip:EnableMouse(false)

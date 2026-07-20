@@ -57,7 +57,7 @@ initFrame:SetScript("OnEvent", function(self)
     local EST_LEN = {
         clock = 150, fps = 70, ms = 70, gold = 150, xprep = 140, spec = 130,
         profession = 120, travel = 40, micromenu = 340, currency = 90, spacer = 40,
-        durability = 70, profession2 = 120,
+        durability = 70, profession2 = 120, greatvault = 100,
     }
 
     ---------------------------------------------------------------------------
@@ -1870,7 +1870,7 @@ initFrame:SetScript("OnEvent", function(self)
             { type = "slider", text = lenLabel, min = 100, max = 3000, step = 10,
               tooltip = "Size of the bar along its block axis in pixels.",
               disabled = function() return cfg.lengthMode == "full" end,
-              disabledTooltip = "Disabled while " .. fullLabel .. " is enabled.",
+              disabledTooltip = EllesmereUI.Lf("Disabled while %1$s is enabled.", EllesmereUI.L(fullLabel)),
               rawTooltip = true,
               getValue = function()
                   local v = cfg.length
@@ -2324,6 +2324,7 @@ initFrame:SetScript("OnEvent", function(self)
                       end,
                       setValue = function(v) s.iconSpacing = v; Apply() end },
                     MkToggle("Character Stats Tooltip", "charStatsTooltip", "Shows item level and secondary stats in the Character button's tooltip."),
+                    MkToggle("Social & Guild Tooltip", "socialTooltip", "Shows a clickable list of online friends and guildmates in the Social and Guild button tooltips."),
                     -- Individual button toggles live in the "Menu Elements"
                     -- checklist dropdown appended after the shared row loop.
                 }
