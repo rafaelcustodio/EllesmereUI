@@ -3013,16 +3013,15 @@ do
         return false
     end
 
-    --- Border color + Show Behind to apply when the user picks a border style.
-    --- Shadow -> black + behind on; everything else -> behind off (Shadow is the
-    --- only style that renders behind). Solid/Shadow default to black, other
-    --- textured styles default to white. Returns (colorTable, behindBool).
+    --- Border color + layer defaults to apply when a border style is selected.
+    --- Shadow is the only style rendered behind both its icon and Unit Frame.
+    --- Returns (colorTable, behindBool, behindUnitFrameBool).
     function EllesmereUI.GetBorderStyleSelectDefaults(textureKey)
-        if textureKey == "shadow" then return { r = 0, g = 0, b = 0 }, true end
+        if textureKey == "shadow" then return { r = 0, g = 0, b = 0 }, true, true end
         if not textureKey or textureKey == "" or textureKey == "solid" then
-            return { r = 0, g = 0, b = 0 }, false
+            return { r = 0, g = 0, b = 0 }, false, false
         end
-        return { r = 1, g = 1, b = 1 }, false
+        return { r = 1, g = 1, b = 1 }, false, false
     end
 
     --- Resolve a border texture key to a file path.
@@ -3077,14 +3076,13 @@ do
                 if PP.GetBorders(borderFrame) then
                     PP.UpdateBorder(borderFrame, size, r, g, b, a)
                     PP.ShowBorder(borderFrame)
-                    -- Restore alpha in case textured mode zeroed it
-                    local ppC = PP.GetBorders(borderFrame)
-                    if ppC then
-                        if ppC._top then ppC._top:SetAlpha(1) end
-                        if ppC._bottom then ppC._bottom:SetAlpha(1) end
-                        if ppC._left then ppC._left:SetAlpha(1) end
-                        if ppC._right then ppC._right:SetAlpha(1) end
-                    end
+                    -- No SetAlpha "restore" for textured-mode zeroing here: on
+                    -- Textures SetAlpha writes the SAME alpha state as
+                    -- SetVertexColor's 4th arg, so UpdateBorder's color write
+                    -- above already restores it -- and a hardcoded SetAlpha(1)
+                    -- stomps every fractional border alpha on re-apply (first
+                    -- apply takes the create branch and looks right; every
+                    -- later apply flashed to full alpha).
                 else
                     PP.CreateBorder(borderFrame, r, g, b, a, size, "OVERLAY", 7)
                 end
@@ -3179,6 +3177,69 @@ do
         end
     end
 
+    -- BackdropTemplate performs arithmetic on its owner's width/height and is
+    -- therefore unusable for frames anchored to secret aura geometry. This
+    -- variant renders textured borders as the same eight edge-file slices,
+    -- while retaining the normal PP path for Solid. `state` is any caller-owned
+    -- table used to cache the eight textures (FFD, AuraKit button data, etc.).
+    local SECRET_BORDER_UV = {
+        topLeft     = { 0.5078125, 0.0625, 0.5078125, 0.9375, 0.6171875, 0.0625, 0.6171875, 0.9375 },
+        topRight    = { 0.6328125, 0.0625, 0.6328125, 0.9375, 0.7421875, 0.0625, 0.7421875, 0.9375 },
+        bottomLeft  = { 0.7578125, 0.0625, 0.7578125, 0.9375, 0.8671875, 0.0625, 0.8671875, 0.9375 },
+        bottomRight = { 0.8828125, 0.0625, 0.8828125, 0.9375, 0.9921875, 0.0625, 0.9921875, 0.9375 },
+        top         = { 0.2578125, 0.9375, 0.3671875, 0.9375, 0.2578125, 0.0625, 0.3671875, 0.0625 },
+        bottom      = { 0.3828125, 0.9375, 0.4921875, 0.9375, 0.3828125, 0.0625, 0.4921875, 0.0625 },
+        left        = { 0.0078125, 0.0625, 0.0078125, 0.9375, 0.1171875, 0.0625, 0.1171875, 0.9375 },
+        right       = { 0.1328125, 0.0625, 0.1328125, 0.9375, 0.2421875, 0.0625, 0.2421875, 0.9375 },
+    }
+
+    function EllesmereUI.ApplySecretSafeBorderStyle(borderFrame, state, size, r, g, b, a,
+        textureKey, offsetX, offsetY, shiftX, shiftY, addonKey, sizeKey)
+        if not borderFrame or not state then return end
+        size, textureKey = size or 0, textureKey or "solid"
+        local edges = state._secretBorderEdges
+        local function HideEdges()
+            if edges then for _, tex in pairs(edges) do tex:Hide() end end
+        end
+        if textureKey == "" or textureKey == "solid" or size <= 0 then
+            HideEdges()
+            EllesmereUI.ApplyBorderStyle(borderFrame, size, r, g, b, a, "solid")
+            return
+        end
+        local path = EllesmereUI.ResolveBorderTexture(textureKey)
+        if not path then HideEdges(); EllesmereUI.ApplyBorderStyle(borderFrame, 0, 0, 0, 0, 0, "solid"); return end
+        -- Also hides any BackdropTemplate child left by an older live version.
+        EllesmereUI.ApplyBorderStyle(borderFrame, 0, 0, 0, 0, 0, "solid")
+        borderFrame:Show()
+        if not edges then
+            edges = {}
+            for key, uv in pairs(SECRET_BORDER_UV) do
+                local tex = borderFrame:CreateTexture(nil, "OVERLAY", nil, 7)
+                tex:SetTexCoord(unpack(uv)); edges[key] = tex
+            end
+            state._secretBorderEdges = edges
+        end
+        local edgeSize = EDGE_MAP[size] or EDGE_MAP[1]
+        local ox, oy, sx, sy = EllesmereUI.GetBorderDefaults(addonKey, textureKey, sizeKey)
+        ox = offsetX ~= nil and offsetX or ox; oy = offsetY ~= nil and offsetY or oy
+        sx = shiftX ~= nil and shiftX or sx; sy = shiftY ~= nil and shiftY or sy
+        if EllesmereUI.BorderTextureUsesScaleOffset(textureKey) then
+            ox, oy = edgeSize / 2 + ox, edgeSize / 2 + oy
+        end
+        for _, tex in pairs(edges) do
+            tex:SetTexture(path, true, true); tex:SetVertexColor(r, g, b, a or 1)
+            tex:ClearAllPoints(); tex:Show()
+        end
+        edges.topLeft:SetSize(edgeSize, edgeSize); edges.topLeft:SetPoint("TOPLEFT", borderFrame, "TOPLEFT", -ox + sx, oy + sy)
+        edges.topRight:SetSize(edgeSize, edgeSize); edges.topRight:SetPoint("TOPRIGHT", borderFrame, "TOPRIGHT", ox + sx, oy + sy)
+        edges.bottomLeft:SetSize(edgeSize, edgeSize); edges.bottomLeft:SetPoint("BOTTOMLEFT", borderFrame, "BOTTOMLEFT", -ox + sx, -oy + sy)
+        edges.bottomRight:SetSize(edgeSize, edgeSize); edges.bottomRight:SetPoint("BOTTOMRIGHT", borderFrame, "BOTTOMRIGHT", ox + sx, -oy + sy)
+        edges.top:SetHeight(edgeSize); edges.top:SetPoint("TOPLEFT", edges.topLeft, "TOPRIGHT"); edges.top:SetPoint("TOPRIGHT", edges.topRight, "TOPLEFT")
+        edges.bottom:SetHeight(edgeSize); edges.bottom:SetPoint("BOTTOMLEFT", edges.bottomLeft, "BOTTOMRIGHT"); edges.bottom:SetPoint("BOTTOMRIGHT", edges.bottomRight, "BOTTOMLEFT")
+        edges.left:SetWidth(edgeSize); edges.left:SetPoint("TOPLEFT", edges.topLeft, "BOTTOMLEFT"); edges.left:SetPoint("BOTTOMLEFT", edges.bottomLeft, "TOPLEFT")
+        edges.right:SetWidth(edgeSize); edges.right:SetPoint("TOPRIGHT", edges.topRight, "BOTTOMRIGHT"); edges.right:SetPoint("BOTTOMRIGHT", edges.bottomRight, "TOPRIGHT")
+    end
+
     --- Set border color on whichever system is currently active (PP or backdrop).
     --- Used for hover highlights and other dynamic color changes.
     function EllesmereUI.SetBorderStyleColor(borderFrame, r, g, b, a)
@@ -3196,6 +3257,18 @@ do
         if bdFrame and bdFrame:IsShown() then
             bdFrame:SetBackdropBorderColor(r, g, b, a)
         end
+    end
+
+    --- Hide whichever ApplyBorderStyle system is currently drawn on borderFrame
+    --- (the PP pixel border or the BackdropTemplate texture) WITHOUT hiding
+    --- borderFrame itself -- used when a different renderer (e.g. the dashed
+    --- ants border) takes over the same frame.
+    function EllesmereUI.HideBorderStyle(borderFrame)
+        if not borderFrame then return end
+        local PP = EllesmereUI.PP
+        if PP and PP.GetBorders and PP.GetBorders(borderFrame) then PP.HideBorder(borderFrame) end
+        local bdFrame = _bdBorderData[borderFrame]
+        if bdFrame then bdFrame:Hide() end
     end
 end
 
@@ -4482,8 +4555,14 @@ do
         [12294]   = 1,  -- Mortal Strike
         [7384]    = 1,  -- Overpower
         [1464]    = 1,  -- Slam
-        [163201]  = 1,  -- Execute (Arms)
-        [5308]    = 1,  -- Execute (base)
+        -- Execute: in 12.x a single Arms Execute press fires TWO SUCCEEDED
+        -- events as a pair (260798 + 281000), not 163201/5308 (in-game trace,
+        -- LeoS report). All four are listed and share the executeWindow echo
+        -- guard below so one press only ever consumes one charge.
+        [260798]  = 1,  -- Execute (Arms, real SUCCEEDED id)
+        [281000]  = 1,  -- Execute (Arms, paired SUCCEEDED id)
+        [163201]  = 1,  -- Execute (Arms, legacy id kept as a fallback)
+        [5308]    = 1,  -- Execute (base, kept as a fallback)
         [260643]  = 1,  -- Skullsplitter
         [34428]   = 1,  -- Victory Rush
         [202168]  = 1,  -- Impending Victory
@@ -4499,6 +4578,10 @@ do
         [845]  = true,  -- Cleave
     }
     local fobWindow = 0  -- suppress a possibly-echoed Slam cast event
+    -- Execute fires a pair of SUCCEEDED ids for one press (see SPENDERS); the
+    -- first to spend opens EllesmereUI._ssExecWindow so the second is skipped
+    -- -> one charge. Stored as a field (not a local) because this do-block's
+    -- main chunk sits at Lua's 200-local cap.
     local bladestormUntil = 0  -- suppress Sweeping Strikes spends until this time
 
     -- Deduplicate cast events via GUID
@@ -4506,19 +4589,44 @@ do
     local guidCount = 0
 
     -- A charge is only consumed when the strike can sweep onto a second
-    -- enemy (~8 yd). Count the hostile target plus enemy nameplates inside
-    -- the index-2 interact probe (~11 yd, slightly generous; same probe as
-    -- the Whirlwind tracker above). `need` = how many enemies must be in
-    -- reach (2 for a sweep partner, 3 for a Fervor of Battle trigger).
+    -- enemy. `need` = how many enemies must be in reach (2 for a sweep
+    -- partner, 3 for a Fervor of Battle trigger).
     -- NOTE: relies on enemy nameplates showing for off-target enemies.
     -- InReach is block-scoped (no upvalues from the call) so EnemiesInReach
     -- allocates nothing -- it runs on every tracked spender cast in combat.
-    -- idx defaults to the index-2 trade probe; index 3 (duel, ~9.9 yd) is
-    -- exercised by the _SSDEBUG comparison output as a candidate tighter fit
-    -- for the real 8 yd sweep.
+    --
+    -- Range gauge: the cleave is player-anchored at ~6 yd (melee), NOT the
+    -- ~11 yd the interact probe measures. H3llfish range-tracker test: the
+    -- game cleaves out to ~6 yd, but the old index-2 probe fired to ~8-11 yd,
+    -- so the 6-11 yd band produced false depletions.
+    --
+    -- C_Spell.IsSpellInRange on Mortal Strike gives a ~5 yd nameplate check
+    -- that tracks the cleave (verified in-game: true at 4-5 yd where it
+    -- cleaves, false past ~6 yd). It is the TIGHTEST primitive that resolves
+    -- on nameplate units: IsItemInRange does NOT work on nameplates (tested --
+    -- always false), so LibRangeCheck's 6/7 yd harm items are unavailable
+    -- here, and CheckInteractDistance bottoms out at ~9.9 yd. So ~5 yd is the
+    -- closest we can measure; the residual ~1 yd gap (cleaves at 5-6 yd but
+    -- the probe reads false) is an UNDER-count -- the safe direction: the bar
+    -- reads slightly full, never empty, and self-heals via CdmSweepSync at the
+    -- next combat lull. Fall back to the interact probe only when
+    -- IsSpellInRange can't answer (nil, or a secret value inside instanced
+    -- content) so the bar never regresses to "never depletes". idx defaults to
+    -- the index-2 trade probe.
     local function InReach(u, idx)
         if not (UnitExists(u) and UnitCanAttack("player", u) and not UnitIsDead(u)) then
             return false
+        end
+        local isr = C_Spell and C_Spell.IsSpellInRange
+        if isr then
+            -- Resolve the live override id (a talent-replaced base id returns
+            -- nil), matching the nameplate range-text / crosshair probes.
+            local ms = (C_SpellBook and C_SpellBook.FindSpellOverrideByID
+                and C_SpellBook.FindSpellOverrideByID(12294)) or 12294
+            local r = isr(ms, u)
+            if not (issecretvalue and issecretvalue(r)) and r ~= nil then
+                return r == true
+            end
         end
         return CheckInteractDistance(u, idx or 2) or false
     end
@@ -4584,6 +4692,20 @@ do
             if guidCount > 200 then wipe(seenGUID); guidCount = 0 end
         end
 
+        -- Catch-all trace: the live reach gauge (IsSpellInRange on Mortal
+        -- Strike ~5 yd, see InReach), regardless of stacks. This is the line
+        -- that identified the Execute cast ids and the cleave range.
+        -- Diagnostic only (_SSDEBUG).
+        if EllesmereUI._SSDEBUG then
+            local nm = (C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)) or "?"
+            local cls = (spellID == SWEEP or (CS_GENERATORS[spellID] and broadKnown)) and "ACTIVATE"
+                or (SPENDERS[spellID] and "SPENDER")
+                or (FOB_TRIGGERS[spellID] and "FoB")
+                or "ignored"
+            dbg(("cast %d %s [%s] stacks=%d reach=%s"):format(
+                spellID, nm, cls, stacks, tostring(EnemiesInReach(2))))
+        end
+
         if spellID == SWEEP
            or (CS_GENERATORS[spellID] and broadKnown) then
             stacks = MaxStacks()
@@ -4614,17 +4736,21 @@ do
             -- 1269383: Master of Warfare replaces Slam with Heroic Strike,
             -- so the echo carries that id instead.
             if (spellID == 1464 or spellID == 1269383) and GetTime() < fobWindow then return end
-            -- No sweep partner in range -> the game doesn't consume a charge
-            local reach = EnemiesInReach(2)
-            if EllesmereUI._SSDEBUG then
-                -- Side-by-side probe comparison: index 2 (trade, ~11.1 yd,
-                -- live) vs index 3 (duel, ~9.9 yd, candidate).
-                dbg(("spend %d: reach11=%s reach10=%s stacks=%d"):format(
-                    spellID, tostring(reach), tostring(EnemiesInReach(2, 3)), stacks))
+            -- Execute's paired second cast id lands in the same frame as the
+            -- first; skip it so one Execute press consumes a single charge.
+            local isExec = spellID == 260798 or spellID == 281000
+                or spellID == 163201 or spellID == 5308
+            if isExec and GetTime() < (EllesmereUI._ssExecWindow or 0) then return end
+            -- No sweep partner in melee range -> the game doesn't cleave, so
+            -- no charge is consumed (see InReach for the ~6 yd gauge).
+            if not EnemiesInReach(2) then
+                dbg("spend BLOCKED (no reach):", spellID)
+                return
             end
-            if not reach then return end
             stacks = max(0, stacks - SPENDERS[spellID])
             if stacks == 0 then expiresAt = nil end
+            if isExec then EllesmereUI._ssExecWindow = GetTime() + 0.3 end
+            dbg("spend APPLIED:", spellID, "->", stacks, "stacks left")
         end
     end
 
@@ -5221,6 +5347,11 @@ function EllesmereUI.MakeUnlockElement(opts)
         -- position-locked (no drag/nudge/anchor link), but resize and
         -- width/height matching stay available.
         keepMoverWhenAnchored = opts.keepMoverWhenAnchored,
+        -- moverBg: optional {r,g,b} base tint for the unlock mover background
+        -- (defaults to the standard dark overlay color when omitted).
+        -- subtitle: optional dimmed helper line shown under the mover label.
+        moverBg           = opts.moverBg,
+        subtitle          = opts.subtitle,
     }
 end
 
@@ -5873,7 +6004,70 @@ function EllesmereUI:ShowConfirmPopup(opts)
         popup._cbRow:Hide()
     end
 
-    popup:SetHeight((popup._baseH or 176) + scaleWarnH + cbH)
+    -- Optional type-to-confirm gate (lazy, like the macro overlay): an edit
+    -- box the user must type the given word into (case-insensitive) before
+    -- the confirm button accepts clicks. Not supported together with
+    -- confirmMacro (secure overlay clicks cannot be gated).
+    local typeH = 0
+    popup._typeGateOn = nil
+    if opts.typeToConfirm then
+        if not popup._typeRow then
+            local row = CreateFrame("Frame", nil, popup)
+            row:SetSize(220, 26)
+            row:SetFrameLevel(popup:GetFrameLevel() + 2)
+            local tLbl = MakeFont(row, 12, nil, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, TEXT_DIM.a)
+            tLbl:SetPoint("LEFT", row, "LEFT", 0, 0)
+            local box = CreateFrame("EditBox", nil, row)
+            box:SetSize(110, 26)
+            box:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+            box:SetAutoFocus(false)
+            box:SetFont(EllesmereUI.EXPRESSWAY or "Fonts\\FRIZQT__.TTF", 13, "")
+            box:SetTextColor(1, 1, 1, 1)
+            box:SetTextInsets(8, 8, 0, 0)
+            box:SetMaxLetters(24)
+            SolidTex(box, "BACKGROUND", 0.10, 0.10, 0.11, 0.9)
+            MakeBorder(box, 1, 1, 1, 0.12)
+            box:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+            box:SetScript("OnTextChanged", function(self)
+                if not popup._typeGateOn then return end
+                local ok = strlower(strtrim(self:GetText() or "")) == popup._typeWant
+                popup._typeGateOk = ok
+                popup._confirmBtn:SetAlpha(ok and 1 or 0.3)
+            end)
+            box:SetScript("OnEnterPressed", function(self)
+                self:ClearFocus()
+                if popup._typeGateOk then
+                    local click = popup._confirmBtn:GetScript("OnClick")
+                    if click then click(popup._confirmBtn) end
+                end
+            end)
+            row._label = tLbl
+            row._box = box
+            popup._typeRow = row
+        end
+        local row = popup._typeRow
+        popup._typeGateOn = true
+        popup._typeGateOk = false
+        popup._typeWant = strlower(strtrim(tostring(opts.typeToConfirm)))
+        row._label:SetText(string.format(EllesmereUI.L('Type "%s" to enable:'), tostring(opts.typeToConfirm)))
+        row._box:SetText("")
+        row:SetWidth(row._label:GetStringWidth() + 10 + 110)
+        row:ClearAllPoints()
+        row:SetPoint("BOTTOM", popup, "BOTTOM", 0, 13 + 27 + 10 + cbH)
+        row:Show()
+        -- The base height affords roughly three message lines; gated popups
+        -- carry long warnings, so grow by the measured overflow too.
+        local extra = popup._msg:GetStringHeight() or 0
+        if opts.disclaimer then
+            extra = extra + (popup._disclaimer:GetStringHeight() or 0) + 8
+        end
+        typeH = 36 + math.max(0, extra - 44)
+    elseif popup._typeRow then
+        popup._typeRow._box:ClearFocus()
+        popup._typeRow:Hide()
+    end
+
+    popup:SetHeight((popup._baseH or 176) + scaleWarnH + cbH + typeH)
     popup._cancelBtn._lbl:SetText(EllesmereUI.L(opts.cancelText or "Cancel"))
     popup._confirmBtn._lbl:SetText(EllesmereUI.L(opts.confirmText or "Confirm"))
     -- onDismiss: called on escape/click-outside. Falls back to onCancel if not provided.
@@ -5894,6 +6088,7 @@ function EllesmereUI:ShowConfirmPopup(opts)
     -- Reset hover states
     popup._cancelBtn._resetAnim()
     popup._confirmBtn._resetAnim()
+    popup._confirmBtn:SetAlpha(popup._typeGateOn and 0.3 or 1)
 
     popup._cancelBtn:SetScript("OnClick", function()
         popup._dimmer:Hide()
@@ -5928,6 +6123,7 @@ function EllesmereUI:ShowConfirmPopup(opts)
     else
         if popup._macroOverlay then popup._macroOverlay:Hide() end
         popup._confirmBtn:SetScript("OnClick", function()
+            if popup._typeGateOn and not popup._typeGateOk then return end
             popup._dimmer:Hide()
             if opts.onConfirm then opts.onConfirm(popup._cbChecked) end
         end)
@@ -8823,7 +9019,7 @@ local function CreateMainFrame()
         end
     end
 
-    -- Done  (right side, FOOTER_PAD from right edge, green, closes window)
+    -- Close  (right side, FOOTER_PAD from right edge, green, closes window)
     do
         local btn = CreateFrame("Button", nil, footerFrame)
         PanelPP.Size(btn, DONE_BTN_W, FOOTER_BTN_H)
@@ -8833,7 +9029,7 @@ local function CreateMainFrame()
         local bg = SolidTex(btn, "BACKGROUND", DARK_BG.r, DARK_BG.g, DARK_BG.b, .92)
         bg:SetAllPoints()
         local lbl = MakeFont(btn, 13, nil, ELLESMERE_GREEN.r, ELLESMERE_GREEN.g, ELLESMERE_GREEN.b)
-        lbl:SetAlpha(0.7); lbl:SetPoint("CENTER"); lbl:SetText(EllesmereUI.L("Done"))
+        lbl:SetAlpha(0.7); lbl:SetPoint("CENTER"); lbl:SetText(EllesmereUI.L("Close"))
         -- Hover animation reads from ELLESMERE_GREEN live
         local FADE_DUR = 0.1
         local progress, target = 0, 0
@@ -9298,6 +9494,13 @@ end
 
 function EllesmereUI:ApplyInlineSearch(query, skipHighlights)
     if not activeModule or not activePage then return end
+    -- Active search force-expands every "Show Less Common" section (links
+    -- hidden entirely); clearing collapses them back to session state. Must
+    -- run BEFORE the cache lookup below: a state transition rebuilds and
+    -- replaces this page's cache entry (see SetLessCommonSearchActive).
+    if EllesmereUI.SetLessCommonSearchActive then
+        EllesmereUI.SetLessCommonSearchActive(query ~= nil and query ~= "")
+    end
     local cacheKey = activeModule .. "::" .. activePage
     local cached = _pageCache[cacheKey]
     if not cached or not cached.wrapper then return end
@@ -10677,7 +10880,7 @@ end
 -------------------------------------------------------------------------------
 --  Slash commands
 -------------------------------------------------------------------------------
-EllesmereUI.VERSION = "8.5.1"
+EllesmereUI.VERSION = "8.5.3"
 
 -- Register this addon's version into a shared global table (taint-free at load time)
 if not _G._EUI_AddonVersions then _G._EUI_AddonVersions = {} end
@@ -10962,9 +11165,10 @@ C_Timer.After(2, function()
     if EllesmereUIDB and EllesmereUIDB.firstInstallPopupShown then
         -- Defer while any intro popup is still pending/open; each runs the
         -- conflict check itself when dismissed (RaidFrames / PatchNotes /
-        -- WindowSkins / SpecOverrides popup files).
+        -- WindowSkins / SpecOverrides / PTRManagers popup files).
         if EllesmereUI._raidFramesIntroPending or EllesmereUI._patchNotesIntroPending
-           or EllesmereUI._windowSkinsIntroPending or EllesmereUI._specOvIntroPending then return end
+           or EllesmereUI._windowSkinsIntroPending or EllesmereUI._specOvIntroPending
+           or EllesmereUI._ptrManagersIntroPending then return end
         if EllesmereUI._RunConflictCheck then EllesmereUI._RunConflictCheck() end
     end
 end)
@@ -11175,7 +11379,7 @@ do
         local f = CreateFrame("Frame", "EllesmereUIDevModeBadge", UIParent)
         f:SetFrameStrata("HIGH")
         f:SetHeight(26)
-        f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 16, -16)
+        f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 16, -41)
         f:EnableMouse(false)
         f:Hide()
 
@@ -11550,7 +11754,14 @@ initFrame:SetScript("OnEvent", function(self, event)
                     local euiFont = EllesmereUI.GetFontPath and EllesmereUI.GetFontPath() or nil
                     local _, size, flags = cfs:GetFont()
                     cfs:SetFont(euiFont or "Fonts\\FRIZQT__.TTF", (size or 14) - 2, flags or "")
-                    if EllesmereUI._getPopupMenuButtonTextColor then local r,g,b=EllesmereUI._getPopupMenuButtonTextColor(); cfs:SetTextColor(r,g,b,1) end
+                    -- Native mode keeps the branded inline-code labels set by
+                    -- the Layout hook; only explicit modes flat-recolor.
+                    if EllesmereUI._getPopupMenuElementMode
+                       and EllesmereUI._getPopupMenuElementMode() ~= "native"
+                       and EllesmereUI._getPopupMenuButtonTextColor then
+                        local r,g,b=EllesmereUI._getPopupMenuButtonTextColor()
+                        cfs:SetTextColor(r,g,b,1)
+                    end
                 end
             end
         end
@@ -11610,13 +11821,32 @@ initFrame:SetScript("OnEvent", function(self, event)
             local lastBtn = anchorBtn
             local euiFont = EllesmereUI.GetFontPath and EllesmereUI.GetFontPath() or "Fonts\\FRIZQT__.TTF"
             local btnFontSize = 13
+            -- Branded two-tone labels are the default (native mode, or when
+            -- BlizzardSkin is not loaded) -- applied via inline color codes
+            -- in SetText, which works with the pause-menu reskin off, exactly
+            -- as before 8.5.2. Only an explicitly chosen Element & Text Color
+            -- mode switches to a plain label + whole-string recolor (inline
+            -- codes would override SetTextColor otherwise).
+            local elemMode = EllesmereUI._getPopupMenuElementMode
+                and EllesmereUI._getPopupMenuElementMode() or "native"
+            local brandHex
+            if elemMode == "native" then
+                local EG = EllesmereUI.ELLESMERE_GREEN or { r = .27, g = .86, b = .49 }
+                brandHex = string.format("|cff%02x%02x%02x",
+                    math.floor(EG.r * 255 + 0.5), math.floor(EG.g * 255 + 0.5),
+                    math.floor(EG.b * 255 + 0.5))
+            end
 
             if showEUI then
                 btn:Show()
-                btn:SetText("EllesmereUI")
+                if brandHex then
+                    btn:SetText(brandHex .. "Ellesmere|r|cffffffffUI|r")
+                else
+                    btn:SetText("EllesmereUI")
+                end
                 if _reskinMenu then
                     local fs = btn:GetFontString()
-                    if fs then fs:SetFont(euiFont, btnFontSize, ""); if EllesmereUI._getPopupMenuButtonTextColor then local r,g,b=EllesmereUI._getPopupMenuButtonTextColor(); fs:SetTextColor(r,g,b,1) end end
+                    if fs then fs:SetFont(euiFont, btnFontSize, ""); if not brandHex and EllesmereUI._getPopupMenuButtonTextColor then local r,g,b=EllesmereUI._getPopupMenuButtonTextColor(); fs:SetTextColor(r,g,b,1) end end
                 end
                 btn:ClearAllPoints()
                 btn:SetPoint("TOP", lastBtn, "BOTTOM", 0, -12)
@@ -11625,10 +11855,14 @@ initFrame:SetScript("OnEvent", function(self, event)
             end
             if showUnlock then
                 unlockBtn:Show()
-                unlockBtn:SetText("EUI Unlock Mode")
+                if brandHex then
+                    unlockBtn:SetText(brandHex .. "EUI|r |cffffffffUnlock Mode|r")
+                else
+                    unlockBtn:SetText("EUI Unlock Mode")
+                end
                 if _reskinMenu then
                     local fs2 = unlockBtn:GetFontString()
-                    if fs2 then fs2:SetFont(euiFont, btnFontSize, ""); if EllesmereUI._getPopupMenuButtonTextColor then local r,g,b=EllesmereUI._getPopupMenuButtonTextColor(); fs2:SetTextColor(r,g,b,1) end end
+                    if fs2 then fs2:SetFont(euiFont, btnFontSize, ""); if not brandHex and EllesmereUI._getPopupMenuButtonTextColor then local r,g,b=EllesmereUI._getPopupMenuButtonTextColor(); fs2:SetTextColor(r,g,b,1) end end
                 end
                 unlockBtn:ClearAllPoints()
                 unlockBtn:SetPoint("TOP", lastBtn, "BOTTOM", 0, showEUI and -4 or -12)
@@ -12199,7 +12433,7 @@ function EllesmereUI.CheckVisibilityMode(mode, state)
     if mode == "in_combat" then return state.inCombat end
     if mode == "out_of_combat" then return not state.inCombat end
     if mode == "in_raid" then return state.inRaid end
-    if mode == "in_party" then return state.inParty or state.inRaid end
+    if mode == "in_party" then return state.inParty end
     if mode == "solo" then return not state.inRaid and not state.inParty end
     if mode == "show_dragonriding" then
         -- Approximates the secure-macro [advflyable,flying] driver: show only
