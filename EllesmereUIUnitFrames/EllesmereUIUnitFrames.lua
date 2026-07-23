@@ -8,6 +8,142 @@ local issecretvalue = issecretvalue
 local oUF = ns.oUF or oUF
 local PP = EllesmereUI.PP
 
+-- Taint-safe override of the embedded lib's DisableBlizzard for the units
+-- this addon disables. The stock version re-parents a disabled Blizzard
+-- frame back to its hidden parent INLINE from a SetParent hooksecurefunc.
+-- Blizzard's Edit Mode layout pass calls SetParent on managed containers
+-- (confirmed live: BossTargetFrameContainer -> UIParent on every Edit Mode
+-- enter/exit), so the inline re-parent runs inside that secure execution
+-- and taints everything Edit Mode touches afterwards -- every 12.x secret
+-- value read then throws a LUA_WARNING (CompactUnitFrame health compares,
+-- encounter warnings, SecureUtil arithmetic) and the tainted setup pass
+-- poisons party frames for the whole session. Same end state here, but the
+-- re-parent is deferred to a timer (a fresh addon-owned execution) and
+-- further postponed while the Edit Mode manager is open, because SetParent
+-- fires Blizzard's synchronous layout handlers in the caller's execution.
+-- Units this addon never disables fall through to the stock implementation.
+do
+    local hiddenParent = CreateFrame("Frame", nil, UIParent)
+    hiddenParent:Hide()
+    local pendingParent, looseFrames, hookedFrames = {}, {}, {}
+    local bossHandled = false
+
+    -- Combat fallback: protected frames can't be re-parented in lockdown;
+    -- park them here and sweep at regen (mirrors the stock lib's behavior).
+    local regenWatcher = CreateFrame("Frame")
+    regenWatcher:SetScript("OnEvent", function(self)
+        if InCombatLockdown() then return end
+        self:UnregisterEvent("PLAYER_REGEN_ENABLED")
+        for f in pairs(looseFrames) do f:SetParent(hiddenParent) end
+        wipe(looseFrames)
+    end)
+
+    local function ApplyHiddenParent(frame)
+        pendingParent[frame] = nil
+        if frame:GetParent() == hiddenParent then return end
+        if EditModeManagerFrame and EditModeManagerFrame:IsShown() then
+            pendingParent[frame] = true
+            C_Timer.After(0.25, function() ApplyHiddenParent(frame) end)
+        elseif InCombatLockdown() and frame:IsProtected() then
+            looseFrames[frame] = true
+            regenWatcher:RegisterEvent("PLAYER_REGEN_ENABLED")
+        else
+            frame:SetParent(hiddenParent)
+        end
+    end
+
+    local function Unreg(child)
+        if child then child:UnregisterAllEvents() end
+    end
+
+    local function HandleFrame(frame, doNotReparent)
+        if type(frame) == "string" then frame = _G[frame] end
+        if not frame then return end
+        frame:UnregisterAllEvents()
+        frame:Hide()
+        if not doNotReparent then
+            frame:SetParent(hiddenParent)
+            if not hookedFrames[frame] then
+                hookedFrames[frame] = true
+                hooksecurefunc(frame, "SetParent", function(self, parent)
+                    if parent ~= hiddenParent and not pendingParent[self] then
+                        pendingParent[self] = true
+                        C_Timer.After(0, function() ApplyHiddenParent(self) end)
+                    end
+                end)
+            end
+        end
+        Unreg(frame.healthBar or frame.healthbar or frame.HealthBar
+            or (frame.HealthBarsContainer and frame.HealthBarsContainer.healthBar))
+        Unreg(frame.manabar or frame.ManaBar)
+        Unreg(frame.castBar or frame.spellbar or frame.CastingBarFrame)
+        Unreg(frame.powerBarAlt or frame.PowerBarAlt)
+        Unreg(frame.BuffFrame or frame.AurasFrame)
+        Unreg(frame.petFrame or frame.PetFrame)
+        Unreg(frame.totFrame)
+        Unreg(frame.CcRemoverFrame)
+        Unreg(frame.DebuffFrame)
+    end
+
+    local origDisableBlizzard = oUF.DisableBlizzard
+    -- Standalone Midnight player alt-power bars. They live under
+    -- PlayerFrameAlternatePowerBarArea (a child of PlayerFrame), so once we
+    -- reparent PlayerFrame to our hidden holder they become descendants of an
+    -- insecure frame and their own event handlers run tainted. On 12.1 build
+    -- 68824 aura access became a hard-error API (RequiresUnitAuraAccess), so
+    -- when one of these bars fires (power/spec/PEW events it registers itself,
+    -- independent of PlayerFrame's now-unregistered events) it drives
+    -- AttachBarToUnitUI -> PlayerFrame_OnAlternatePowerBarEnabled ->
+    -- PlayerFrame_ToPlayerArt -> BuffFrame:Update() -> GetAuraSlots, which
+    -- throws "Auras cannot be accessed when secret while tainted by
+    -- EllesmereUIUnitFrames". PlayerFrame's own art events are already dead, so
+    -- these bars are the last live driver into that chain: unregister their
+    -- events to cut it. UnregisterAllEvents is taint-clean (the same operation
+    -- the override already does on PlayerFrame's other sub-bars) and combat-
+    -- legal. Do NOT reparent them (Edit-Mode-managed; reparenting risks the
+    -- layout-pass taint the override defers timers to avoid). 12.1-gated:
+    -- retail keeps them event-registered, harmless there since the player
+    -- frame is hidden. The bars' Blizzard globals may not exist on every
+    -- client, so Unreg nil-guards each.
+    local ALT_POWER_BARS = {
+        "AlternatePowerBar", "MonkStaggerBar",
+        "EvokerEbonMightBar", "DemonHunterSoulFragmentsBar",
+    }
+    local function DisableAltPowerBars()
+        if not EllesmereUI.IS_121 then return end
+        for i = 1, #ALT_POWER_BARS do
+            Unreg(_G[ALT_POWER_BARS[i]])
+        end
+    end
+
+    function oUF:DisableBlizzard(unit)
+        if not unit then return end
+        if unit == "player" then
+            HandleFrame(PlayerFrame)
+            DisableAltPowerBars()
+        elseif unit == "pet" then
+            HandleFrame(PetFrame)
+        elseif unit == "target" then
+            HandleFrame(TargetFrame)
+        elseif unit == "focus" then
+            HandleFrame(FocusFrame)
+        elseif unit:match("boss%d?$") then
+            if not bossHandled then
+                bossHandled = true
+                -- Container is re-parented (Edit Mode can revive it); the
+                -- individual boss frames are container-managed and must not
+                -- be re-parented or the layout code breaks on their sizes.
+                HandleFrame(BossTargetFrameContainer)
+                for i = 1, (_G.MAX_BOSS_FRAMES or 5) do
+                    HandleFrame("Boss" .. i .. "TargetFrame", true)
+                end
+            end
+        else
+            return origDisableBlizzard(self, unit)
+        end
+    end
+end
+
 -- Per-addon border texture defaults (size key = borderSize 0-4)
 do
     local ALL_SIZES = { [0] = true, [1] = true, [2] = true, [3] = true, [4] = true }
@@ -6017,7 +6153,6 @@ local SATED_DEBUFFS = {
     [160455] = true,  -- Fatigued (Netherwinds)
     [264689] = true,  -- Fatigued (Primal Rage)
     [390435] = true,  -- Exhaustion (Fury of the Aspects)
-    [428628] = true,  -- Exhaustion (variant)
 }
 -- Debuffs permanently hidden from all unit frames (no toggle, ever). Blizzard
 -- keeps these spellIds readable, so spellId matching is safe. Mirrors the Raid
@@ -11134,7 +11269,11 @@ function InitializeFrames()
         frames._cbSuppressFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
         frames._cbSuppressFrame:RegisterEvent("EDIT_MODE_LAYOUTS_UPDATED")
         frames._cbSuppressFrame:SetScript("OnEvent", function()
-            ApplyBlizzCastbarState()
+            -- Deferred: EDIT_MODE_LAYOUTS_UPDATED is dispatched from inside
+            -- Edit Mode's own operations; applying suppression state there
+            -- writes cast bar state mid-pass (same taint mechanism as the
+            -- DisableBlizzard override at the top of this file).
+            C_Timer.After(0, ApplyBlizzCastbarState)
         end)
         -- Edit Mode exit reparents the cast bar back into its layout frame
         -- (which gets hidden), so re-apply our state when the panel closes.
@@ -11386,26 +11525,46 @@ function InitializeFrames()
         if _blizzCPHooked then return end
         _blizzCPHooked = true
         local _cpSetParentGuard = false
-        -- Re-assert position when Blizzard reparents (form/spec changes).
-        hooksecurefunc(cpFrame, "SetParent", function(self, newParent)
-            if not _blizzCPActive or _cpSetParentGuard then return end
+        -- Both hooks defer their re-assert work: they can fire inside
+        -- Blizzard's secure Edit Mode layout pass (same taint mechanism as
+        -- the DisableBlizzard override at the top of this file), and while
+        -- the manager is open the re-assert waits for it to close.
+        local _cpReassertQueued = false
+        local ReassertClassPower
+        ReassertClassPower = function(self)
+            _cpReassertQueued = false
+            if not _blizzCPActive then return end
+            if EditModeManagerFrame and EditModeManagerFrame:IsShown() then
+                _cpReassertQueued = true
+                C_Timer.After(0.25, function() ReassertClassPower(self) end)
+                return
+            end
             local wanted = _cpExpectedParent or frames.player or UIParent
-            if newParent ~= wanted then
+            if self:GetParent() ~= wanted then
                 _cpSetParentGuard = true
                 PositionClassPowerBar(self)
                 -- Blizzard may have re-stolen during PositionClassPowerBar.
                 -- The anchor is already correct, so just fix the parent directly.
-                local cur = self:GetParent()
-                wanted = _cpExpectedParent or frames.player or UIParent
-                if cur ~= wanted then
+                if self:GetParent() ~= wanted then
                     self:SetParent(wanted)
                 end
                 _cpSetParentGuard = false
             end
+            if not self:IsShown() and not InCombatLockdown() then self:Show() end
+        end
+        -- Re-assert position when Blizzard reparents (form/spec changes).
+        hooksecurefunc(cpFrame, "SetParent", function(self, newParent)
+            if not _blizzCPActive or _cpSetParentGuard or _cpReassertQueued then return end
+            local wanted = _cpExpectedParent or frames.player or UIParent
+            if newParent ~= wanted then
+                _cpReassertQueued = true
+                C_Timer.After(0, function() ReassertClassPower(self) end)
+            end
         end)
         hooksecurefunc(cpFrame, "Hide", function(self)
-            if not _blizzCPActive then return end
-            if not InCombatLockdown() then self:Show() end
+            if not _blizzCPActive or _cpReassertQueued then return end
+            _cpReassertQueued = true
+            C_Timer.After(0, function() ReassertClassPower(self) end)
         end)
     end
 
@@ -11540,12 +11699,32 @@ function InitializeFrames()
     -- Not fixable without reparenting/overriding a secure frame in combat, so it's
     -- surfaced in the mini-frame "Frame Source" tooltip (see BuildFoTToTOptions), which
     -- recommends matching the parent's source instead of mixing them.
-    local _suppressedChildren, _suppressWatcher
+    local _suppressedChildren, _suppressWatcher, _rehidePending
+    -- Deferred re-hide: OnShow fires inside whatever secure execution showed
+    -- the parent (target swaps, Edit Mode's preview pass on a Blizzard-source
+    -- TargetFrame/FocusFrame); hiding inline there taints the remainder of
+    -- that execution (same mechanism as the DisableBlizzard override at the
+    -- top of this file). While the Edit Mode manager is open the re-hide
+    -- waits for it to close.
+    local _DeferredRehide
+    _DeferredRehide = function(frame)
+        _rehidePending[frame] = nil
+        if not frame:IsShown() then return end
+        if EditModeManagerFrame and EditModeManagerFrame:IsShown() then
+            _rehidePending[frame] = true
+            C_Timer.After(0.25, function() _DeferredRehide(frame) end)
+        elseif InCombatLockdown() then
+            _suppressWatcher:RegisterEvent("PLAYER_REGEN_ENABLED")
+        else
+            frame:Hide()
+        end
+    end
     local function SuppressBlizzardChildFrame(frame)
         if not frame then return end
         frame:UnregisterAllEvents()
         if not InCombatLockdown() then frame:Hide() end
         _suppressedChildren = _suppressedChildren or {}
+        _rehidePending = _rehidePending or {}
         if not _suppressWatcher then
             _suppressWatcher = CreateFrame("Frame")
             _suppressWatcher:SetScript("OnEvent", function(self)
@@ -11557,10 +11736,9 @@ function InitializeFrames()
         if not _suppressedChildren[frame] then
             _suppressedChildren[frame] = true
             frame:HookScript("OnShow", function(self)
-                if InCombatLockdown() then
-                    _suppressWatcher:RegisterEvent("PLAYER_REGEN_ENABLED")
-                else
-                    self:Hide()
+                if not _rehidePending[self] then
+                    _rehidePending[self] = true
+                    C_Timer.After(0, function() _DeferredRehide(self) end)
                 end
             end)
         end

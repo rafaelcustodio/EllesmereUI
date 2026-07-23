@@ -887,6 +887,7 @@ EllesmereUI.RegisterSyncExclusions("EllesmereUICooldownManager", {
     "cdmBars.bars.*.iconSize",
     "cdmBars.bars.*.numRows",
     "cdmBars.bars.*.anchorFirstRow",
+    "cdmBars.bars.*.rowGrowDirection",
     "cdmBars.bars.*.spacing",
     "cdmBars.bars.*.verticalOrientation",
     "cdmBars.bars.*.anchorTo",
@@ -10880,7 +10881,7 @@ end
 -------------------------------------------------------------------------------
 --  Slash commands
 -------------------------------------------------------------------------------
-EllesmereUI.VERSION = "8.5.3"
+EllesmereUI.VERSION = "8.5.4"
 
 -- Register this addon's version into a shared global table (taint-free at load time)
 if not _G._EUI_AddonVersions then _G._EUI_AddonVersions = {} end
@@ -12523,7 +12524,11 @@ function EllesmereUI.SetPlayerCastBarSuppressed(owner, suppressed)
         end
         EllesmereUI._GetFFD(blizzBar).castBarSuppressed = true
 
-        if blizzBar:GetParent() ~= hiddenParent then
+        -- Skip the re-parent while Edit Mode is open: SetParent fires
+        -- Blizzard's synchronous layout handlers in this execution, and the
+        -- UnitFrames Edit-Mode-close hook re-applies this state afterwards.
+        if blizzBar:GetParent() ~= hiddenParent
+            and not (EditModeManagerFrame and EditModeManagerFrame:IsShown()) then
             blizzBar:SetParent(hiddenParent)
         end
 
@@ -12534,8 +12539,14 @@ function EllesmereUI.SetPlayerCastBarSuppressed(owner, suppressed)
             hooksecurefunc(blizzBar, "SetParent", function(self, newParent)
                 if EllesmereUI._GetFFD(self).castBarSuppressed and newParent ~= EllesmereUI._playerCastBarHiddenParent then
                     C_Timer.After(0, function()
+                        -- Never re-parent while Edit Mode is open, even from
+                        -- a timer: SetParent fires Blizzard's synchronous
+                        -- layout handlers under addon taint and poisons the
+                        -- manager's state for its next pass. The Edit Mode
+                        -- close hook (UnitFrames) re-applies suppression.
                         if EllesmereUI._GetFFD(self).castBarSuppressed
                            and not InCombatLockdown()
+                           and not (EditModeManagerFrame and EditModeManagerFrame:IsShown())
                            and self:GetParent() ~= EllesmereUI._playerCastBarHiddenParent
                         then
                             self:SetParent(EllesmereUI._playerCastBarHiddenParent)
@@ -12558,10 +12569,14 @@ function EllesmereUI.SetPlayerCastBarSuppressed(owner, suppressed)
             if not EllesmereUI._GetFFD(selection).showHooked then
                 EllesmereUI._GetFFD(selection).showHooked = true
                 hooksecurefunc(selection, "Show", function(self)
-                    if PlayerCastingBarFrame and EllesmereUI._GetFFD(PlayerCastingBarFrame).castBarSuppressed then
-                        self:SetAlpha(0)
-                        self:EnableMouse(false)
-                    end
+                    -- Deferred: Show fires inside Edit Mode's secure
+                    -- ShowSystemSelections pass; write nothing there.
+                    C_Timer.After(0, function()
+                        if PlayerCastingBarFrame and EllesmereUI._GetFFD(PlayerCastingBarFrame).castBarSuppressed then
+                            self:SetAlpha(0)
+                            self:EnableMouse(false)
+                        end
+                    end)
                 end)
             end
         end
@@ -12571,7 +12586,8 @@ function EllesmereUI.SetPlayerCastBarSuppressed(owner, suppressed)
 
     EllesmereUI._GetFFD(blizzBar).castBarSuppressed = false
 
-    if hiddenParent and blizzBar:GetParent() == hiddenParent and EllesmereUI._GetFFD(blizzBar).origParent then
+    if hiddenParent and blizzBar:GetParent() == hiddenParent and EllesmereUI._GetFFD(blizzBar).origParent
+        and not (EditModeManagerFrame and EditModeManagerFrame:IsShown()) then
         blizzBar:SetParent(EllesmereUI._GetFFD(blizzBar).origParent)
     end
 
