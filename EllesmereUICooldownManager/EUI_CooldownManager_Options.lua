@@ -9444,6 +9444,30 @@ initFrame:SetScript("OnEvent", function(self)
                             -- isToggle already gates them here; only the rejoin branch
                             -- above needed the payloadValue guard for them.)
                             if scopeActive and (valuesMatch or (ctx.isToggle and not ctx.payloadValue)) then
+                                -- Payload items (custom colour RGB, scalar seconds):
+                                -- the apply swept the per-icon originals, so this
+                                -- scope holds the ONLY copy of the value -- a plain
+                                -- un-apply would discard it and snap the setting to
+                                -- default. Seed the removed value back into the spell
+                                -- in hand first, so toggle-off is an undo for that
+                                -- spell (recreates its pre-apply own value) instead
+                                -- of a silent reset.
+                                if (ctx.scalarApply or ctx.payloadValue) and ss and scopeT then
+                                    -- EnsureSS, not ss directly: the apply's member
+                                    -- sweep prunes an entry it empties from the
+                                    -- store (a spell whose ONLY settings were the
+                                    -- swept keys), leaving this closure's ss
+                                    -- orphaned -- a seed into it would be lost.
+                                    -- EnsureSS re-persists the same table (no-op
+                                    -- when it is still in the store).
+                                    local target = EnsureSS()
+                                    for _, k in ipairs(keys) do
+                                        local own
+                                        if allSpecs then own = scopeT[k]
+                                        else own = rawget(scopeT, k) end
+                                        if own ~= nil then rawset(target, k, own) end
+                                    end
+                                end
                                 AB.RunBarUnapply(keys, allSpecs)
                                 if ctx.refresh then ctx.refresh() end
                                 if s._updateActive then s._updateActive() end

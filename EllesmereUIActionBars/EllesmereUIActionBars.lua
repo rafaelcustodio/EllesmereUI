@@ -9438,10 +9438,29 @@ end
 
 function EAB:OnEnable()
     -- If this is a first install (or reset), we need to capture Blizzard's
-    -- Edit Mode layout BEFORE hiding bars. Defer the full setup to
-    -- PLAYER_ENTERING_WORLD so Edit Mode has applied positions.
+    -- Edit Mode layout BEFORE hiding bars. The capture must run once Edit Mode
+    -- has applied bar positions/sizes, i.e. at/after PLAYER_ENTERING_WORLD.
+    --
+    -- OnEnable itself is now dispatched from the Lite enable-flush, which is
+    -- gated on IsLoggedIn() and deferred one tick past PLAYER_LOGIN (the Edit
+    -- Mode secret-taint fix). So on a fresh install the login
+    -- PLAYER_ENTERING_WORLD has ALREADY fired by the time we run here -- a plain
+    -- RegisterEvent would then wait for the next zone change, so OnFirstLogin
+    -- (and the FinishSetup it calls) would never run this session and the bars
+    -- stay built-but-invisible (reported on fresh 8.5.4 installs; a downgrade to
+    -- 8.5.3 then upgrade "fixes" it only because the capture then already ran).
+    --
+    -- Since the flush guarantees we're logged in and past the login PEW (Edit
+    -- Mode has applied its layout), capture now. Keep the event as a backstop
+    -- for the rare case we somehow enable before login; the _needsCapture guard
+    -- keeps the two paths idempotent (OnFirstLogin clears it + unregisters PEW).
     if self._needsCapture then
         self:RegisterEvent("PLAYER_ENTERING_WORLD", "OnFirstLogin")
+        if IsLoggedIn() then
+            C_Timer_After(0, function()
+                if self._needsCapture then self:OnFirstLogin() end
+            end)
+        end
     else
         self:FinishSetup()
     end
@@ -9451,6 +9470,15 @@ end
 -- At this point Edit Mode has applied bar positions/sizes/rows.
 function EAB:OnFirstLogin()
     self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+
+    -- A profile import can stamp the capture flag mid-session (imported data
+    -- is a chosen layout). Honor the stamp here so a still-pending capture
+    -- never overwrites the imported profile; just run the normal setup.
+    if self.db.sv._capturedOnce_EAB then
+        self._needsCapture = false
+        self:FinishSetup()
+        return
+    end
 
     -- Capture Blizzard layout while bars are still visible
     local captured = CaptureBlizzardDefaults()

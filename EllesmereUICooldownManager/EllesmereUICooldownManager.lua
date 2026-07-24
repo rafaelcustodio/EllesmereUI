@@ -8180,8 +8180,24 @@ function ECME:OnEnable()
         _cdmSetupStarted = true
         EnsureMappings(GetStore())
         if self._needsCapture then
-            -- Defer one more step so Edit Mode has applied positions
+            -- Capture Blizzard's Edit Mode layout once it has applied positions
+            -- (at/after PLAYER_ENTERING_WORLD). But OnEnable/TryBuildCDM now run
+            -- deferred past the login PEW -- the Lite enable-flush dispatches
+            -- OnEnable from a C_Timer past PLAYER_LOGIN (Edit Mode taint fix),
+            -- and a spec-change wakeup can defer this further still -- so on a
+            -- fresh install that login PLAYER_ENTERING_WORLD has already fired.
+            -- A plain RegisterEvent would then wait for the next zone change, so
+            -- OnCDMFirstLogin/CDMFinishSetup would never run this session and the
+            -- tracker stays unbuilt (same class as the fresh-install action-bar
+            -- regression). Keep the event as a backstop and, since we're already
+            -- in the world with Edit Mode applied, capture now; the _needsCapture
+            -- guard keeps the two paths idempotent.
             self:RegisterEvent("PLAYER_ENTERING_WORLD", "OnCDMFirstLogin")
+            if IsLoggedIn() then
+                C_Timer.After(0, function()
+                    if self._needsCapture then self:OnCDMFirstLogin() end
+                end)
+            end
         else
             self:CDMFinishSetup()
         end
@@ -8221,7 +8237,12 @@ end
 
 function ECME:OnCDMFirstLogin()
     self:UnregisterEvent("PLAYER_ENTERING_WORLD")
-    CDMFirstLoginCapture()
+    -- A profile import can stamp the capture flag mid-session (imported data
+    -- is a chosen layout). Honor the stamp here so a still-pending capture
+    -- never overwrites the imported profile; just finish the deferred setup.
+    if not self.db.sv._capturedOnce_CDM then
+        CDMFirstLoginCapture()
+    end
     self._needsCapture = false
     self:CDMFinishSetup()
 end
