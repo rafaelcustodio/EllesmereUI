@@ -1992,11 +1992,24 @@ do
     ---------------------------------------------------------------------------
     --  Core pixel-perfect values
     ---------------------------------------------------------------------------
-    PP.physicalWidth, PP.physicalHeight = GetPhysicalScreenSize()
-
-    -- 768 is WoW's reference height; this gives us the size of 1 physical
-    -- pixel in WoW's coordinate system at scale 1.0
-    PP.perfect = 768 / PP.physicalHeight
+    -- 768 is WoW's reference height; perfect is the size of 1 physical pixel
+    -- in WoW's coordinate system at scale 1.0.
+    --
+    -- GetPhysicalScreenSize() can report 0 (or nil) while a display-mode change
+    -- is in flight, and 768/0 is infinite. Since perfect is the divisor behind
+    -- every pixel snap in the suite, that turns snapped sizes into NaN addon
+    -- wide, so keep the last known-good height whenever the query comes back
+    -- unusable.
+    function PP.RefreshPhysical()
+        local pw, ph = GetPhysicalScreenSize()
+        if ph and ph > 0 then
+            PP.physicalWidth, PP.physicalHeight = pw, ph
+        elseif not PP.physicalHeight then
+            PP.physicalWidth, PP.physicalHeight = 1920, 1080
+        end
+        PP.perfect = 768 / PP.physicalHeight
+    end
+    PP.RefreshPhysical()
 
     -- mult = size of 1 physical pixel in the current UIParent scale.
     -- When UIParent scale == perfect, mult == 1 and every integer is
@@ -2010,8 +2023,7 @@ do
 
     --- Recalculate mult after a scale or resolution change.
     function PP.UpdateMult()
-        PP.physicalWidth, PP.physicalHeight = GetPhysicalScreenSize()
-        PP.perfect = 768 / PP.physicalHeight
+        PP.RefreshPhysical()
         local uiScale = EllesmereUIDB and EllesmereUIDB.ppUIScale or PP.PixelBestSize()
         PP.mult = PP.perfect / uiScale
     end
@@ -2712,8 +2724,7 @@ do
     scaleWatcher:SetScript("OnEvent", function(_, event)
         if event == "DISPLAY_SIZE_CHANGED" then
             -- Resolution changed -- recalculate perfect and re-apply scale
-            PP.physicalWidth, PP.physicalHeight = GetPhysicalScreenSize()
-            PP.perfect = 768 / PP.physicalHeight
+            PP.RefreshPhysical()
             -- Only auto-update if user explicitly opted into auto scale
             if EllesmereUIDB and EllesmereUIDB.ppUIScaleAuto == true then
                 PP.SetUIScale(PP.PixelBestSize())
@@ -3581,6 +3592,14 @@ function EllesmereUI.SetDarkModeAll(on, filter)
         end
     end
     EllesmereUI.RefreshDarkMode()
+    -- Dark Mode feeds the conditional-override "darkmode" condition. This is
+    -- deliberately here and NOT in RefreshDarkMode: SetDarkModeAll's only
+    -- callers are the two Fonts & Colors master checkboxes (a pure user
+    -- action, never a profile-apply boundary), while RefreshDarkMode is also
+    -- reached from the profile-apply pipeline, where an extra recheck could
+    -- interleave with the conditions establish choreography. No-op-cheap
+    -- when no darkmode group exists; self-defers in combat.
+    if EllesmereUI.Conditions_Recheck then EllesmereUI.Conditions_Recheck() end
 end
 
 -------------------------------------------------------------------------------
@@ -4761,11 +4780,18 @@ do
     -- wasSetFromAura/auraInstanceID/IsShown, count via
     -- auraDataCached.applications -- plain out of restricted combat, secret
     -- inside it (both observations from the CDM module's TBB stack reader,
-    -- ReadStackApplications). Same source Coolinator displays; here it
-    -- feeds two fail-open corrections the cast prediction can't make:
-    -- zero on a confirmed early drop (/cancelaura), and drift resync
-    -- whenever the count reads plain. CDM disabled or the buff untracked
-    -- -> no child is ever found and prediction behaves exactly as before.
+    -- ReadStackApplications). Here it feeds two fail-open corrections the
+    -- cast prediction can't make: zero on a confirmed early drop
+    -- (/cancelaura), and drift resync whenever the count reads plain. CDM
+    -- disabled or the buff untracked -> no child is ever found and
+    -- prediction behaves exactly as before.
+    --
+    -- Provenance: this sync came in through community PR #861 and was later
+    -- reviewed by curseforge in a full originality audit, prompted by an
+    -- earlier revision of the PR's comment naming a third-party addon. The
+    -- review confirmed the technique is original, expanding on the CDM module's
+    -- own ReadStackApplications (cited above) which reads Blizzard's widget data.
+
     local function CdmInfoMatches(info)
         if not info then return false end
         if info.spellID == SWEEP or info.overrideSpellID == SWEEP then return true end
@@ -10881,7 +10907,7 @@ end
 -------------------------------------------------------------------------------
 --  Slash commands
 -------------------------------------------------------------------------------
-EllesmereUI.VERSION = "8.5.7"
+EllesmereUI.VERSION = "8.5.8"
 
 -- Register this addon's version into a shared global table (taint-free at load time)
 if not _G._EUI_AddonVersions then _G._EUI_AddonVersions = {} end
