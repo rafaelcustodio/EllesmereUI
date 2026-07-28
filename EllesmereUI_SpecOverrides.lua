@@ -54,7 +54,12 @@ local EDIT_R, EDIT_G, EDIT_B = 1, 0.72, 0.2
 local GOLD_R, GOLD_G, GOLD_B = 199/255, 166/255, 90/255
 
 local PROFILES_MODULE = "_EUIProfiles"
-local LIST_PAGE = "Spec Overrides"
+-- The management tab under Profiles & Presets. Both override list pages live
+-- behind this ONE tab now (a segmented toggle at the top of the page picks
+-- which builder renders); the page builders themselves stayed separate, so
+-- every SelectPage target and "am I on the list page?" check just follows
+-- this constant.
+local LIST_PAGE = "Overrides"
 
 -- Modules excluded wholesale: CDM has its own native per-spec system; the
 -- rest are account/character-level UI (window skins, social, bags, chat,
@@ -64,6 +69,17 @@ local LIST_PAGE = "Spec Overrides"
 -- PruneOrphanEntries (strips persisted paths + drops emptied entries).
 local FOLDER_BLACKLIST = {
     EllesmereUIBlizzardSkin      = true,
+    -- The Skyriding HUD registers its own sub-DB (EllesmereUIDragonRidingDB)
+    -- from inside BlizzardSkin, so its registry folder dodges the
+    -- BlizzardSkin entry above. A width-match write to its width key was
+    -- auto-captured into a user's CDM Icon Scale override; the per-spec
+    -- apply then touched a folder with no REFRESH_FNS entry, and the
+    -- unmapped-folder fallback escalated EVERY such apply into a full
+    -- RefreshAllAddons -- spec-changed event traffic after combat became
+    -- minutes of continuous full-suite refresh (the 2026-07 post-combat
+    -- lag storm). Blacklisting blocks both future captures and the apply
+    -- of already-banked entries; a migration strips those from stores.
+    EllesmereUIDragonRiding      = true,
     EllesmereUIDamageMeters      = true,
     EllesmereUIMythicTimer       = true,
     EllesmereUIQuestTracker      = true,
@@ -100,6 +116,10 @@ local REFRESH_FNS = {
     EllesmereUIDamageMeters      = { "_EDM_Apply" },
     EllesmereUIDataBars          = { "_EDB_Apply" },
     EllesmereUIAuraBuffReminders = { "_EABR_RequestRefresh", "_EABR_ApplyUnlockPos" },
+    -- Folder is capture/apply-blacklisted (see FOLDER_BLACKLIST); this entry
+    -- is insurance so a key that slips through any future path can never hit
+    -- the unmapped-folder fallback and escalate into a full RefreshAllAddons.
+    EllesmereUIDragonRiding      = { "_EDR_Rebuild" },
 }
 
 -- Class glyph sprite (toolbar button) + modern class sprite (group icons)
@@ -3067,6 +3087,43 @@ function Cond.WriteValues(gid, forSession)
         end
     end
     return touched
+end
+
+--- Writes an entry's recorded DEFAULT values back to live. Called right
+--- BEFORE a conditional entry is removed: a conditional's values sit in the
+--- live profile for as long as its condition holds -- including while the
+--- options panel is open, because the Default Editing Mode swap covers the
+--- SPEC store only (see EnterDefaultView / WriteDefaultValues). Drop the
+--- entry without this and nothing can ever write the default back: the
+--- override's values silently become the profile's own settings. The spec
+--- delete flow needs no equivalent (with the panel open live already holds
+--- the shared defaults); its one path that CAN hit this -- the orphan drop
+--- in PruneOrphanEntries -- carries the same restore.
+--- Guards mirror Cond.WriteValues exactly, so this only ever writes keys the
+--- conditional overlay itself could have written: blacklisted paths and
+--- match-owned size keys are never applied from here, a SPEC-owned fkey
+--- belongs to the spec system (spec wins at runtime -- live is its value,
+--- not ours), an unloaded module cannot be written, and a NIL_SENT marker on
+--- a defaults-backed key is harvest residue, not a real removal.
+--- touched: folder-set accumulator; the caller refreshes once.
+function Cond.RestoreEntryDefaults(entry, touched)
+    local def = entry.values and entry.values.default
+    if not def then return end
+    for fkey, dv in pairs(def) do
+        if not BlacklistedFKey(fkey) and not MatchOwnedFKey(fkey)
+           and not EntryOwning(fkey) and FKeyLoaded(fkey) then
+            local v = (dv == NIL_SENT) and nil or dv
+            local nilPoison = (v == nil) and HasRegisteredDefault(fkey)
+            local cur = ReadLive(fkey)
+            if not nilPoison and type(v) ~= "table" and type(cur) ~= "table"
+               and cur ~= v then
+                if WriteLive(fkey, v) then
+                    local folder = SplitFKey(fkey)
+                    if folder then touched[folder] = true end
+                end
+            end
+        end
+    end
 end
 
 --- Garbage-collects conditional fkeys no group map holds a value for (the
@@ -6055,9 +6112,22 @@ RefreshCardsPopup = function()
                         end
                         local st = Cond.GetStore()
                         if st then
+                            -- Put each entry's recorded default back on the
+                            -- live profile BEFORE dropping it. While this
+                            -- conditional is applied its values ARE the live
+                            -- values (the Default view swap covers the spec
+                            -- store only), and a removed entry has no writer
+                            -- left -- the override's values would silently
+                            -- become the profile's settings. Value-equal
+                            -- no-op when the group was not applied.
+                            local touched = {}
                             for i = #st, 1, -1 do
-                                if st[i].group == g.id then table.remove(st, i) end
+                                if st[i].group == g.id then
+                                    Cond.RestoreEntryDefaults(st[i], touched)
+                                    table.remove(st, i)
+                                end
                             end
+                            if next(touched) then RunRefreshers(touched) end
                         end
                         Cond.RebuildIndex()
                         if EllesmereUI.Conditions_RemoveUnlockLayout then
@@ -6074,10 +6144,15 @@ RefreshCardsPopup = function()
                         if EllesmereUI.Conditions_Recheck then EllesmereUI.Conditions_Recheck() end
                         RequestGoldWalk()
                         RefreshCardsPopup()
-                        local ap = EllesmereUI.GetActivePage and EllesmereUI:GetActivePage()
-                        if ap == LIST_PAGE or ap == "Conditional Overrides" then
-                            EllesmereUI:RefreshPage(true)
-                        end
+                        -- FORCED rebuild, on EVERY page -- not just the two
+                        -- management tabs. Deleting an APPLIED conditional
+                        -- changes live values (the default restore above,
+                        -- plus the transition's own writes for surviving
+                        -- entries), so open widgets are showing the deleted
+                        -- override's values until they re-read. Forced
+                        -- because restored values can change page STRUCTURE
+                        -- too, exactly like the session exits.
+                        if EllesmereUI.RefreshPage then EllesmereUI:RefreshPage(true) end
                     end,
                 })
             end,
@@ -6357,7 +6432,7 @@ function Cond.ShowNameIconPopup(conds, keyStr, existing)
             if newGroup then Cond.EnterEdit(newGroup) end
             Cond.UpdateButton()
             Cond.RefreshCards()
-            if EllesmereUI.GetActivePage and EllesmereUI:GetActivePage() == "Conditional Overrides" then
+            if EllesmereUI.GetActivePage and EllesmereUI:GetActivePage() == LIST_PAGE then
                 EllesmereUI:RefreshPage(true)
             end
         end)

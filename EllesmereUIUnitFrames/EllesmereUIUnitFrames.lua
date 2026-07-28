@@ -1120,6 +1120,14 @@ local defaults = {
             simpleBuffSpacing = 1,
             simpleDebuffSpacing = 1,
             textSize = 12,
+            extraTextContent = "none",
+            extraTextSize = 12,
+            extraTextClassColor = false,
+            extraTextColorR = 1, extraTextColorG = 1, extraTextColorB = 1,
+            extraTextX = 0, extraTextY = 0,
+            extraTextAlign = "left",
+            extraTextShortNameLength = 0,
+            extraTextShortNameEllipsis = true,
             leftTextContent = "name",
             leftTextClassColor = false,
             leftTextColorR = 1, leftTextColorG = 1, leftTextColorB = 1,
@@ -4439,14 +4447,13 @@ function ns.UpdatePowerBorder(power, settings)
     EllesmereUI.ApplyBorderStyle(border, size, c.r, c.g, c.b, alpha, style,
         settings.powerBorderOffsetX, settings.powerBorderOffsetY,
         settings.powerBorderShiftX, settings.powerBorderShiftY, "unitframes", size)
-    if isAttached then
-        local edges = PP.GetBorders(border)
-        if edges then
-            if edges._left then edges._left:SetAlpha(0) end
-            if edges._right then edges._right:SetAlpha(0) end
-            if edges._top then edges._top:SetAlpha(pos == "below" and alpha or 0) end
-            if edges._bottom then edges._bottom:SetAlpha(pos == "above" and alpha or 0) end
-        end
+    local edges = PP.GetBorders(border)
+    if edges then
+        edges._hideLeft = isAttached or nil
+        edges._hideRight = isAttached or nil
+        edges._hideTop = (isAttached and pos == "above") or nil
+        edges._hideBottom = (isAttached and pos == "below") or nil
+        PP.SetBorderSize(border, size)
     end
     local borderLevel = settings.powerBorderBehind
         and math.max(0, power:GetFrameLevel() - 1) or (power:GetFrameLevel() + 5)
@@ -6274,6 +6281,12 @@ function ns.ApplyEUIAuraFilter(element, base, settings)
     if not f then f = {}; element._euiAuraFlags = f end
     f.player, f.raid, f.cc, f.bigDef, f.extDef = ns.ResolveAuraFlags(base, settings)
     f.showLust = (base == "HARMFUL") and settings.showLustDebuff
+    -- Show Tooltip For -> Buffs & Debuffs (per-unit, default on). Element-level
+    -- flag: the element re-applies EnableMouse from it on EVERY button update,
+    -- so it is the only mouse knob that sticks -- per-button calls get
+    -- overwritten by the element's own update pass. Centralized here because
+    -- every element runs through this at creation and on each reload restyle.
+    element.disableMouse = (settings.showAuraTooltips == false) or nil
 end
 
 local function CreateTargetAuras(frame, unit)
@@ -7939,6 +7952,7 @@ local function StyleBossFrame(frame, unit)
     local leftContent = settings.leftTextContent or "name"
     local rightContent = settings.rightTextContent or "perhp"
     local centerContent = settings.centerTextContent or "none"
+    local extraContent = settings.extraTextContent or "none"
 
     local leftText = textOverlay:CreateFontString(nil, "OVERLAY")
     SetFSFont(leftText, settings.leftTextSize or settings.textSize or 12)
@@ -7957,6 +7971,15 @@ local function StyleBossFrame(frame, unit)
     centerText:SetWordWrap(false)
     centerText:SetTextColor(1, 1, 1)
     frame.CenterText = centerText
+
+    -- Extra Text: a 4th text zone, identical to the others (same tags + absorb
+    -- gate); it only anchors per extraTextAlign and is capped at 95% of the bar
+    -- width (ellipsis truncation). Mirrors the Main Frames implementation.
+    local extraText = textOverlay:CreateFontString(nil, "OVERLAY")
+    SetFSFont(extraText, settings.extraTextSize or settings.textSize or 12)
+    extraText:SetWordWrap(false)
+    extraText:SetTextColor(1, 1, 1)
+    frame.ExtraText = extraText
 
     frame.NameText = leftText
     frame.HealthValue = rightText
@@ -8019,22 +8042,29 @@ local function StyleBossFrame(frame, unit)
         end
     end
 
-    local function ApplyTextTags(lc, rc, cc)
+    local function ApplyTextTags(lc, rc, cc, ec)
+        -- Callers that predate the Extra Text zone pass 3 args; fall back to
+        -- the stored content so those sites keep working (same as Main Frames).
+        ec = ec or (settings.extraTextContent or "none")
         local ltag = ContentToTag(lc, "leftText", settings)
         local rtag = ContentToTag(rc, "rightText", settings)
         local ctag = ContentToTag(cc, "centerText", settings)
+        local etag = ContentToTag(ec, "extraText", settings)
         if leftText._curTag then frame:Untag(leftText); leftText._curTag = nil end
         if rightText._curTag then frame:Untag(rightText); rightText._curTag = nil end
         if centerText._curTag then frame:Untag(centerText); centerText._curTag = nil end
+        if extraText._curTag then frame:Untag(extraText); extraText._curTag = nil end
         if ltag then frame:Tag(leftText, ltag); leftText._curTag = ltag end
         if rtag then frame:Tag(rightText, rtag); rightText._curTag = rtag end
         if ctag then frame:Tag(centerText, ctag); centerText._curTag = ctag end
+        if etag then frame:Tag(extraText, etag); extraText._curTag = etag end
         ApplyAbsorbGate("left", leftText, lc)
         ApplyAbsorbGate("right", rightText, rc)
         ApplyAbsorbGate("center", centerText, cc)
+        ApplyAbsorbGate("extra", extraText, ec)
         if frame.UpdateTags then frame:UpdateTags() end
     end
-    ApplyTextTags(leftContent, rightContent, centerContent)
+    ApplyTextTags(leftContent, rightContent, centerContent, extraContent)
     frame._applyTextTags = ApplyTextTags
 
     local function ApplyTextPositions(s)
@@ -8051,6 +8081,30 @@ local function StyleBossFrame(frame, unit)
         local cxo = s.centerTextX or 0
         local cyo = s.centerTextY or 0
         local barW = s.frameWidth or 100
+        -- Extra Text: anchored per extraTextAlign (left/right/center). Truncated
+        -- with an ellipsis when the text would exceed 95% of the health bar width
+        -- (SetWordWrap(false) + the capped width below), matching Main Frames.
+        local ec = s.extraTextContent or "none"
+        SetFSFont(extraText, s.extraTextSize or s.textSize or 12)
+        extraText:ClearAllPoints()
+        if ec ~= "none" then
+            local exo = s.extraTextX or 0
+            local eyo = s.extraTextY or 0
+            local ealign = s.extraTextAlign or "left"
+            if ealign == "right" then
+                extraText:SetJustifyH("RIGHT")
+                PP.Point(extraText, "RIGHT", textOverlay, "RIGHT", -5 + exo, eyo)
+            elseif ealign == "center" then
+                extraText:SetJustifyH("CENTER")
+                PP.Point(extraText, "CENTER", textOverlay, "CENTER", exo, eyo)
+            else
+                extraText:SetJustifyH("LEFT")
+                PP.Point(extraText, "LEFT", textOverlay, "LEFT", 5 + exo, eyo)
+            end
+            PP.Width(extraText, barW * 0.95)
+            extraText:Show()
+            ApplyClassColor(extraText, unit, s.extraTextClassColor, s.extraTextColorR, s.extraTextColorG, s.extraTextColorB)
+        else extraText:Hide() end
         -- Each text position renders independently; Center no longer hides Left/Right.
         SetFSFont(centerText, csz)
         centerText:ClearAllPoints()
@@ -8278,7 +8332,43 @@ SpecHasClassPower = function()
     return specID and entry[specID] ~= nil
 end
 
+-- Fixed child-born shells for the class-power event driver and the
+-- class-power castbar watcher. The class-power bar is destroyed and
+-- rebuilt on spec switches through the profile system, whose dispatch
+-- runs under the PARENT addon's execution context -- and the engine
+-- bills a handler's entire call tree to the addon whose context created
+-- the frame, so drivers recreated there would bill the parent's CPU row
+-- for their polling. Creating them ONCE here (child main chunk) and
+-- reconfiguring per build keeps every rebuild attribution-safe.
+ns._cpDriver = CreateFrame("Frame")
+ns._cpDriver:Hide()
+ns._cpCastWatcher = CreateFrame("Frame")
+ns._cpCastWatcher:Hide()
+
+-- 10 Hz anim tickers for the two class-power polls. A per-frame OnUpdate
+-- that early-outs to a 0.1s cadence still pays a full Lua entry every
+-- render frame (pure dispatch tax at high fps); a looping Animation fires
+-- the body at the real cadence and the C engine sleeps between fires.
+-- Created HERE (child main chunk) because the AnimationGroup is the
+-- engine's entry object and bills its creation context. Bodies read a
+-- swappable ns function so per-build closures stay per-build; a ticker
+-- runs only between Start()/Stop() and pauses while its host is hidden.
+ns._cpDriverTick = EllesmereUI.Tick.NewAnimTicker(ns._cpDriver, function()
+    local fn = ns._cpTickFn
+    if fn then fn() end
+    return true
+end, 0.1)
+ns._cpWatchTick = EllesmereUI.Tick.NewAnimTicker(ns._cpCastWatcher, function()
+    local fn = ns._cpWatchFn
+    if fn then fn() end
+    return true
+end, 0.1)
+
 local function DestroyCustomClassPower()
+    ns._cpTickFn = nil
+    ns._cpDriverTick.Stop()
+    ns._cpWatchFn = nil
+    ns._cpWatchTick.Stop()
     if frames._customClassPower then
         frames._customClassPower:Hide()
         -- Unregister events on all children to prevent leaks
@@ -8642,8 +8732,16 @@ local function CreateCustomClassPower(playerFrame, style)
         end
     end
 
-    -- Event driver
-    local eventFrame = CreateFrame("Frame", nil, container)
+    -- Event driver: the shared child-born shell (see ns._cpDriver above),
+    -- fully reset here because the previous spec's build may have left
+    -- registrations or an OnUpdate poll on it.
+    local eventFrame = ns._cpDriver
+    eventFrame:UnregisterAllEvents()
+    eventFrame:SetScript("OnEvent", nil)
+    ns._cpTickFn = nil
+    ns._cpDriverTick.Stop()
+    eventFrame:SetParent(container)
+    eventFrame:Show()
     if isCustom then
         -- Per-resource event registration: only register what each resource
         -- actually needs to avoid unnecessary event traffic.
@@ -8657,13 +8755,11 @@ local function CreateCustomClassPower(playerFrame, style)
                                or powerType == "SWEEPING_STRIKES")
 
         if needsOnUpdate then
-            local elapsed = 0
-            eventFrame:SetScript("OnUpdate", function(_, dt)
-                elapsed = elapsed + dt
-                if elapsed < 0.1 then return end
-                elapsed = 0
-                UpdatePips()
-            end)
+            -- 10 Hz poll on the shared anim ticker (see ns._cpDriverTick):
+            -- same cadence as the old OnUpdate accumulator without the
+            -- per-render-frame entry tax.
+            ns._cpTickFn = UpdatePips
+            ns._cpDriverTick.Start()
         end
 
         eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -9323,9 +9419,7 @@ local function ReloadFrames()
                     if frame.Castbar then
                         local castbarBg = frame.Castbar:GetParent()
                         if settings.showPlayerCastbar then
-                            if not frame:IsElementEnabled("Castbar") then
-                                frame:EnableElement("Castbar")
-                            end
+                            ns.SetCastbarElement(frame, true)
                             if castbarBg then
                                 local cbW = db.profile.player.playerCastbarWidth or 181
                                 local cbH = db.profile.player.playerCastbarHeight or 14
@@ -9406,9 +9500,7 @@ local function ReloadFrames()
                                 end
                             end
                         else
-                            if frame:IsElementEnabled("Castbar") then
-                                frame:DisableElement("Castbar")
-                            end
+                            ns.SetCastbarElement(frame, false)
                             frame.Castbar:Hide()
                             if castbarBg then castbarBg:Hide() end
                         end
@@ -9481,7 +9573,7 @@ local function ReloadFrames()
                             end
                             -- Only reanchor + ForceUpdate when layout actually changed
                             local buffFilter = ns.ComposeAuraFilter("HELPFUL", settings)
-                            local buffKey = string.format("%s%s%d%d%d%s%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, buffCbOff, settings.buffGrowth or "auto", settings.maxBuffs or 4, settings.buffSize or 22, settings.buffOffsetX or 0, settings.buffOffsetY or 0) .. "p" .. (settings.buffMaxPerRow or 0) .. "spx" .. (settings.buffSpacingX or 1) .. "spy" .. (settings.buffSpacingY or 1) .. buffFilter
+                            local buffKey = string.format("%s%s%d%d%d%s%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, buffCbOff, settings.buffGrowth or "auto", settings.maxBuffs or 4, settings.buffSize or 22, settings.buffOffsetX or 0, settings.buffOffsetY or 0) .. "p" .. (settings.buffMaxPerRow or 0) .. "spx" .. (settings.buffSpacingX or 1) .. "spy" .. (settings.buffSpacingY or 1) .. buffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                             if frame.Buffs._lastBuffKey ~= buffKey then
                                 frame.Buffs._lastBuffKey = buffKey
                                 ns.ApplyEUIAuraFilter(frame.Buffs, "HELPFUL", settings)
@@ -9530,7 +9622,7 @@ local function ReloadFrames()
                                 debuffCbOff = -cbH
                             end
                             local debuffFilter = ns.ComposeAuraFilter("HARMFUL", settings) .. (settings.showLustDebuff and "|LUST" or "")
-                            local debuffKey = string.format("%s%s%d%d%d%s%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, debuffCbOff, settings.debuffGrowth or "auto", settings.maxDebuffs or 10, settings.debuffSize or 22, settings.debuffOffsetX or 0, settings.debuffOffsetY or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "spx" .. (settings.debuffSpacingX or 1) .. "spy" .. (settings.debuffSpacingY or 1) .. debuffFilter
+                            local debuffKey = string.format("%s%s%d%d%d%s%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, debuffCbOff, settings.debuffGrowth or "auto", settings.maxDebuffs or 10, settings.debuffSize or 22, settings.debuffOffsetX or 0, settings.debuffOffsetY or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "spx" .. (settings.debuffSpacingX or 1) .. "spy" .. (settings.debuffSpacingY or 1) .. debuffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                             if frame.Debuffs._lastDebuffKey ~= debuffKey then
                                 frame.Debuffs._lastDebuffKey = debuffKey
                                 ns.ApplyEUIAuraFilter(frame.Debuffs, "HARMFUL", settings)
@@ -9906,7 +9998,7 @@ local function ReloadFrames()
                                 end
                             end
                             local buffFilter = ns.ComposeAuraFilter("HELPFUL", settings)
-                            local buffKey = string.format("%s%s%d%d%s%d%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, settings.buffGrowth or "auto", settings.maxBuffs or 20, liveCbOff, settings.buffSize or 22, settings.buffOffsetX or 0, settings.buffOffsetY or 0) .. "p" .. (settings.buffMaxPerRow or 0) .. "spx" .. (settings.buffSpacingX or 1) .. "spy" .. (settings.buffSpacingY or 1) .. buffFilter
+                            local buffKey = string.format("%s%s%d%d%s%d%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, settings.buffGrowth or "auto", settings.maxBuffs or 20, liveCbOff, settings.buffSize or 22, settings.buffOffsetX or 0, settings.buffOffsetY or 0) .. "p" .. (settings.buffMaxPerRow or 0) .. "spx" .. (settings.buffSpacingX or 1) .. "spy" .. (settings.buffSpacingY or 1) .. buffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                             if frame.Buffs._lastBuffKey ~= buffKey then
                                 frame.Buffs._lastBuffKey = buffKey
                                 ns.ApplyEUIAuraFilter(frame.Buffs, "HELPFUL", settings)
@@ -9957,7 +10049,7 @@ local function ReloadFrames()
                                 end
                             end
                             local debuffFilter = ns.ComposeAuraFilter("HARMFUL", settings) .. (settings.showLustDebuff and "|LUST" or "")
-                            local debuffKey = string.format("%s%s%d%d%s%d%d%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, settings.debuffGrowth or "auto", settings.maxDebuffs or 20, liveDbCbOff, settings.debuffSize or 22, settings.debuffOffsetX or 0, settings.debuffOffsetY or 0, settings.onlyPlayerDebuffs and 1 or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "spx" .. (settings.debuffSpacingX or 1) .. "spy" .. (settings.debuffSpacingY or 1) .. debuffFilter
+                            local debuffKey = string.format("%s%s%d%d%s%d%d%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, settings.debuffGrowth or "auto", settings.maxDebuffs or 20, liveDbCbOff, settings.debuffSize or 22, settings.debuffOffsetX or 0, settings.debuffOffsetY or 0, settings.onlyPlayerDebuffs and 1 or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "spx" .. (settings.debuffSpacingX or 1) .. "spy" .. (settings.debuffSpacingY or 1) .. debuffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                             if frame.Debuffs._lastDebuffKey ~= debuffKey then
                                 frame.Debuffs._lastDebuffKey = debuffKey
                                 ns.ApplyEUIAuraFilter(frame.Debuffs, "HARMFUL", settings)
@@ -10279,7 +10371,7 @@ local function ReloadFrames()
                             end
                         end
                         local debuffFilter = ns.ComposeAuraFilter("HARMFUL", settings) .. (settings.showLustDebuff and "|LUST" or "")
-                        local debuffKey = string.format("%s%s%d%d%s%d%d%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, settings.debuffGrowth or "auto", settings.maxDebuffs or 10, focusDbCbOff, settings.debuffSize or 22, settings.debuffOffsetX or 0, settings.debuffOffsetY or 0, settings.onlyPlayerDebuffs and 1 or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "spx" .. (settings.debuffSpacingX or 1) .. "spy" .. (settings.debuffSpacingY or 1) .. debuffFilter
+                        local debuffKey = string.format("%s%s%d%d%s%d%d%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, settings.debuffGrowth or "auto", settings.maxDebuffs or 10, focusDbCbOff, settings.debuffSize or 22, settings.debuffOffsetX or 0, settings.debuffOffsetY or 0, settings.onlyPlayerDebuffs and 1 or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "spx" .. (settings.debuffSpacingX or 1) .. "spy" .. (settings.debuffSpacingY or 1) .. debuffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                         if frame.Debuffs._lastDebuffKey ~= debuffKey then
                             frame.Debuffs._lastDebuffKey = debuffKey
                             ns.ApplyEUIAuraFilter(frame.Debuffs, "HARMFUL", settings)
@@ -10322,7 +10414,7 @@ local function ReloadFrames()
                             end
                         end
                         local buffFilter = ns.ComposeAuraFilter("HELPFUL", settings)
-                        local buffKey = string.format("%s%s%d%d%s%d%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, settings.buffGrowth or "auto", settings.maxBuffs or 4, focusBfCbOff, settings.buffSize or 22, settings.buffOffsetX or 0, settings.buffOffsetY or 0) .. "p" .. (settings.buffMaxPerRow or 0) .. "spx" .. (settings.buffSpacingX or 1) .. "spy" .. (settings.buffSpacingY or 1) .. buffFilter
+                        local buffKey = string.format("%s%s%d%d%s%d%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, settings.buffGrowth or "auto", settings.maxBuffs or 4, focusBfCbOff, settings.buffSize or 22, settings.buffOffsetX or 0, settings.buffOffsetY or 0) .. "p" .. (settings.buffMaxPerRow or 0) .. "spx" .. (settings.buffSpacingX or 1) .. "spy" .. (settings.buffSpacingY or 1) .. buffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                         if frame.Buffs._lastBuffKey ~= buffKey then
                             frame.Buffs._lastBuffKey = buffKey
                             ns.ApplyEUIAuraFilter(frame.Buffs, "HELPFUL", settings)
@@ -10661,7 +10753,7 @@ local function ReloadFrames()
                         -- Physical-pixel icon spacing (folded into the key so a
                         -- spacing change re-anchors the stack on the next refresh).
                         local debuffSpacingVal = ns.GetBossDebuffSpacing(settings, simpleOn)
-                        local debuffKey = string.format("%s%s%d%d%s%d%d%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, effGrowth, settings.maxDebuffs or 10, liveDbCbOff, effectiveDebuffSize, dbOffX, dbOffY, settings.onlyPlayerDebuffs and 1 or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "sp" .. debuffSpacingVal .. debuffFilter
+                        local debuffKey = string.format("%s%s%d%d%s%d%d%d%d%d%d", dia or "", dfp or "", dox or 0, doy or 0, effGrowth, settings.maxDebuffs or 10, liveDbCbOff, effectiveDebuffSize, dbOffX, dbOffY, settings.onlyPlayerDebuffs and 1 or 0) .. "p" .. (settings.debuffMaxPerRow or 0) .. "sp" .. debuffSpacingVal .. debuffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                         if frame.Debuffs._lastDebuffKey ~= debuffKey then
                             frame.Debuffs._lastDebuffKey = debuffKey
                             ns.ApplyEUIAuraFilter(frame.Debuffs, "HARMFUL", settings)
@@ -10753,10 +10845,12 @@ local function ReloadFrames()
                         -- Physical-pixel icon spacing (folded into the key so a
                         -- spacing change re-anchors the column on the next refresh).
                         local buffSpacingVal = ns.GetBossBuffSpacing(settings, simpleBuffOn)
-                        local buffKey = string.format("%s%s%d%d%s%d%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, bGrowthEff, settings.maxBuffs or 4, bossBfCbOff, effectiveBuffSize, bfOffX, bfOffY) .. "p" .. (settings.buffMaxPerRow or 0) .. "sp" .. buffSpacingVal .. buffFilter
+                        local buffKey = string.format("%s%s%d%d%s%d%d%d%d%d", bia or "", bfp or "", box or 0, boy or 0, bGrowthEff, settings.maxBuffs or 4, bossBfCbOff, effectiveBuffSize, bfOffX, bfOffY) .. "p" .. (settings.buffMaxPerRow or 0) .. "sp" .. buffSpacingVal .. buffFilter .. (settings.showAuraTooltips == false and "ttOff" or "")
                         if frame.Buffs._lastBuffKey ~= buffKey then
                             frame.Buffs._lastBuffKey = buffKey
-                            ns.ApplyEUIAuraFilter(frame.Buffs, "HELPFUL", {})  -- boss buffs: no filtering
+                            -- Boss buffs: no filtering (empty flag set), but the
+                            -- aura-tooltip toggle still travels.
+                            ns.ApplyEUIAuraFilter(frame.Buffs, "HELPFUL", { showAuraTooltips = settings.showAuraTooltips })
                             frame.Buffs.size = effectiveBuffSize
                             frame.Buffs.spacing = PP.FromPixels(buffSpacingVal)
                             frame.Buffs:ClearAllPoints()
@@ -11072,6 +11166,23 @@ local function ReloadFrames()
     end
 end
 
+-- Toggle a frame's oUF Castbar element without rewriting Blizzard's cast bar
+-- event registration. oUF silences PlayerCastingBarFrame/PetCastingBarFrame
+-- when the element enables on the player frame and re-arms them when it
+-- disables; the shared helpers keep whatever a standalone cast bar addon set.
+-- On ns (not a new file-scope local) to respect the Lua 200-locals cap.
+function ns.SetCastbarElement(frame, enable)
+    if not frame or not frame.Castbar then return end
+    if (frame:IsElementEnabled("Castbar") and true or false) == (enable and true or false) then return end
+    EllesmereUI.CaptureBlizzCastBarEvents()
+    if enable then
+        frame:EnableElement("Castbar")
+    else
+        frame:DisableElement("Castbar")
+    end
+    EllesmereUI.RestoreBlizzCastBarEvents()
+end
+
 -- Manage Blizzard's player cast bar ownership based on whether UnitFrames is
 -- rendering its own player cast bar. oUF already handles the event plumbing
 -- for its own castbar element; this helper only coordinates suppression with
@@ -11265,9 +11376,20 @@ function InitializeFrames()
     -- it, so oUF never disables it); "hidden" removes Blizzard's frame too.
     oUF:SetActiveStyle("EllesmerePlayer")
     if playerFrameSource == "eui" then
+        -- Spawning enables the Castbar element, which silences Blizzard's
+        -- player/pet cast bars. Keep whatever a standalone cast bar addon set.
+        EllesmereUI.CaptureBlizzCastBarEvents()
         frames.player = oUF:Spawn("player", "EllesmereUIUnitFrames_Player")
+        EllesmereUI.RestoreBlizzCastBarEvents()
     elseif playerFrameSource == "hidden" then
+        -- Wrapped for the same reason as the spawn above: DisableBlizzard
+        -- unregisters PlayerFrame's cast bar child, and an unregister seen
+        -- outside a capture window is read as a third-party addon claiming the
+        -- frame -- EUI would mark its own silence as somebody else's and never
+        -- hand the bar back.
+        EllesmereUI.CaptureBlizzCastBarEvents()
         oUF:DisableBlizzard("player")
+        EllesmereUI.RestoreBlizzCastBarEvents()
     end
 
     -- Visibility wrapper for the player frame only. Parent the player frame
@@ -11464,7 +11586,8 @@ function InitializeFrames()
 
         -- Stop castbar watcher by default; only re-enabled in the "bottom" branch
         if bar._castbarWatcher then
-            bar._castbarWatcher:SetScript("OnUpdate", nil)
+            ns._cpWatchFn = nil
+            ns._cpWatchTick.Stop()
             bar._castbarWatcher:Hide()
         end
 
@@ -11571,14 +11694,16 @@ function InitializeFrames()
             -- Only run the castbar watcher if the player castbar is enabled
             if db.profile.player.showPlayerCastbar then
                 if not bar._castbarWatcher then
-                    bar._castbarWatcher = CreateFrame("Frame", nil, bar)
+                    -- Shared child-born shell (see ns._cpCastWatcher): a
+                    -- frame created here would be born in whatever context
+                    -- triggered this rebuild and could bill the parent for
+                    -- the 10 Hz poll below.
+                    bar._castbarWatcher = ns._cpCastWatcher
+                    bar._castbarWatcher:SetParent(bar)
                 end
-                local cbElapsed = 0
                 local playerFrame = frames.player
-                bar._castbarWatcher:SetScript("OnUpdate", function(_, dt)
-                    cbElapsed = cbElapsed + dt
-                    if cbElapsed < 0.1 then return end
-                    cbElapsed = 0
+                -- 10 Hz body on the shared anim ticker (see ns._cpWatchTick).
+                ns._cpWatchFn = function()
                     local cb = playerFrame and playerFrame.Castbar
                     local castbarBg = cb and cb:GetParent()
                     local nowVis = castbarBg and castbarBg:IsShown() and db.profile.player.showPlayerCastbar
@@ -11586,8 +11711,9 @@ function InitializeFrames()
                         bar._lastCastVis = nowVis
                         AnchorBottom()
                     end
-                end)
+                end
                 bar._castbarWatcher:Show()
+                ns._cpWatchTick.Start()
             end
             ResizeFrameForClassPower(0)
         end
@@ -12299,9 +12425,7 @@ function InitializeFrames()
     -- Player castbar: disable oUF element if not wanted (always created now)
     if frames.player and frames.player.Castbar then
         if not db.profile.player.showPlayerCastbar then
-            if frames.player:IsElementEnabled("Castbar") then
-                frames.player:DisableElement("Castbar")
-            end
+            ns.SetCastbarElement(frames.player, false)
             frames.player.Castbar:Hide()
             local castbarBg = frames.player.Castbar:GetParent()
             if castbarBg then castbarBg:Hide() end
@@ -12540,13 +12664,9 @@ function InitializeFrames()
                                     wantsCastbar = s.showCastbar ~= false
                                 end
                                 if wantsCastbar then
-                                    if not frame:IsElementEnabled("Castbar") then
-                                        frame:EnableElement("Castbar")
-                                    end
+                                    ns.SetCastbarElement(frame, true)
                                 else
-                                    if frame:IsElementEnabled("Castbar") then
-                                        frame:DisableElement("Castbar")
-                                    end
+                                    ns.SetCastbarElement(frame, false)
                                     frame.Castbar:Hide()
                                     local castbarBg = frame.Castbar:GetParent()
                                     if castbarBg then castbarBg:Hide() end
@@ -12559,11 +12679,12 @@ function InitializeFrames()
                         if frame:IsShown() then
                             -- Disable oUF elements before hiding to prevent a
                             -- single-frame flash when the unit attribute is cleared
-                            for _, elem in ipairs({"Health", "Power", "Portrait", "Castbar", "Buffs", "Debuffs", "HealthPrediction"}) do
+                            for _, elem in ipairs({"Health", "Power", "Portrait", "Buffs", "Debuffs", "HealthPrediction"}) do
                                 if frame[elem] and frame:IsElementEnabled(elem) then
                                     frame:DisableElement(elem)
                                 end
                             end
+                            ns.SetCastbarElement(frame, false)
                             frame:Hide()
                             frame:SetAttribute("unit", nil)
                         end
@@ -14154,12 +14275,32 @@ function EllesmereUF:OnInitialize()
     -- Blizzard options panel is registered centrally in EllesmereUI.lua
 end
 
-function EllesmereUF:OnEnable()
+-- Enable-body router. OnEnable runs under the parent addon's lifecycle
+-- dispatch, and the engine bills a script handler's whole call tree to
+-- the addon whose execution context created the frame the engine entered
+-- through -- so every frame born inside the build (oUF buttons, event
+-- drivers, castbar watchers) would bill the PARENT's CPU row forever.
+-- Routing the body through this file-scope frame's PLAYER_LOGIN handler
+-- runs the build in this child's context instead. Ordering is safe: the
+-- parent's lifecycle frame registered PLAYER_LOGIN first (parent loads
+-- before children), so OnEnable has always set the pending flag by the
+-- time this frame's handler fires -- within the SAME event dispatch, and
+-- therefore still inside the combat-reload pre-lockdown window.
+local function EnableBody()
     InitializeFrames()
     -- Register with unlock mode synchronously: on a combat reload this runs
     -- inside the pre-lockdown window, so the login position pass can resolve
     -- and place anchored unit frames before SetPoint gets blocked.
     RegisterUFUnlockElements()
+    -- The parent's synchronous PLAYER_LOGIN position pass (EUI_UnlockMode)
+    -- fires BEFORE this router drains, so unit frame elements were not yet
+    -- registered when it ran. Re-fire it now -- still inside the same
+    -- PLAYER_LOGIN dispatch, so anchored unit frames are placed within the
+    -- combat-reload pre-lockdown window exactly as before. The pass is
+    -- re-entrant by design (CDM and the PEW fallback both re-fire it).
+    if EllesmereUI and EllesmereUI._applySavedPositions then
+        EllesmereUI._applySavedPositions()
+    end
     C_Timer.After(0, SetupOptionsPanel)
     C_Timer.After(0, function()
         if EllesmereUI and EllesmereUI.ApplyColorsToOUF then
@@ -14177,8 +14318,35 @@ function EllesmereUF:OnEnable()
             ns.PlayerPA_Apply()
         end
     end)
+end
 
-    -- Incompatible addon detection is handled globally by EllesmereUI
+do
+    local loginFired = false
+    local router = CreateFrame("Frame")
+    router:RegisterEvent("PLAYER_LOGIN")
+    -- Backstop only: PLAYER_LOGIN always fires for a startup-loaded addon,
+    -- but if it were ever missed the next world entry drains the flag.
+    router:RegisterEvent("PLAYER_ENTERING_WORLD")
+    router:SetScript("OnEvent", function(self)
+        self:UnregisterEvent("PLAYER_LOGIN")
+        self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+        loginFired = true
+        if ns._eufEnablePending then
+            ns._eufEnablePending = nil
+            EnableBody()
+        end
+    end)
+
+    function EllesmereUF:OnEnable()
+        if loginFired then
+            -- Runtime re-enable long after login: run directly (rare; any
+            -- parent-context billing lasts only until the next reload).
+            EnableBody()
+        else
+            ns._eufEnablePending = true
+        end
+        -- Incompatible addon detection is handled globally by EllesmereUI
+    end
 end
 
 -------------------------------------------------------------------------------
