@@ -68,7 +68,7 @@ local function ShowTransformsPopup()
         dimTex:SetColorTexture(0, 0, 0, 0.25)
 
         local popup = CreateFrame("Frame", nil, dimmer)
-        popup:SetScale(ppScale)
+        popup:SetScale(EllesmereUI.PopupBump(1))
         popup:SetFrameStrata("FULLSCREEN_DIALOG")
         popup:SetFrameLevel(dimmer:GetFrameLevel() + 10)
         popup:SetSize(POPUP_W, POPUP_H)
@@ -2290,7 +2290,7 @@ initFrame:SetScript("OnEvent", function(self)
                   end
               end },
             { type="toggle", text="Auto Open Containers",
-              tooltip="Automatically opens bags, boxes and parcels in your inventory when they are added to your bags.",
+              tooltip="Automatically opens bags, boxes and parcels in your inventory when they are added to your bags.\n\nContainers received from the mailbox are held until you close the mailbox, so opening them cannot collide with mail still delivering items.",
               getValue=function()
                   if not EllesmereUIDB then return false end
                   return EllesmereUIDB.autoOpenContainers == true

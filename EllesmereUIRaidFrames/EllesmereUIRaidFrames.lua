@@ -500,6 +500,10 @@ local defaults = {
         customBgColor    = { r = 17/255, g = 17/255, b = 17/255 },
         bgClassColored   = false,
         bgDarkness       = 50,
+        -- Fill axis. Off = the classic left-to-right bar; on = the bar fills
+        -- bottom-to-top instead. Party frames can hold their own value (the
+        -- key is in the healthBar party-override section).
+        healthVerticalFill = false,
 
         -- Power bar (on when any powerShowFor* role is true)
         showPowerBar     = true,
@@ -1241,6 +1245,45 @@ ns.healthBarTextures     = healthBarTextures
 ns.healthBarTextureNames = healthBarTextureNames
 ns.healthBarTextureOrder = healthBarTextureOrder
 
+-- Vertical health fill. SetOrientation drives the bar's fill AXIS. Raid and
+-- party resolve their own value through the settings table the caller passes
+-- (party gets its own when the Health Bar section is unsynced). On ns, not
+-- file-scope locals -- this file is at the Lua 5.1 200-local cap.
+ns.RF_IsVerticalFill = function(s)
+    return ((s or db.profile).healthVerticalFill) and true or false
+end
+
+-- Fill-texture rotation, DERIVED -- never set on its own, so it can never go
+-- stale against the bar's axis or a texture swap. Two texture families live on
+-- these bars and they want opposite treatment on a vertical bar:
+--
+--   stretch (shield.tga, striped3, blizzard, WHITE8X8, every health texture):
+--     one image scaled to the fill rect. Designed wide-and-short, so on a tall
+--     bar it must be ROTATED or it smears into a stretched mess.
+--   tiled (stripedReversed, the large* stripe sets, striped-maxhp, the modern
+--     absorb): repeats at native pixel size on BOTH axes, so it already reads
+--     correctly at any bar shape. Rotating it fights the tiling and is exactly
+--     what produced the stretched look -- leave these alone.
+--
+-- Tiling is read back off the live fill texture rather than passed in, so this
+-- stays correct no matter which style function last touched the bar.
+ns.RF_ApplyFillRotation = function(bar)
+    if not (bar and bar.SetRotatesTexture) then return end
+    local vert = bar.GetOrientation and bar:GetOrientation() == "VERTICAL"
+    local fill = bar.GetStatusBarTexture and bar:GetStatusBarTexture()
+    local tiled = fill and ((fill.GetHorizTile and fill:GetHorizTile())
+                         or (fill.GetVertTile and fill:GetVertTile()))
+    bar:SetRotatesTexture((vert and not tiled) and true or false)
+end
+
+ns.RF_ApplyHealthOrientation = function(bar, s)
+    if not bar then return false end
+    local vert = ns.RF_IsVerticalFill(s)
+    bar:SetOrientation(vert and "VERTICAL" or "HORIZONTAL")
+    ns.RF_ApplyFillRotation(bar)
+    return vert
+end
+
 -- Resolve an absorb/heal/max-health style key to a texture path. Built-in
 -- styles come from ABSORB_STYLE_TEX; "sm:" SharedMedia keys (shared with the
 -- Bar Texture dropdown, appended into healthBarTextures) fall through to the
@@ -1482,8 +1525,16 @@ function ns._ApplyHealthBg(d, health, s, unit)
     end
     if not bg then return end
     bg:ClearAllPoints()
-    bg:SetPoint("TOPLEFT", health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
-    bg:SetPoint("BOTTOMRIGHT", health, "BOTTOMRIGHT", 0, 0)
+    -- The bg covers only the MISSING health, so it hangs off the far side of the
+    -- fill: the fill's right edge normally, its top edge on a vertical bar. Read
+    -- the axis off the bar itself so this needs no settings lookup.
+    if health.GetOrientation and health:GetOrientation() == "VERTICAL" then
+        bg:SetPoint("TOPLEFT", health, "TOPLEFT", 0, 0)
+        bg:SetPoint("BOTTOMRIGHT", health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
+    else
+        bg:SetPoint("TOPLEFT", health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
+        bg:SetPoint("BOTTOMRIGHT", health, "BOTTOMRIGHT", 0, 0)
+    end
     if s.healthColorMode == "dark" then
         bg:SetColorTexture(EllesmereUI.GetDarkModeBg())
     else
@@ -1967,6 +2018,7 @@ ns.ApplyModernAbsorbBar = function(bar, mask)
         local base = bar._modernBase
         if base then base:SetAllPoints(fill); base:Show() end
     end
+    ns.RF_ApplyFillRotation(bar)  -- tiled: stays unrotated on a vertical bar
 end
 
 -- Hide the modern solid base whenever a non-modern style is applied so that
@@ -2014,6 +2066,9 @@ local function ApplyAbsorbStyle(absorbBar, style, settings)
         fill:SetVertTile(tiled)
         if mask then fill:AddMaskTexture(mask) end
     end
+    -- New fill object + new tiling state: re-derive rotation (stretch styles
+    -- rotate on a vertical bar, tiled ones must not).
+    ns.RF_ApplyFillRotation(absorbBar)
     if fw then
         fw:SetStatusBarTexture(tex)
         fw:SetStatusBarColor(ac.r, ac.g, ac.b, alpha)
@@ -2024,6 +2079,7 @@ local function ApplyAbsorbStyle(absorbBar, style, settings)
             fwFill:SetVertTile(tiled)
             if mask then fwFill:AddMaskTexture(mask) end
         end
+        ns.RF_ApplyFillRotation(fw)
     end
 end
 
@@ -2046,6 +2102,7 @@ ns.ApplyHealAbsorbStyle = function(haBar, style, settings)
         fill:SetVertTile(tiled)
         if mask then fill:AddMaskTexture(mask) end
     end
+    ns.RF_ApplyFillRotation(haBar)
 end
 
 -- Reduced max-health overlay style. A 1:1 set of the heal-absorb textures plus
@@ -2075,6 +2132,7 @@ ns.ApplyMaxHealthStyle = function(bar, style, settings)
         fill:SetHorizTile(tiled)
         fill:SetVertTile(tiled)
     end
+    ns.RF_ApplyFillRotation(bar)
 end
 
 -------------------------------------------------------------------------------
@@ -2216,12 +2274,104 @@ local function CreateAbsorbBar(button, healthBar)
     -- nil guards inside ReanchorAbsorbToFill simply skip them. Without this,
     -- they resolved to globals (nil) inside the closure, so the heal absorb
     -- never re-anchored to the right edge in "Show Absorbs from Right Edge".
-    local healAbsorbBar, healPredBar, healClip
+    -- reducedBar joins them: ReanchorAbsorbToFill flips its orientation too, and
+    -- an undeclared name inside the closure would resolve to a nil global.
+    local healAbsorbBar, healPredBar, healClip, reducedBar
 
     -- Re-anchor clip frames and forward bar to the current health fill texture.
     -- Must be called whenever SetStatusBarTexture replaces the fill object.
     local function ReanchorAbsorbToFill()
         local fill = healthBar:GetStatusBarTexture()
+
+        -- Vertical fill: the whole HP cluster rotates with the health bar. Every
+        -- anchor below is the horizontal layout with its axis swapped -- the
+        -- fill's RIGHT edge (the "HP edge" the shields, heal absorb and heal
+        -- prediction hang off) becomes its TOP edge, and the frame's right/left
+        -- edges become its top/bottom. Resolved live off the button's own
+        -- settings source so party frames honour their own Health Bar section.
+        local vs = d._isParty and ns._scaledPartyProxy
+            or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+        local isVert = ns.RF_ApplyHealthOrientation(healthBar, vs)
+        backfillBar._axisVert = isVert  -- read by the blizzardModern spark block
+        -- Indexed, not ipairs: the creation-time call runs before the heal/max
+        -- bars exist, and ipairs would stop at the first nil.
+        local axisBars = { backfillBar, forwardBar, healAbsorbBar, healPredBar, reducedBar }
+        for i = 1, 5 do
+            local b = axisBars[i]
+            if b then
+                b:SetOrientation(isVert and "VERTICAL" or "HORIZONTAL")
+                ns.RF_ApplyFillRotation(b)  -- derived: rotate stretch styles only
+            end
+        end
+
+        if isVert then
+            curClip:ClearAllPoints()
+            curClip:SetPoint("BOTTOMLEFT", healthBar, "BOTTOMLEFT", 0, 0)
+            curClip:SetPoint("TOPRIGHT", fill, "TOPRIGHT", 0, 0)
+            missClip:ClearAllPoints()
+            missClip:SetPoint("BOTTOMLEFT", fill, "TOPLEFT", 0, -1)
+            missClip:SetPoint("TOPRIGHT", healthBar, "TOPRIGHT", 0, 0)
+            forwardBar:ClearAllPoints()
+            forwardBar:SetPoint("BOTTOMLEFT", fill, "TOPLEFT", 0, 0)
+            forwardBar:SetPoint("BOTTOMRIGHT", fill, "TOPRIGHT", 0, 0)
+            if healPredBar then
+                healPredBar:ClearAllPoints()
+                healPredBar:SetPoint("BOTTOMLEFT", fill, "TOPLEFT", 0, 0)
+                healPredBar:SetPoint("BOTTOMRIGHT", fill, "TOPRIGHT", 0, 0)
+            end
+            -- Edge modes keep their key names: "right" is the far edge of the
+            -- fill axis (the top when vertical), "left" the near one (bottom).
+            local vAbsorbMode = db.profile.absorbEdgeMode or "overlay"
+            backfillBar:ClearAllPoints()
+            if vAbsorbMode == "right" or vAbsorbMode == "left" then
+                curClip:ClearAllPoints()
+                curClip:SetPoint("TOPLEFT", healthBar, "TOPLEFT", 0, 0)
+                curClip:SetPoint("BOTTOMRIGHT", healthBar, "BOTTOMRIGHT", 0, 0)
+                if vAbsorbMode == "left" then
+                    backfillBar:SetReverseFill(false)
+                    backfillBar:SetPoint("BOTTOMLEFT", healthBar, "BOTTOMLEFT", 0, 0)
+                    backfillBar:SetPoint("BOTTOMRIGHT", healthBar, "BOTTOMRIGHT", 0, 0)
+                else
+                    backfillBar:SetReverseFill(true)
+                    backfillBar:SetPoint("TOPLEFT", healthBar, "TOPLEFT", 0, 0)
+                    backfillBar:SetPoint("TOPRIGHT", healthBar, "TOPRIGHT", 0, 0)
+                end
+            else
+                backfillBar:SetReverseFill(true)
+                backfillBar:SetPoint("TOPLEFT", healthBar, "TOPLEFT", 0, 0)
+                backfillBar:SetPoint("TOPRIGHT", healthBar, "TOPRIGHT", 0, 0)
+            end
+
+            if healAbsorbBar then
+                local vHealMode = db.profile.healAbsorbEdgeMode or "overlay"
+                if healClip then
+                    healClip:ClearAllPoints()
+                    if vHealMode == "right" or vHealMode == "left" then
+                        healClip:SetPoint("TOPLEFT", healthBar, "TOPLEFT", 0, 0)
+                        healClip:SetPoint("BOTTOMRIGHT", healthBar, "BOTTOMRIGHT", 0, 0)
+                    else
+                        healClip:SetPoint("BOTTOMLEFT", healthBar, "BOTTOMLEFT", 0, 0)
+                        healClip:SetPoint("TOPRIGHT", fill, "TOPRIGHT", 0, 0)
+                    end
+                end
+                healAbsorbBar:ClearAllPoints()
+                if vHealMode == "right" then
+                    healAbsorbBar:SetReverseFill(true)
+                    healAbsorbBar:SetPoint("TOPLEFT", healthBar, "TOPLEFT", 0, 0)
+                    healAbsorbBar:SetPoint("TOPRIGHT", healthBar, "TOPRIGHT", 0, 0)
+                elseif vHealMode == "left" then
+                    healAbsorbBar:SetReverseFill(false)
+                    healAbsorbBar:SetPoint("BOTTOMLEFT", healthBar, "BOTTOMLEFT", 0, 0)
+                    healAbsorbBar:SetPoint("BOTTOMRIGHT", healthBar, "BOTTOMRIGHT", 0, 0)
+                else
+                    healAbsorbBar:SetReverseFill(true)
+                    healAbsorbBar:SetPoint("TOPLEFT", fill, "TOPLEFT", 0, 0)
+                    healAbsorbBar:SetPoint("TOPRIGHT", fill, "TOPRIGHT", 0, 0)
+                end
+            end
+            return
+        end
+
         curClip:ClearAllPoints()
         curClip:SetPoint("TOPLEFT", healthBar, "TOPLEFT", 0, 0)
         curClip:SetPoint("BOTTOMRIGHT", fill, "BOTTOMRIGHT", 0, 0)
@@ -2361,7 +2511,8 @@ local function CreateAbsorbBar(button, healthBar)
     healPredBar:Hide()
 
     -- Reduced max health bar: black bg + red striped overlay on right side
-    local reducedBar = CreateFrame("StatusBar", nil, healthBar)
+    -- (forward-declared above so ReanchorAbsorbToFill can reach it).
+    reducedBar = CreateFrame("StatusBar", nil, healthBar)
     reducedBar:SetStatusBarTexture("Interface\\AddOns\\EllesmereUIRaidFrames\\Media\\striped-maxhp.png")
     local rmhFill = reducedBar:GetStatusBarTexture()
     if rmhFill then
@@ -2747,7 +2898,14 @@ local function UpdateAbsorb(button, unit)
     -- while overshielding. isClamped (the Missing-Health-clamp overshield boolean) flips
     -- between them secret-safely, so exactly one is ever visible.
     if absStyle == "blizzardModern" then
-        if fw then
+        -- Vertical fill: the shield itself rotates, but these two edge glows are
+        -- 16px-wide strips pinned to the shield's LEFT edge and re-sized to the
+        -- bar height on every update, so they cannot follow a vertical seam.
+        -- Hide them rather than render a sideways glow; the shield is unaffected.
+        if ab._axisVert and fw then
+            if fw._edgeSpark then fw._edgeSpark:Hide() end
+            if fw._bfSpark then fw._bfSpark:Hide() end
+        elseif fw then
             -- Fill-rect anchors are permanent (statusbar textures persist
             -- across SetValue); sizes are size-gated; the overshield spark's
             -- anchor moves only when the Show Overshield toggle flips.
@@ -3033,7 +3191,7 @@ local function StyleButton(button)
 
     -- Section markers: name where per-button creation time goes in login
     -- captures (/erfprof login). Zero cost while the profiler is off.
-    local tSB = ns.ProfBegin("SB:core")
+    local tSB = 0 -- PROF: ns.ProfBegin("SB:core")
 
     -- Register our unit buttons so the free right-click camera watcher can tell
     -- when the cursor is over an EUI raid/party frame (direct IsMouseOver test).
@@ -3082,6 +3240,10 @@ local function StyleButton(button)
     health:SetStatusBarTexture(texPath)
     health:GetStatusBarTexture():SetHorizTile(false)
     if PP then PP.DisablePixelSnap(health) end
+    -- Fill axis. StyleButton runs before d._isParty is set, so this uses the raid
+    -- value; ReanchorAbsorbToFill re-resolves it against the button's real
+    -- settings source (raid / party / extra) on every update.
+    ns.RF_ApplyHealthOrientation(health, s)
     health:SetMinMaxValues(0, 100)
     health:SetValue(100)
     d.health = health
@@ -3155,14 +3317,14 @@ local function StyleButton(button)
         tnb:Hide()
     end
 
-    ns.ProfEnd("SB:core", tSB)
+    if tSB > 0 then ns.ProfEnd("SB:core", tSB) end
 
     -- Absorb shields
-    tSB = ns.ProfBegin("SB:absorbs")
+    tSB = 0 -- PROF: ns.ProfBegin("SB:absorbs")
     CreateAbsorbBar(button, health)
-    ns.ProfEnd("SB:absorbs", tSB)
+    if tSB > 0 then ns.ProfEnd("SB:absorbs", tSB) end
 
-    tSB = ns.ProfBegin("SB:bordersDispel")
+    tSB = 0 -- PROF: ns.ProfBegin("SB:bordersDispel")
     -- Border frame
     local bdrFrame = CreateFrame("Frame", nil, button)
     bdrFrame:SetAllPoints(button)
@@ -3312,8 +3474,8 @@ local function StyleButton(button)
     end
     AnchorDispelIcon()
     d.AnchorDispelIcon = AnchorDispelIcon
-    ns.ProfEnd("SB:bordersDispel", tSB)
-    tSB = ns.ProfBegin("SB:texts")
+    if tSB > 0 then ns.ProfEnd("SB:bordersDispel", tSB) end
+    tSB = 0 -- PROF: ns.ProfBegin("SB:texts")
 
     -- Text carrier: name + health text sit in the text band (ns.LVL_TEXT) --
     -- above every border including the hover/target raise, below the aura
@@ -3431,8 +3593,8 @@ local function StyleButton(button)
     end
     AnchorStatusText()
     d.AnchorStatusText = AnchorStatusText
-    ns.ProfEnd("SB:texts", tSB)
-    tSB = ns.ProfBegin("SB:indicators")
+    if tSB > 0 then ns.ProfEnd("SB:texts", tSB) end
+    tSB = 0 -- PROF: ns.ProfBegin("SB:indicators")
 
     -- Role icon. Carrier sits in the text band (ns.LVL_AURA - 1 = ns.LVL_TEXT,
     -- same as the name/health text): above every border including the
@@ -3576,8 +3738,8 @@ local function StyleButton(button)
     end
     AnchorCombatIcon()
     d.AnchorCombatIcon = AnchorCombatIcon
-    ns.ProfEnd("SB:indicators", tSB)
-    tSB = ns.ProfBegin("SB:debuffPool")
+    if tSB > 0 then ns.ProfEnd("SB:indicators", tSB) end
+    tSB = 0 -- PROF: ns.ProfBegin("SB:debuffPool")
 
     -- Debuff icons (pre-created, anchored dynamically)
     d.debuffIcons = {}
@@ -3776,8 +3938,8 @@ local function StyleButton(button)
     end
     AnchorDebuffs()
     d.AnchorDebuffs = AnchorDebuffs
-    ns.ProfEnd("SB:debuffPool", tSB)
-    tSB = ns.ProfBegin("SB:defPool")
+    if tSB > 0 then ns.ProfEnd("SB:debuffPool", tSB) end
+    tSB = 0 -- PROF: ns.ProfBegin("SB:defPool")
 
     -- Defensive/external icon pool (same structure as debuff icons)
     local DEF_CAP = 4
@@ -3885,8 +4047,8 @@ local function StyleButton(button)
     end
     AnchorDefensives()
     d.AnchorDefensives = AnchorDefensives
-    ns.ProfEnd("SB:defPool", tSB)
-    tSB = ns.ProfBegin("SB:tail")
+    if tSB > 0 then ns.ProfEnd("SB:defPool", tSB) end
+    tSB = 0 -- PROF: ns.ProfBegin("SB:tail")
 
     -- Anchor name text based on position setting
     -- Uses two-point anchoring (LEFT+RIGHT) for width constraint, with
@@ -4272,7 +4434,7 @@ local function StyleButton(button)
     if ns.RFC_SetupButton then
         ns.RFC_SetupButton(button, health, d)
     end
-    ns.ProfEnd("SB:tail", tSB)
+    if tSB > 0 then ns.ProfEnd("SB:tail", tSB) end
 end
 
 -------------------------------------------------------------------------------
@@ -6160,7 +6322,7 @@ end
 --  Unit-to-button mapping
 -------------------------------------------------------------------------------
 local function RebuildUnitMap()
-    local t0 = ns.ProfBegin("RebuildUnitMap")
+    local t0 = 0 -- PROF: ns.ProfBegin("RebuildUnitMap")
     wipe(unitToButton)
     for _, btn in ipairs(allButtons) do
         if btn:IsVisible() then
@@ -6187,7 +6349,7 @@ local function RebuildUnitMap()
             end
         end
     end
-    ns.ProfEnd("RebuildUnitMap", t0)
+    if t0 > 0 then ns.ProfEnd("RebuildUnitMap", t0) end
 end
 
 -------------------------------------------------------------------------------
@@ -6207,7 +6369,7 @@ end
 ns._paintGen = 0
 local function UpdateAllButtons()
     if previewActive then return end  -- real buttons hidden during preview
-    local t0 = ns.ProfBegin("UpdateAllButtons")
+    local t0 = 0 -- PROF: ns.ProfBegin("UpdateAllButtons")
     local now, gen = GetTime(), ns._paintGen
     for _, btn in ipairs(allButtons) do
         local u = btn:GetAttribute("unit")
@@ -6226,7 +6388,7 @@ local function UpdateAllButtons()
             end
         end
     end
-    ns.ProfEnd("UpdateAllButtons", t0)
+    if t0 > 0 then ns.ProfEnd("UpdateAllButtons", t0) end
 end
 
 -- Full per-button refresh for a freshly (re)assigned unit. Mirrors the
@@ -7037,6 +7199,10 @@ FB.ApplyStyle = function(owner)
         b._health:SetStatusBarTexture(texPath)
         local ft = b._health:GetStatusBarTexture()
         if ft then ft:SetHorizTile(false) end
+        -- Fill axis follows the raid Health Bar setting, like every other
+        -- element these buttons borrow. The bg is a full-button texture here
+        -- (not fill-tracking), so nothing else needs re-anchoring.
+        ns.RF_ApplyHealthOrientation(b._health, s)
         -- No power bar / top name bar here: health fills the button.
         b._health:SetHeight(h)
 
@@ -8250,7 +8416,7 @@ ns._BuildHeaderSet = function(merge)
         ns._sizeTierDirtyInCombat = true
         return
     end
-    local tb = ns.ProfBegin("BuildHeaderSet")
+    local tb = 0 -- PROF: ns.ProfBegin("BuildHeaderSet")
 
     local s = db.profile
 
@@ -8385,7 +8551,7 @@ ns._BuildHeaderSet = function(merge)
 
     -- Freshly built headers need the current sort attributes.
     ApplySortToHeaders()
-    ns.ProfEnd("BuildHeaderSet", tb)
+    if tb > 0 then ns.ProfEnd("BuildHeaderSet", tb) end
 end
 
 local function CreateHeaders()
@@ -9682,20 +9848,20 @@ end
 -- Seed / full re-evaluation of every assigned unit (enable, roster change,
 -- phase change). Kept as RangeUpdate (forward-declared) for existing callers.
 RangeUpdate = function()
-    local t0 = ns.ProfBegin("RangeUpdate")
+    local t0 = 0 -- PROF: ns.ProfBegin("RangeUpdate")
     for unit, btn in pairs(unitToButton) do UpdateButtonRange(unit, btn) end
     for unit, btn in pairs(ns._partyUnitToButton) do UpdateButtonRange(unit, btn) end
     for unit, btn in pairs(ns._xfUnitToButton) do UpdateButtonRange(unit, btn) end
-    ns.ProfEnd("RangeUpdate", t0)
+    if t0 > 0 then ns.ProfEnd("RangeUpdate", t0) end
 end
 ns._RangeSeedAll = RangeUpdate
 
 local function RangeRefineAll()
-    local t0 = ns.ProfBegin("RangeRefine")
+    local t0 = 0 -- PROF: ns.ProfBegin("RangeRefine")
     for unit, btn in pairs(unitToButton) do RefineButtonRange(unit, btn) end
     for unit, btn in pairs(ns._partyUnitToButton) do RefineButtonRange(unit, btn) end
     for unit, btn in pairs(ns._xfUnitToButton) do RefineButtonRange(unit, btn) end
-    ns.ProfEnd("RangeRefine", t0)
+    if t0 > 0 then ns.ProfEnd("RangeRefine", t0) end
 end
 
 function StartRangeTicker()
@@ -9730,7 +9896,7 @@ end  -- range fading section (do-block keeps its locals out of the 200-cap)
 local ghostTicker = nil
 
 local function GhostAuraCheck()
-    local t0 = ns.ProfBegin("GhostAuraCheck")
+    local t0 = 0 -- PROF: ns.ProfBegin("GhostAuraCheck")
     local function checkUnit(unit, btn)
         local d = GetFFD(btn)
         if not UnitIsVisible(unit) or not UnitIsConnected(unit) then
@@ -9769,7 +9935,7 @@ local function GhostAuraCheck()
     for unit, btn in pairs(unitToButton) do checkUnit(unit, btn) end
     for unit, btn in pairs(ns._partyUnitToButton) do checkUnit(unit, btn) end
     for unit, btn in pairs(ns._xfUnitToButton) do checkUnit(unit, btn) end
-    ns.ProfEnd("GhostAuraCheck", t0)
+    if t0 > 0 then ns.ProfEnd("GhostAuraCheck", t0) end
 end
 
 local function StartGhostTicker()
@@ -10001,7 +10167,9 @@ local function OnEvent(self, event, arg1, ...)
         end
         ns._rosterDirtyInCombat = nil
         ns._sizeTierDirtyInCombat = nil
-        local t0 = ns.ProfBegin("Visibility:REGEN"); UpdateVisibility(); ns.ProfEnd("Visibility:REGEN", t0)
+        local t0 = 0 -- PROF: ns.ProfBegin("Visibility:REGEN")
+        UpdateVisibility()
+        if t0 > 0 then ns.ProfEnd("Visibility:REGEN", t0) end
         ns._UpdatePartyVisibility()
         if rosterDirty or sizeTierDirty then
             if framesVisible then
@@ -10009,7 +10177,9 @@ local function OnEvent(self, event, arg1, ...)
                     -- Size tier crossed during combat: full reload now safe
                     ReloadFrames()
                 else
-                    t0 = ns.ProfBegin("LayoutGroups:REGEN"); LayoutGroups(); ns.ProfEnd("LayoutGroups:REGEN", t0)
+                    t0 = 0 -- PROF: ns.ProfBegin("LayoutGroups:REGEN")
+                    LayoutGroups()
+                    if t0 > 0 then ns.ProfEnd("LayoutGroups:REGEN", t0) end
                 end
                 -- Same-dimension tier changes take the LayoutGroups branch;
                 -- reapply offset so the container lands at the correct tier.
@@ -10057,7 +10227,7 @@ local function OnEvent(self, event, arg1, ...)
             end
             -- Rebuild unit maps during combat so new/moved members get events.
             if framesVisible then
-                local t0 = ns.ProfBegin("RebuildUnitMap:COMBAT")
+                local t0 = 0 -- PROF: ns.ProfBegin("RebuildUnitMap:COMBAT")
                 wipe(unitToButton)
                 for _, btn in ipairs(allButtons) do
                     if btn:IsVisible() then
@@ -10071,7 +10241,7 @@ local function OnEvent(self, event, arg1, ...)
                         end
                     end
                 end
-                ns.ProfEnd("RebuildUnitMap:COMBAT", t0)
+                if t0 > 0 then ns.ProfEnd("RebuildUnitMap:COMBAT", t0) end
             end
             -- Party frames: rebuild unit map during combat
             if ns._partyFramesVisible then
@@ -10097,7 +10267,7 @@ local function OnEvent(self, event, arg1, ...)
             if not ns._crPaintTimer and (framesVisible or ns._partyFramesVisible) then
                 ns._crPaintTimer = C_Timer.NewTimer(0, function()
                     ns._crPaintTimer = nil
-                    local t1 = ns.ProfBegin("UpdateAll:COMBAT_ROSTER")
+                    local t1 = 0 -- PROF: ns.ProfBegin("UpdateAll:COMBAT_ROSTER")
                     if framesVisible then
                         for _, btn in ipairs(allButtons) do
                             local u = btn:GetAttribute("unit")
@@ -10128,7 +10298,7 @@ local function OnEvent(self, event, arg1, ...)
                             end
                         end
                     end
-                    ns.ProfEnd("UpdateAll:COMBAT_ROSTER", t1)
+                    if t1 > 0 then ns.ProfEnd("UpdateAll:COMBAT_ROSTER", t1) end
                 end)
             end
             return
@@ -10151,7 +10321,9 @@ local function OnEvent(self, event, arg1, ...)
             local tierChanged = (newW ~= ns._activeSizeW or newH ~= ns._activeSizeH)
             local wasVis = framesVisible
             ns._visForceRebuild = nil
-            local t0 = ns.ProfBegin("Visibility:ROSTER"); UpdateVisibility(); ns.ProfEnd("Visibility:ROSTER", t0)
+            local t0 = 0 -- PROF: ns.ProfBegin("Visibility:ROSTER")
+            UpdateVisibility()
+            if t0 > 0 then ns.ProfEnd("Visibility:ROSTER", t0) end
             ns._UpdatePartyVisibility()
             if framesVisible then
                 if tierChanged then
@@ -10161,7 +10333,9 @@ local function OnEvent(self, event, arg1, ...)
                 elseif not wasVis then
                     -- Hidden->visible transition: UpdateVisibility already ran the
                     -- full rebuild (RebuildUnitMap + UpdateAllButtons); just lay out.
-                    t0 = ns.ProfBegin("LayoutGroups:ROSTER"); LayoutGroups(); ns.ProfEnd("LayoutGroups:ROSTER", t0)
+                    t0 = 0 -- PROF: ns.ProfBegin("LayoutGroups:ROSTER")
+                    LayoutGroups()
+                    if t0 > 0 then ns.ProfEnd("LayoutGroups:ROSTER", t0) end
                 else
                     -- Already visible, same tier: light refresh only. Aura
                     -- full-rescans are intentionally skipped (hook + UNIT_AURA
@@ -10171,7 +10345,9 @@ local function OnEvent(self, event, arg1, ...)
                     for _, btn in ipairs(allButtons) do
                         if btn:IsVisible() and btn:GetAttribute("unit") then UpdateButton(btn) end
                     end
-                    t0 = ns.ProfBegin("LayoutGroups:ROSTER"); LayoutGroups(); ns.ProfEnd("LayoutGroups:ROSTER", t0)
+                    t0 = 0 -- PROF: ns.ProfBegin("LayoutGroups:ROSTER")
+                    LayoutGroups()
+                    if t0 > 0 then ns.ProfEnd("LayoutGroups:ROSTER", t0) end
                 end
                 -- Re-derive the growth-corner anchor after any roster-driven
                 -- layout. tierChanged above compares frame DIMENSIONS, so two
@@ -10194,23 +10370,31 @@ local function OnEvent(self, event, arg1, ...)
         -- Standard ~40yd range change for this unit (event-driven, debounced).
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then
-            local t0 = ns.ProfBegin("RangeEvent")
+            local t0 = 0 -- PROF: ns.ProfBegin("RangeEvent")
             ns._UpdateButtonRange(arg1, btn)
-            ns.ProfEnd("RangeEvent", t0)
+            if t0 > 0 then ns.ProfEnd("RangeEvent", t0) end
         end
     elseif event == "UNIT_PHASE" then
         -- Phasing doesn't fire UNIT_IN_RANGE_UPDATE; re-evaluate all (rare).
         if ns._RangeSeedAll then ns._RangeSeedAll() end
     elseif event == "UNIT_HEALTH" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
-        if btn then local t0 = ns.ProfBegin("UpdateButton:HEALTH"); ns._UpdateButtonHealth(btn); ns.ProfEnd("UpdateButton:HEALTH", t0) end
+        if btn then
+            local t0 = 0 -- PROF: ns.ProfBegin("UpdateButton:HEALTH")
+            ns._UpdateButtonHealth(btn)
+            if t0 > 0 then ns.ProfEnd("UpdateButton:HEALTH", t0) end
+        end
     elseif event == "UNIT_MAXHEALTH" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
-        if btn then local t0 = ns.ProfBegin("UpdateButton:MAXHEALTH"); ns._UpdateButtonHealth(btn); ns.ProfEnd("UpdateButton:MAXHEALTH", t0) end
+        if btn then
+            local t0 = 0 -- PROF: ns.ProfBegin("UpdateButton:MAXHEALTH")
+            ns._UpdateButtonHealth(btn)
+            if t0 > 0 then ns.ProfEnd("UpdateButton:MAXHEALTH", t0) end
+        end
     elseif event == "UNIT_POWER_UPDATE" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn and GetFFD(btn).power then
-            local t0 = ns.ProfBegin("PowerUpdate")
+            local t0 = 0 -- PROF: ns.ProfBegin("PowerUpdate")
             local d = GetFFD(btn)
             local pType = UnitPowerType(arg1) or 0
             -- Percent-based, secret-safe (see UpdateButton power block).
@@ -10229,7 +10413,7 @@ local function OnEvent(self, event, arg1, ...)
                     d._pwBgTintF = f
                 end
             end
-            ns.ProfEnd("PowerUpdate", t0)
+            if t0 > 0 then ns.ProfEnd("PowerUpdate", t0) end
         end
     elseif event == "UNIT_AURA" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
@@ -10237,11 +10421,15 @@ local function OnEvent(self, event, arg1, ...)
             if EllesmereUI.IS_121 then
                 -- 12.1: aura displays are engine-driven containers; the absorb
                 -- overlay (aura-granted shields) is the only consumer left here.
-                local t0 = ns.ProfBegin("UpdateAbsorb:AURA"); UpdateAbsorb(btn, arg1); ns.ProfEnd("UpdateAbsorb:AURA", t0)
+                local t0 = 0 -- PROF: ns.ProfBegin("UpdateAbsorb:AURA")
+                UpdateAbsorb(btn, arg1)
+                if t0 > 0 then ns.ProfEnd("UpdateAbsorb:AURA", t0) end
             else
             local updateInfo = ...
             -- Dispel border is the dispel signal: never throttled, always now.
-            local t0 = ns.ProfBegin("UpdateDispelBorder"); UpdateDispelBorder(btn, arg1, updateInfo); ns.ProfEnd("UpdateDispelBorder", t0)
+            local t0 = 0 -- PROF: ns.ProfBegin("UpdateDispelBorder")
+            UpdateDispelBorder(btn, arg1, updateInfo)
+            if t0 > 0 then ns.ProfEnd("UpdateDispelBorder", t0) end
             -- Informational aura icons: immediate under the per-frame budget; a
             -- single-frame flood spills the overflow to the drain ticker, which
             -- full-rescans current state a few frames later (lossless).
@@ -10250,13 +10438,19 @@ local function OnEvent(self, event, arg1, ...)
             if ns._auraFrameN < ns._auraBudget then
                 ns._auraFrameN = ns._auraFrameN + 1
                 if ns._auraDirty[arg1] then ns._auraDirty[arg1] = nil; ns._auraDirtyN = ns._auraDirtyN - 1 end
-                t0 = ns.ProfBegin("UpdateDebuffs"); UpdateDebuffs(btn, arg1, updateInfo); ns.ProfEnd("UpdateDebuffs", t0)
-                t0 = ns.ProfBegin("UpdateDefensives"); UpdateDefensives(btn, arg1, updateInfo); ns.ProfEnd("UpdateDefensives", t0)
+                t0 = 0 -- PROF: ns.ProfBegin("UpdateDebuffs")
+                UpdateDebuffs(btn, arg1, updateInfo)
+                if t0 > 0 then ns.ProfEnd("UpdateDebuffs", t0) end
+                t0 = 0 -- PROF: ns.ProfBegin("UpdateDefensives")
+                UpdateDefensives(btn, arg1, updateInfo)
+                if t0 > 0 then ns.ProfEnd("UpdateDefensives", t0) end
                 -- No UpdateAbsorb on the aura stream: the dedicated absorb
                 -- events (branch below) are a strict superset for everything
                 -- the absorb bars render. See _FlushUnitAuras.
                 if ns.BM_UpdateIndicators then
-                    t0 = ns.ProfBegin("BM_UpdateIndicators"); ns.BM_UpdateIndicators(btn, arg1, db, updateInfo); ns.ProfEnd("BM_UpdateIndicators", t0)
+                    t0 = 0 -- PROF: ns.ProfBegin("BM_UpdateIndicators")
+                    ns.BM_UpdateIndicators(btn, arg1, db, updateInfo)
+                    if t0 > 0 then ns.ProfEnd("BM_UpdateIndicators", t0) end
                 end
             elseif not ns._auraDirty[arg1] then
                 ns._auraDirty[arg1] = true
@@ -10269,7 +10463,9 @@ local function OnEvent(self, event, arg1, ...)
         or event == "UNIT_HEAL_PREDICTION" or event == "UNIT_MAX_HEALTH_MODIFIERS_CHANGED" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then
-            local t0 = ns.ProfBegin("UpdateAbsorb:OTHER"); UpdateAbsorb(btn, arg1); ns.ProfEnd("UpdateAbsorb:OTHER", t0)
+            local t0 = 0 -- PROF: ns.ProfBegin("UpdateAbsorb:OTHER")
+            UpdateAbsorb(btn, arg1)
+            if t0 > 0 then ns.ProfEnd("UpdateAbsorb:OTHER", t0) end
             if event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED" then ns.UpdateHealAbsorbTextFor(btn, arg1) end
         end
     elseif event == "UNIT_NAME_UPDATE" then
@@ -10306,7 +10502,7 @@ local function OnEvent(self, event, arg1, ...)
     elseif event == "UNIT_THREAT_LIST_UPDATE" or event == "UNIT_THREAT_SITUATION_UPDATE" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then
-            local t0 = ns.ProfBegin("ThreatUpdate")
+            local t0 = 0 -- PROF: ns.ProfBegin("ThreatUpdate")
             local d = GetFFD(btn)
             if d.threatFrame then
                 local bs = db.profile.threatBorderSize or 0
@@ -10322,7 +10518,7 @@ local function OnEvent(self, event, arg1, ...)
                     d.threatFrame:Hide()
                 end
             end
-            ns.ProfEnd("ThreatUpdate", t0)
+            if t0 > 0 then ns.ProfEnd("ThreatUpdate", t0) end
         end
     elseif event == "UNIT_FLAGS" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
@@ -10338,7 +10534,7 @@ local function OnEvent(self, event, arg1, ...)
         end
     elseif event == "PARTY_MEMBER_ENABLE" or event == "PARTY_MEMBER_DISABLE" then
         -- Only status text / health color changes (online/offline)
-        local t0 = ns.ProfBegin("UpdateAll:PARTY_MEMBER")
+        local t0 = 0 -- PROF: ns.ProfBegin("UpdateAll:PARTY_MEMBER")
         if not previewActive then
             for _, btn in ipairs(allButtons) do
                 local u = btn:GetAttribute("unit")
@@ -10351,13 +10547,17 @@ local function OnEvent(self, event, arg1, ...)
                 if u and btn:IsVisible() then UpdateButton(btn) end
             end
         end
-        ns.ProfEnd("UpdateAll:PARTY_MEMBER", t0)
+        if t0 > 0 then ns.ProfEnd("UpdateAll:PARTY_MEMBER", t0) end
     elseif event == "RAID_TARGET_UPDATE" then
-        local t0 = ns.ProfBegin("UpdateRaidMarkers"); ns._UpdateRaidMarkers(); ns.ProfEnd("UpdateRaidMarkers", t0)
+        local t0 = 0 -- PROF: ns.ProfBegin("UpdateRaidMarkers")
+        ns._UpdateRaidMarkers()
+        if t0 > 0 then ns.ProfEnd("UpdateRaidMarkers", t0) end
     elseif event == "PLAYER_TARGET_CHANGED" then
-        local t0 = ns.ProfBegin("UpdateTargetBorders"); ns._UpdateTargetBorders(); ns.ProfEnd("UpdateTargetBorders", t0)
+        local t0 = 0 -- PROF: ns.ProfBegin("UpdateTargetBorders")
+        ns._UpdateTargetBorders()
+        if t0 > 0 then ns.ProfEnd("UpdateTargetBorders", t0) end
     elseif event == "READY_CHECK" then
-        local t0 = ns.ProfBegin("ReadyCheck:START")
+        local t0 = 0 -- PROF: ns.ProfBegin("ReadyCheck:START")
         readyCheckActive = true
         for _, btn in ipairs(allButtons) do
             local u = btn:GetAttribute("unit")
@@ -10367,7 +10567,7 @@ local function OnEvent(self, event, arg1, ...)
             local u = btn:GetAttribute("unit")
             if u and btn:IsVisible() then UpdateReadyCheck(btn, u) end
         end
-        ns.ProfEnd("ReadyCheck:START", t0)
+        if t0 > 0 then ns.ProfEnd("ReadyCheck:START", t0) end
     elseif event == "READY_CHECK_CONFIRM" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then UpdateReadyCheck(btn, arg1) end
@@ -10453,7 +10653,9 @@ local function OnEvent(self, event, arg1, ...)
                 ns._sizeTierDirtyInCombat = true
                 return
             end
-            local t0 = ns.ProfBegin("Visibility:PEW"); UpdateVisibility(); ns.ProfEnd("Visibility:PEW", t0)
+            local t0 = 0 -- PROF: ns.ProfBegin("Visibility:PEW")
+            UpdateVisibility()
+            if t0 > 0 then ns.ProfEnd("Visibility:PEW", t0) end
             ns._UpdatePartyVisibility()
             if framesVisible then
                 -- Full reload ONLY when the size tier actually changed across
@@ -10475,16 +10677,18 @@ local function OnEvent(self, event, arg1, ...)
                     if newOv ~= ns._activeTierOverride then tierChanged = true end
                 end
                 if tierChanged then
-                    t0 = ns.ProfBegin("ReloadFrames:PEW"); ReloadFrames(); ns.ProfEnd("ReloadFrames:PEW", t0)
+                    t0 = 0 -- PROF: ns.ProfBegin("ReloadFrames:PEW")
+                    ReloadFrames()
+                    if t0 > 0 then ns.ProfEnd("ReloadFrames:PEW", t0) end
                 else
-                    t0 = ns.ProfBegin("PEWLightHeal")
+                    t0 = 0 -- PROF: ns.ProfBegin("PEWLightHeal")
                     for unit, btn in pairs(unitToButton) do
                         RegisterPrivateAuras(btn, unit)
                     end
                     RangeUpdate()
                     if ns.FB_Apply then ns.FB_Apply() end
                     if ns.XF_Apply then ns.XF_Apply() end
-                    ns.ProfEnd("PEWLightHeal", t0)
+                    if t0 > 0 then ns.ProfEnd("PEWLightHeal", t0) end
                 end
             end
             if ns._partyFramesVisible then
@@ -10557,6 +10761,7 @@ do
             "customFillColor", "dynamicColor100", "dynamicColor50", "dynamicColor0",
             "customBgColor", "bgClassColored", "bgDarkness", "smoothBars",
             "healPrediction", "healPredOpacity", "healPredColor",
+            "healthVerticalFill",
         },
         absorbs = {
             "absorbStyle", "absorbOpacity", "absorbColor", "absorbEdgeMode", "showOvershield",
@@ -13601,6 +13806,7 @@ local function ApplyPreviewData(f, index)
     if f._health then
         f._health:SetStatusBarTexture(ResolveHealthTexture())
         f._health:GetStatusBarTexture():SetHorizTile(false)
+        ns.RF_ApplyHealthOrientation(f._health, s)
         f._health:SetMinMaxValues(0, 100)
         f._health:SetValue(healthPct)
         f._healthPct = healthPct
@@ -13648,18 +13854,27 @@ local function ApplyPreviewData(f, index)
 
     -- Background
     if f._bg then
-        if s.healthColorMode == "dark" then
+        -- BG covers the missing-health portion only (never behind the fill), so
+        -- it hangs off the far side of the fill -- its right edge normally, its
+        -- top edge on a vertical bar. Mirrors the live UpdateHealthBg.
+        local pvVert = ns.RF_IsVerticalFill(s)
+        local function AnchorPreviewBg()
             f._bg:ClearAllPoints()
-            f._bg:SetPoint("TOPLEFT", f._health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
-            f._bg:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+            if pvVert then
+                f._bg:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                f._bg:SetPoint("BOTTOMRIGHT", f._health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
+            else
+                f._bg:SetPoint("TOPLEFT", f._health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
+                f._bg:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+            end
+        end
+        if s.healthColorMode == "dark" then
+            AnchorPreviewBg()
             f._bg:SetColorTexture(EllesmereUI.GetDarkModeBg())
         else
-            -- BG covers the missing-health portion only (never behind the fill),
-            -- matching the real-frame themed branch + Dark mode. Keeps the preview
+            -- Matches the real-frame themed branch + Dark mode. Keeps the preview
             -- a 1:1 replica for reduced-fill-opacity setups.
-            f._bg:ClearAllPoints()
-            f._bg:SetPoint("TOPLEFT", f._health:GetStatusBarTexture(), "TOPRIGHT", 0, 0)
-            f._bg:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+            AnchorPreviewBg()
             local bgA = (s.bgDarkness or 50) / 100
             local cc = s.bgClassColored and classToken and EllesmereUI.GetClassColor(classToken)
             if cc then
@@ -13800,7 +14015,11 @@ local function ApplyPreviewData(f, index)
             -- "Default Blizz Frames": seam spark + overshield spark (preview values are
             -- plain numbers, so overshield is a normal compare instead of isClamped).
             if modern then
-                if fw then
+                -- Vertical fill hides the two edge glows (see the live path).
+                if ns.RF_IsVerticalFill(s) and fw then
+                    if fw._edgeSpark then fw._edgeSpark:Hide() end
+                    if fw._bfSpark then fw._bfSpark:Hide() end
+                elseif fw then
                     local fmb = fw._modernBase
                     if fmb then fmb:SetAllPoints(fw:GetStatusBarTexture()) end
                     local previewOver = absorbAmt > (100 - (healthPct or 100))
@@ -13843,7 +14062,52 @@ local function ApplyPreviewData(f, index)
         local mc = f._absorbBar._missClip
         if cc and mc and f._health then
             local absorbMode = s.absorbEdgeMode or "overlay"
-            if absorbMode == "right" or absorbMode == "left" then
+            -- Vertical fill: same layout with the axis swapped (the fill's right
+            -- edge becomes its top edge). Mirrors the live vertical branch.
+            local pvAbVert = ns.RF_IsVerticalFill(s)
+            local pvAxisBars = { f._absorbBar, fw }
+            for i = 1, 2 do
+                local b = pvAxisBars[i]
+                if b then
+                    b:SetOrientation(pvAbVert and "VERTICAL" or "HORIZONTAL")
+                    ns.RF_ApplyFillRotation(b)
+                end
+            end
+            if pvAbVert then
+                local vfill = f._health:GetStatusBarTexture()
+                if absorbMode == "right" or absorbMode == "left" then
+                    cc:ClearAllPoints()
+                    cc:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                    cc:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+                    f._absorbBar:ClearAllPoints()
+                    if absorbMode == "left" then
+                        f._absorbBar:SetReverseFill(false)
+                        f._absorbBar:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 0, 0)
+                        f._absorbBar:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+                    else
+                        f._absorbBar:SetReverseFill(true)
+                        f._absorbBar:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                        f._absorbBar:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
+                    end
+                    if fw then fw:Hide() end
+                else
+                    cc:ClearAllPoints()
+                    cc:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 0, 0)
+                    cc:SetPoint("TOPRIGHT", vfill, "TOPRIGHT", 0, 0)
+                    mc:ClearAllPoints()
+                    mc:SetPoint("BOTTOMLEFT", vfill, "TOPLEFT", 0, -1)
+                    mc:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
+                    f._absorbBar:SetReverseFill(true)
+                    f._absorbBar:ClearAllPoints()
+                    f._absorbBar:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                    f._absorbBar:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
+                end
+                if fw then
+                    fw:ClearAllPoints()
+                    fw:SetPoint("BOTTOMLEFT", vfill, "TOPLEFT", 0, 0)
+                    fw:SetPoint("BOTTOMRIGHT", vfill, "TOPRIGHT", 0, 0)
+                end
+            elseif absorbMode == "right" or absorbMode == "left" then
                 cc:ClearAllPoints()
                 cc:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
                 cc:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
@@ -13871,6 +14135,14 @@ local function ApplyPreviewData(f, index)
                 f._absorbBar:ClearAllPoints()
                 f._absorbBar:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
                 f._absorbBar:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+            end
+            -- Restore the forward bar's horizontal anchors (the vertical branch
+            -- above re-points it, and these are otherwise only set at creation).
+            if not pvAbVert and fw then
+                local hfill = f._health:GetStatusBarTexture()
+                fw:ClearAllPoints()
+                fw:SetPoint("TOPLEFT", hfill, "TOPRIGHT", 0, 0)
+                fw:SetPoint("BOTTOMLEFT", hfill, "BOTTOMRIGHT", 0, 0)
             end
         end
     end
@@ -13920,30 +14192,62 @@ local function ApplyPreviewData(f, index)
         -- Heal absorb placement (independent of shield absorb; mirrors live).
         if f._health then
             local healMode = s.healAbsorbEdgeMode or "overlay"
-            if f._healClip then
-                f._healClip:ClearAllPoints()
-                if healMode == "right" or healMode == "left" then
-                    f._healClip:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
-                    f._healClip:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
-                else
-                    f._healClip:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
-                    f._healClip:SetPoint("BOTTOMRIGHT", f._health:GetStatusBarTexture(), "BOTTOMRIGHT", 0, 0)
+            -- Vertical fill: same layout, axis swapped (mirrors the live branch).
+            local pvHaVert = ns.RF_IsVerticalFill(s)
+            f._healAbsorbBar:SetOrientation(pvHaVert and "VERTICAL" or "HORIZONTAL")
+            ns.RF_ApplyFillRotation(f._healAbsorbBar)
+            if pvHaVert then
+                local vfill = f._health:GetStatusBarTexture()
+                if f._healClip then
+                    f._healClip:ClearAllPoints()
+                    if healMode == "right" or healMode == "left" then
+                        f._healClip:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                        f._healClip:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+                    else
+                        f._healClip:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 0, 0)
+                        f._healClip:SetPoint("TOPRIGHT", vfill, "TOPRIGHT", 0, 0)
+                    end
                 end
-            end
-            f._healAbsorbBar:ClearAllPoints()
-            if healMode == "right" then
-                f._healAbsorbBar:SetReverseFill(true)
-                f._healAbsorbBar:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
-                f._healAbsorbBar:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
-            elseif healMode == "left" then
-                f._healAbsorbBar:SetReverseFill(false)
-                f._healAbsorbBar:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
-                f._healAbsorbBar:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 0, 0)
+                f._healAbsorbBar:ClearAllPoints()
+                if healMode == "right" then
+                    f._healAbsorbBar:SetReverseFill(true)
+                    f._healAbsorbBar:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                    f._healAbsorbBar:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
+                elseif healMode == "left" then
+                    f._healAbsorbBar:SetReverseFill(false)
+                    f._healAbsorbBar:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 0, 0)
+                    f._healAbsorbBar:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+                else
+                    f._healAbsorbBar:SetReverseFill(true)
+                    f._healAbsorbBar:SetPoint("TOPLEFT", vfill, "TOPLEFT", 0, 0)
+                    f._healAbsorbBar:SetPoint("TOPRIGHT", vfill, "TOPRIGHT", 0, 0)
+                end
             else
-                local fill = f._health:GetStatusBarTexture()
-                f._healAbsorbBar:SetReverseFill(true)
-                f._healAbsorbBar:SetPoint("TOPRIGHT", fill, "TOPRIGHT", 0, 0)
-                f._healAbsorbBar:SetPoint("BOTTOMRIGHT", fill, "BOTTOMRIGHT", 0, 0)
+                if f._healClip then
+                    f._healClip:ClearAllPoints()
+                    if healMode == "right" or healMode == "left" then
+                        f._healClip:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                        f._healClip:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+                    else
+                        f._healClip:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                        f._healClip:SetPoint("BOTTOMRIGHT", f._health:GetStatusBarTexture(), "BOTTOMRIGHT", 0, 0)
+                    end
+                end
+                f._healAbsorbBar:ClearAllPoints()
+                if healMode == "right" then
+                    f._healAbsorbBar:SetReverseFill(true)
+                    f._healAbsorbBar:SetPoint("TOPRIGHT", f._health, "TOPRIGHT", 0, 0)
+                    f._healAbsorbBar:SetPoint("BOTTOMRIGHT", f._health, "BOTTOMRIGHT", 0, 0)
+                elseif healMode == "left" then
+                    f._healAbsorbBar:SetReverseFill(false)
+                    f._healAbsorbBar:SetPoint("TOPLEFT", f._health, "TOPLEFT", 0, 0)
+                    f._healAbsorbBar:SetPoint("BOTTOMLEFT", f._health, "BOTTOMLEFT", 0, 0)
+                else
+                    local fill = f._health:GetStatusBarTexture()
+                    f._healAbsorbBar:SetReverseFill(true)
+                    f._healAbsorbBar:SetPoint("TOPRIGHT", fill, "TOPRIGHT", 0, 0)
+                    f._healAbsorbBar:SetPoint("BOTTOMRIGHT", fill, "BOTTOMRIGHT", 0, 0)
+                end
             end
         end
     end
@@ -13960,6 +14264,25 @@ local function ApplyPreviewData(f, index)
             f._healPredBar:SetStatusBarColor(pc.r, pc.g, pc.b, pAlpha)
             f._healPredBar:SetWidth(w)
             f._healPredBar:SetHeight(healthH)
+            -- Grows from the HP edge into the missing health: the fill's right
+            -- edge normally, its top edge on a vertical bar. Only set at creation
+            -- otherwise, so both axes are re-applied here.
+            do
+                local pvPredVert = ns.RF_IsVerticalFill(s)
+                local pFill = f._health and f._health:GetStatusBarTexture()
+                f._healPredBar:SetOrientation(pvPredVert and "VERTICAL" or "HORIZONTAL")
+                ns.RF_ApplyFillRotation(f._healPredBar)
+                if pFill then
+                    f._healPredBar:ClearAllPoints()
+                    if pvPredVert then
+                        f._healPredBar:SetPoint("BOTTOMLEFT", pFill, "TOPLEFT", 0, 0)
+                        f._healPredBar:SetPoint("BOTTOMRIGHT", pFill, "TOPRIGHT", 0, 0)
+                    else
+                        f._healPredBar:SetPoint("TOPLEFT", pFill, "TOPRIGHT", 0, 0)
+                        f._healPredBar:SetPoint("BOTTOMLEFT", pFill, "BOTTOMRIGHT", 0, 0)
+                    end
+                end
+            end
             f._healPredBar:SetMinMaxValues(0, 100)
             f._healPredBar:SetValue(predAmt)
             f._healPredBar:Show()
@@ -13978,6 +14301,11 @@ local function ApplyPreviewData(f, index)
             or (not ns._testMode and not ns._indicatorsVisible and ns._absorbsPreviewVisible)
         if rmhShow and rmhAmt > 0 and rmhStyle ~= "none" then
             ns.ApplyMaxHealthStyle(f._reducedMaxHealthBar, rmhStyle, s)
+            do  -- eats the far end of the bar: the right edge, or the top when vertical
+                local pvRmhVert = ns.RF_IsVerticalFill(s)
+                f._reducedMaxHealthBar:SetOrientation(pvRmhVert and "VERTICAL" or "HORIZONTAL")
+                ns.RF_ApplyFillRotation(f._reducedMaxHealthBar)
+            end
             f._reducedMaxHealthBar:SetValue(rmhAmt)
             local rmhBg = f._reducedMaxHealthBg
             if rmhBg then
